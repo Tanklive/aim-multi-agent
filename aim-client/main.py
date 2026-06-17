@@ -373,6 +373,19 @@ class Transport:
         """发送群聊消息"""
         await self._sdk.send_grp(group_id, text)
 
+    async def send_ack(self, to_id: str, original_msg_id: str):
+        """发送已读回执（type: ack）"""
+        import json as _json
+        from aim_nats_sdk import make_envelope, Subjects
+        envelope = make_envelope(
+            from_id=self.agent_id, msg_type="ack",
+            payload={"text": ""}, reply_to=original_msg_id,
+        )
+        subject = Subjects.dm(to_id)
+        data = _json.dumps(envelope, ensure_ascii=False).encode()
+        await self._sdk.nc.publish(subject, data)
+        self._logger.debug(f" ACK → {to_id} (msg={original_msg_id[:8]})")
+
     async def authenticate(self) -> bool:
         return True
 
@@ -505,6 +518,11 @@ class AIMClient:
                 break
             self.scheduler.on_dispatch_started()
             self.logger.info(f" 投递: {msg.msg_id[:8]} from={msg.from_id} (q={self.queue.size()})")
+            # 已读回执：出队即发送（WeChat 已读语义）
+            try:
+                await self.transport.send_ack(msg.from_id, msg.msg_id)
+            except Exception as ack_err:
+                self.logger.debug(f" ACK 发送失败（不阻塞）: {ack_err}")
             try:
                 reply = await self._call_adapter(msg)
                 if reply:

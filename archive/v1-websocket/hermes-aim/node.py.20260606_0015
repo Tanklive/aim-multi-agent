@@ -1,0 +1,1036 @@
+#!/usr/bin/env python3
+"""
+AIM Unified Node — 服务端+客户端合一
+每个节点同时监听（服务端）和连接对等节点（客户端）
+
+架构：
+  ┌─────────┐     WS      ┌─────────┐
+  │ ZS0001  │◄───────────►│ ZS0002  │
+  │ 🐸呱呱  │             │ 🐴吉量  │
+  └─────────┘             └────┬────┘
+       ▲                       │ WS
+       │          WS           │
+       └───────────────────────┘
+                        ┌─────────┐
+                        │ ZS0003  │
+                        │ 🐤小火鸡│
+                        └─────────┘
+
+每个节点：
+  - 启动 WebSocket 服务端（接受其它节点连入）
+  - 主动连接配置中的对等节点
+  - 消息路由：本地处理 / 转发给对等节点 / 存离线队列
+"""
+
+import asyncio
+import hashlib
+import json
+import logging
+import os
+import signal
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Optional, Set
+
+try:
+    import websockets
+    from websockets.asyncio.server import serve as ws_serve
+    from websockets.asyncio.client import connect as ws_connect
+except ImportError:
+    print("ERROR: websockets not installed. Run: pip install websockets")
+    sys.exit(1)
+
+from models import Message, PeerInfo, MsgType, ConnInfo
+from security import get_security_manager, audit_auth, audit_message
+from capability import get_registry
+from registry import OperatorRegistry, AgentRegistry, RegisterRequest, Operator
+
+BASE_DIR = Path(__file__).parent
+DATA_DIR = BASE_DIR / "data"
+LOGS_DIR = BASE_DIR / "logs"
+CONFIG_FILE = BASE_DIR / "config.json"
+
+DATA_DIR.mkdir(exist_ok=True)
+LOGS_DIR.mkdir(exist_ok=True)
+
+
+def _get_node_id():
+    """获取节点ID：环境变量 > 配置文件"""
+    return os.environ.get("JLM_NODE_ID") or None
+
+
+class AIMNode:
+    """统一节点 — 既是服务端又是客户端"""
+
+    def __init__(self, config_path: str = None, my_id: str = None):
+        self.config = self._load_config(config_path or CONFIG_FILE)
+        self.my_id = my_id or _get_node_id() or self.config.get("node_id", "ZS0002")
+        
+        # 安全Phase2开关：支持配置文件或环境变量控制
+        # 优先级：环境变量 > 配置文件 > 默认值
+        hmac_verify = os.environ.get('AIM_HMAC_VERIFY', '').lower()
+        if hmac_verify in ('true', '1', 'yes'):
+            self.hmac_verify_enabled = True
+        elif hmac_verify in ('false', '0', 'no'):
+            self.hmac_verify_enabled = False
+        else:
+            # 从配置文件读取，默认关闭（开发测试模式）
+            self.hmac_verify_enabled = self.config.get('security', {}).get('hmac_verify', False)
+
+        # TLS配置
+        tls_cfg = self.config.get('security', {}).get('tls', {})
+        self.tls_enabled = tls_cfg.get('enabled', False)
+        self.tls_cert = tls_cfg.get('cert_file', 'secrets/cert.pem')
+        self.tls_key = tls_cfg.get('key_file', 'secrets/key.pem')
+        self._ssl_context = None
+        if self.tls_enabled:
+            self._init_tls()
+
+        # 认证频率控制
+        rate_cfg = self.config.get('security', {}).get('rate_limit', {})
+        self.auth_max_attempts = rate_cfg.get('auth_max_attempts', 5)
+        self.auth_window_seconds = rate_cfg.get('auth_window_seconds', 30)
+        self._auth_attempts: Dict[str, list] = {}  # ip -> [timestamps]
+
+        # 所有已知 Agent（含自己）
+        self.tokens = self._load_tokens()  # 本节点的明文token
+        self.agents: Dict[str, PeerInfo] = {}
+        for aid, acfg in self.config["agents"].items():
+            self.agents[aid] = PeerInfo(
+                agent_id=aid, name=acfg["name"], emoji=acfg["emoji"],
+                token_hash=acfg.get("token_hash", ""),
+                token=self.tokens.get(aid, ""),
+                role=acfg.get("role", "member"),
+                host=acfg.get("host", "127.0.0.1"),
+                port=acfg.get("port", 18900),
+            )
+
+        # 本节点的明文token
+        self.token = self.tokens.get(self.my_id, "")
+
+        # 本节点配置（从 agents 中取自己）
+        my_cfg = self.config["agents"][self.my_id]
+        self.name = my_cfg["name"]
+        self.emoji = my_cfg["emoji"]
+        self.role = my_cfg.get("role", "member")
+        self.port = my_cfg.get("port", 18900)
+        self.host = my_cfg.get("host", "0.0.0.0")
+
+        # 群组
+        self.groups: Dict[str, dict] = {}
+        for gid, gcfg in self.config.get("groups", {}).items():
+            self.groups[gid] = {"group_id": gid, "name": gcfg["name"],
+                                "members": gcfg["members"]}
+
+        # 连接池
+        self._server_clients: Dict[str, object] = {}   # 连入我的节点 {agent_id: ws}
+        self._peer_conns: Dict[str, object] = {}        # 我连出的节点 {agent_id: ws}
+        self._max_conns_per_agent = 5
+        self._seen_msgs: Set[str] = set()               # 去重（防环）
+        self._sent_msgs: Set[str] = set()               # 发送端去重（防重发）
+        self._sent_fingerprints: Dict[str, float] = {}   # 内容指纹去重 {fingerprint: timestamp}
+        self._fingerprint_ttl = 60                       # 指纹有效期（秒）
+        self._sent_ids: Set[str] = set()               # 接收端去重（防重复处理）
+        
+        # 任务状态追踪
+        self._task_states: Dict[str, dict] = {}         # {msg_id: {state, ts, by, task_info}}
+        self._task_states_ttl = 3600                    # 状态保留 1 小时
+
+        self._running = False
+        self._loop = None
+
+        # 日志
+        self.log = logging.getLogger(f"aim.{self.my_id}")
+
+        # ── 注册表 ──
+        self._init_registry()
+
+    def _init_registry(self):
+        self.op_registry = OperatorRegistry()
+        self.ag_registry = AgentRegistry(self.op_registry)
+        operators_cfg = self.config.get("operators", {})
+        if operators_cfg:
+            self.op_registry.load_from_config(operators_cfg)
+            self.log.info(f"加载 {len(operators_cfg)} 个操作人")
+        op_id = list(operators_cfg.keys())[0] if operators_cfg else "OP0001"
+        for aid, acfg in self.config.get("agents", {}).items():
+            self.ag_registry.add_seed(agent_id=aid, operator_id=op_id, agent_name=acfg["name"], emoji=acfg.get("emoji",""), framework=acfg.get("framework",""))
+        id_config = self.config.get("registration",{}).get("id_pool",{})
+        start = id_config.get("start",4)
+        if isinstance(start,str): start = int(start.replace("ZS",""))
+        self.ag_registry._next_id = max(start,3)
+        self.log.info(f"注册表就绪 下一个: ZS{self.ag_registry._next_id:04d}")
+
+    def _init_tls(self):
+        """初始化TLS/SSL上下文（加载证书）"""
+        import ssl
+        cert_path = Path(self.tls_cert)
+        key_path = Path(self.tls_key)
+        if not cert_path.is_absolute():
+            cert_path = BASE_DIR / cert_path
+        if not key_path.is_absolute():
+            key_path = BASE_DIR / key_path
+        if not cert_path.exists():
+            self.log.warning(f"TLS证书不存在: {cert_path}，TLS未启用")
+            self.tls_enabled = False
+            return
+        if not key_path.exists():
+            self.log.warning(f"TLS密钥不存在: {key_path}，TLS未启用")
+            self.tls_enabled = False
+            return
+        try:
+            self._ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            self._ssl_context.load_cert_chain(str(cert_path), str(key_path))
+            self.log.info(f"🔒 TLS已启用: {cert_path}")
+        except Exception as e:
+            self.log.error(f"TLS初始化失败: {e}")
+            self.tls_enabled = False
+
+    def _check_auth_rate_limit(self, ip: str) -> bool:
+        """认证频率控制：同一IP在窗口期内最多N次认证尝试"""
+        now = time.time()
+        window = self.auth_window_seconds
+        max_attempts = self.auth_max_attempts
+        if ip not in self._auth_attempts:
+            self._auth_attempts[ip] = []
+        # 清理过期记录
+        self._auth_attempts[ip] = [t for t in self._auth_attempts[ip] if now - t < window]
+        # 检查是否超限
+        if len(self._auth_attempts[ip]) >= max_attempts:
+            self.log.warning(f"🚫 认证频率超限: {ip} ({max_attempts}次/{window}s)")
+            return False
+        self._auth_attempts[ip].append(now)
+        return True
+
+    def _load_config(self, path) -> dict:
+        p = Path(path) if isinstance(path, str) else path
+        if not p.exists():
+            print(f"ERROR: 配置文件不存在: {p}")
+            sys.exit(1)
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _load_tokens(self) -> dict:
+        """加载明文token（仅本节点的token.json）"""
+        token_file = BASE_DIR / "tokens.json"
+        if token_file.exists():
+            with open(token_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        return {}
+
+    # ── 消息持久化 ────────────────────────────────
+
+    MSG_FILE = DATA_DIR / "messages.jsonl"
+    MAX_MSG_FILE = 10 * 1024 * 1024  # 10MB 轮转
+
+    def _persist(self, msg: Message):
+        try:
+            # 超过10MB轮转为 .old
+            if self.MSG_FILE.exists() and self.MSG_FILE.stat().st_size > self.MAX_MSG_FILE:
+                old = self.MSG_FILE.with_suffix(".jsonl.old")
+                self.MSG_FILE.rename(old)
+            msg_dict = json.loads(msg.to_log_line())
+            with open(self.MSG_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(msg_dict, ensure_ascii=False) + "\n")
+            # 归档到各Agent本地记录
+            try:
+                from archive import archive_message
+                archive_message(msg_dict)
+            except Exception:
+                pass
+        except Exception as e:
+            self.log.error(f"持久化失败: {e}")
+
+    def _get_offline(self, agent_id: str) -> list:
+        path = DATA_DIR / f"offline_{agent_id}.json"
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, OSError):
+                pass
+        return []
+
+    def _save_offline(self, agent_id: str, messages: list):
+        path = DATA_DIR / f"offline_{agent_id}.json"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(messages, f, ensure_ascii=False)
+
+    # ── JSON 收发 ─────────────────────────────────
+
+    async def _send_json(self, ws, data: dict):
+        try:
+            await ws.send(json.dumps(data, ensure_ascii=False))
+        except (websockets.ConnectionClosed, ConnectionError, OSError):
+            pass
+
+    async def _broadcast(self, data: dict, exclude: str = None):
+        """广播给所有已连接节点"""
+        for aid, ws in {**self._server_clients, **self._peer_conns}.items():
+            if aid != exclude:
+                await self._send_json(ws, data)
+
+    async def _broadcast_status(self, msg_id: str, state: str, by: str, data: dict):
+        """广播状态更新
+        - 私信：只回传给发送方
+        - 群消息：广播给群内所有参与者
+        """
+        status_msg = {
+            "cmd": "status_update",
+            "msg_id": msg_id,
+            "state": state,
+            "by": by,
+            "ts": data.get("ts", time.time()),
+            "detail": data.get("detail", ""),
+        }
+        
+        # 查找原始消息以确定是私信还是群消息
+        task_info = self._task_states.get(msg_id, {})
+        is_group = data.get("group", False)
+        
+        if is_group:
+            # 群消息：广播给群内所有成员
+            target_group = data.get("group_id", "grp_trio")
+            group = self.groups.get(target_group, {})
+            members = group.get("members", [])
+            for member_id in members:
+                if member_id != by:  # 不发给自己
+                    if member_id in self._server_clients:
+                        await self._send_json(self._server_clients[member_id], status_msg)
+                    elif member_id in self._peer_conns:
+                        await self._send_json(self._peer_conns[member_id], status_msg)
+        else:
+            # 私信：只回传给发送方（原始消息的 from_id）
+            original_from = data.get("original_from", by)
+            if original_from in self._server_clients:
+                await self._send_json(self._server_clients[original_from], status_msg)
+            elif original_from in self._peer_conns:
+                await self._send_json(self._peer_conns[original_from], status_msg)
+
+    def _cleanup_task_states(self):
+        """清理过期的任务状态"""
+        now = time.time()
+        expired = [mid for mid, st in self._task_states.items()
+                   if now - st.get("ts", 0) > self._task_states_ttl]
+        for mid in expired:
+            del self._task_states[mid]
+
+    # ── 消息投递 ──────────────────────────────────
+
+    def _check_send_dedup(self, from_id: str, to_id: str, content: str) -> bool:
+        """内容指纹去重：同一发送者60秒内发相同内容返回True（重复）"""
+        key = f"{from_id}:{to_id}:{content[:200]}"
+        fp = hashlib.md5(key.encode()).hexdigest()[:16]
+        now = time.time()
+
+        # 清理过期指纹
+        expired = [k for k, t in self._sent_fingerprints.items()
+                   if now - t > self._fingerprint_ttl]
+        for k in expired:
+            del self._sent_fingerprints[k]
+
+        # 检查是否重复
+        if fp in self._sent_fingerprints:
+            return True
+
+        self._sent_fingerprints[fp] = now
+        return False
+
+    async def _deliver(self, msg: Message):
+        """投递消息：本地 / 对等节点 / 离线"""
+        # 发送端去重（防重发）
+        if msg.msg_id in self._sent_msgs:
+            return
+        self._sent_msgs.add(msg.msg_id)
+        if len(self._sent_msgs) > 10000:
+            self._sent_msgs = set(list(self._sent_msgs)[-5000:])
+
+        if msg.msg_id in self._seen_msgs:
+            return  # 已处理过，防环
+        self._seen_msgs.add(msg.msg_id)
+        if len(self._seen_msgs) > 10000:
+            self._seen_msgs = set(list(self._seen_msgs)[-5000:])
+
+        self._persist(msg)
+
+        if msg.group:
+            await self._deliver_group(msg)
+        else:
+            await self._deliver_single(msg)
+
+    async def _deliver_single(self, msg: Message):
+        """单聊投递"""
+        to = msg.to_id
+
+        # 1) 目标直接连在我这（优先路由到客户端连接）
+        if to in self._server_clients:
+            await self._send_json(self._server_clients[to], {
+                "cmd": "message", "msg": json.loads(msg.to_json())
+            })
+            await self._send_ack(msg)
+            return
+
+        # 2) 目标是我自己（本地处理）
+        if to == self.my_id:
+            self._on_local_message(msg)
+            return
+
+        # 3) 目标在我连出的对等节点上
+        if to in self._peer_conns:
+            await self._send_json(self._peer_conns[to], {
+                "cmd": "relay", "msg": json.loads(msg.to_json())
+            })
+            await self._send_ack(msg)
+            return
+
+        # 4) 尝试通过已知对等节点路由
+        for peer_id, ws in self._peer_conns.items():
+            if peer_id != msg.from_id and msg.hop < 3:
+                fwd = json.loads(msg.to_json())
+                fwd["hop"] = msg.hop + 1
+                await self._send_json(ws, {"cmd": "relay", "msg": fwd})
+                await self._send_ack(msg)
+                return
+
+        # 5) 不可达，存离线
+        offline = self._get_offline(to)
+        if len(offline) < 5000:
+            offline.append(json.loads(msg.to_json()))
+            self._save_offline(to, offline)
+        await self._send_ack(msg, delivered=False)
+        self.log.info(f"📬 {msg.from_id}→{to}: 离线存储")
+
+    async def _deliver_group(self, msg: Message):
+        """群聊投递 — 按成员投递+离线存储，确保每个成员都能收到"""
+        group = self.groups.get(msg.to_id)
+        if not group:
+            return
+
+        delivered_any = False
+        for mid in group["members"]:
+            if mid == msg.from_id:
+                continue
+            # 本地成员（直连在我这的WebSocket客户端）
+            if mid in self._server_clients:
+                await self._send_json(self._server_clients[mid], {
+                    "cmd": "message", "msg": json.loads(msg.to_json())
+                })
+                delivered_any = True
+                self.log.info(f"📨 群发→{mid}: 在线推送(server_client)")
+            elif mid in self._peer_conns:
+                await self._send_json(self._peer_conns[mid], {
+                    "cmd": "relay", "msg": json.loads(msg.to_json())
+                })
+                delivered_any = True
+                self.log.info(f"📨 群发→{mid}: 在线推送(peer_conn)")
+            else:
+                # 离线存储 — 按成员单独存储，确保群消息在个人离线箱中
+                offline = self._get_offline(mid)
+                if len(offline) < 5000:
+                    offline.append(json.loads(msg.to_json()))
+                    self._save_offline(mid, offline)
+                    self.log.info(f"📬 群发→{mid}: 离线存储")
+
+        await self._send_ack(msg, delivered=delivered_any)
+
+    async def _send_ack(self, msg: Message, delivered: bool = True):
+        if msg.from_id in self._server_clients:
+            await self._send_json(self._server_clients[msg.from_id], {
+                "cmd": "ack", "msg_id": msg.msg_id, "delivered": delivered
+            })
+        elif msg.from_id in self._peer_conns:
+            await self._send_json(self._peer_conns[msg.from_id], {
+                "cmd": "ack", "msg_id": msg.msg_id, "delivered": delivered
+            })
+
+    def _on_local_message(self, msg: Message):
+        """收到发给本节点的消息"""
+        # 接收端去重
+        if msg.msg_id in self._sent_ids:
+            return
+        self._sent_ids.add(msg.msg_id)
+        if len(self._sent_ids) > 10000:
+            self._sent_ids = set(list(self._sent_ids)[-5000:])
+
+        dt = datetime.fromtimestamp(msg.timestamp).strftime("%H:%M:%S")
+        sender = self.agents.get(msg.from_id)
+        prefix = f"[群]" if msg.group else ""
+        self.log.info(f"📨 {dt} {prefix}[{msg.from_id}] {msg.content}")
+
+    # ── 服务端（接受连入）─────────────────────────
+
+    async def _handle_server_client(self, ws):
+        """处理连入的客户端"""
+        agent_id = None
+        try:
+            async for raw in ws:
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+
+                cmd = data.get("cmd", "")
+
+                if cmd == "auth":
+                    # 获取客户端IP
+                    peer_info = ws.remote_address if hasattr(ws, 'remote_address') else ("unknown", 0)
+                    client_ip = peer_info[0] if isinstance(peer_info, tuple) else str(peer_info)
+                    # 认证频率控制
+                    if not self._check_auth_rate_limit(client_ip):
+                        await self._send_json(ws, {"cmd": "auth_fail", "reason": "认证频率过高，请稍后重试"})
+                        continue
+                    aid = data.get("agent_id", "")
+                    agent = self.agents.get(aid)
+                    # 支持新旧两种认证方式
+                    if "signature" in data and "timestamp" in data:
+                        if self.hmac_verify_enabled:
+                            # 新方式：HMAC签名认证
+                            timestamp = data.get("timestamp", 0)
+                            signature = data.get("signature", "")
+                            sec = get_security_manager()
+                            if not sec.verify_signature(aid, timestamp, signature):
+                                audit_auth(aid, False, "hmac", "签名验证失败")
+                                await self._send_json(ws, {"cmd": "auth_fail", "reason": "签名验证失败"})
+                                continue
+                        # else: HMAC验证关闭，直接通过
+                    else:
+                        # 旧方式：token认证（向后兼容）
+                        token = data.get("token", "")
+                        if not agent or not agent.verify_token(aid, token):
+                            audit_auth(aid, False, "token", "认证失败")
+                            await self._send_json(ws, {"cmd": "auth_fail", "reason": "认证失败"})
+                            continue
+
+                    # 踢旧连接
+                    if aid in self._server_clients:
+                        try:
+                            await self._server_clients[aid].close()
+                        except Exception:
+                            pass
+
+                    self._server_clients[aid] = ws
+                    agent.online = True
+                    agent_id = aid
+
+                    self.log.info(f"✅ {agent.emoji}{agent.name}({aid}) 连入")
+
+                    # 返回认证成功 + 离线消息
+                    offline = self._get_offline(aid)
+                    if offline:
+                        self._save_offline(aid, [])
+
+                    await self._send_json(ws, {
+                        "cmd": "auth_ok",
+                        "agent": agent.to_dict(),
+                        "groups": [g for g in self.groups.values() if aid in g["members"]],
+                        "unread": offline,
+                    })
+                    auth_method = "hmac" if "signature" in data else "token"
+                    audit_auth(aid, True, auth_method)
+                    self.log.info(f"📤 auth_ok已发送给 {aid}")
+
+                    # 广播上线
+                    try:
+                        await self._broadcast({
+                            "cmd": "presence", "agent_id": aid,
+                            "name": agent.name, "emoji": agent.emoji,
+                            "status": "online",
+                        }, exclude=aid)
+                        self.log.info(f"📡 presence广播完成 for {aid}")
+                    except Exception as bcast_err:
+                        self.log.error(f"❌ presence广播异常: {bcast_err}")
+
+                    self.log.info(f"🔄 handler继续监听 {aid}...")
+
+                elif cmd == "ping":
+                    await self._send_json(ws, {"cmd": "pong"})
+
+                elif not agent_id:
+                    await self._send_json(ws, {"cmd": "error", "reason": "未认证"})
+
+                elif cmd == "send":
+                    to_id = data.get("to", "")
+                    content = data.get("content", "")
+                    # 内容指纹去重（防脚本重发）
+                    if self._check_send_dedup(agent_id, to_id, content):
+                        self.log.info(f"🔄 发送端去重: {agent_id}→{to_id}: {content[:30]}")
+                        await self._send_json(ws, {"cmd": "ack", "msg_id": "dedup", "delivered": True})
+                        continue
+                    # 消息签名验证（安全Phase2）
+                    msg_signature = data.get("signature")
+                    msg_timestamp = data.get("timestamp")
+                    msg_id = data.get("msg_id", "")
+                    if msg_signature and msg_timestamp and self.hmac_verify_enabled:
+                        sec = get_security_manager()
+                        if not sec.verify_message_signature(agent_id, msg_id, content, msg_timestamp, msg_signature):
+                            self.log.warning(f"⚠️ 消息签名验证失败: {agent_id}→{to_id}")
+                            await self._send_json(ws, {"cmd": "error", "reason": "消息签名验证失败"})
+                            continue
+                    msg = Message(
+                        from_id=agent_id,
+                        to_id=to_id,
+                        content=content,
+                        group=data.get("group", False),
+                    )
+                    self.log.info(f"📨 {agent_id}→{msg.to_id}: {msg.content[:50]}")
+                    verified = bool(msg_signature) and bool(msg_timestamp)
+                    audit_message(agent_id, msg.to_id, verified, msg.group)
+                    await self._deliver(msg)
+
+                elif cmd == "relay":
+                    # 来自对等节点的消息转发
+                    msg_data = data.get("msg", {})
+                    msg = Message(**{k: v for k, v in msg_data.items()
+                                     if k in Message.__dataclass_fields__})
+                    await self._deliver(msg)
+
+                elif cmd == "online?":
+                    online = [a.to_dict() for a in self.agents.values() if a.online]
+                    await self._send_json(ws, {"cmd": "online_list", "agents": online})
+
+                elif cmd == "groups?":
+                    glist = [g for g in self.groups.values()
+                             if agent_id in g["members"]]
+                    await self._send_json(ws, {"cmd": "groups_list", "groups": glist})
+
+                elif cmd == "history":
+                    results = self._query_history(
+                        agent_id, data.get("target", ""),
+                        data.get("limit", 50), data.get("group", False)
+                    )
+                    await self._send_json(ws, {
+                        "cmd": "history", "target": data.get("target"),
+                        "messages": results,
+                    })
+
+                elif cmd == "status_update":
+                    # 任务状态更新
+                    msg_id = data.get("msg_id", "")
+                    state = data.get("state", "")
+                    if msg_id and state:
+                        self._task_states[msg_id] = {
+                            "state": state,
+                            "ts": data.get("ts", time.time()),
+                            "by": agent_id,
+                            "detail": data.get("detail", ""),
+                            "task_info": data.get("task", None),
+                        }
+                        self.log.info(f"📊 状态更新: {msg_id} → {state} (by {agent_id})")
+                        # 传递群组信息
+                        broadcast_data = {
+                            **data,
+                            "group": data.get("group", False),
+                            "group_id": data.get("group_id", ""),
+                            "original_from": data.get("original_from", agent_id),
+                        }
+                        await self._broadcast_status(msg_id, state, agent_id, broadcast_data)
+                    await self._send_json(ws, {"cmd": "status_ack", "msg_id": msg_id})
+
+                elif cmd == "task_status":
+                    # 查询任务状态
+                    msg_id = data.get("msg_id", "")
+                    state = self._task_states.get(msg_id)
+                    await self._send_json(ws, {
+                        "cmd": "task_status_result",
+                        "msg_id": msg_id,
+                        "state": state,
+                    })
+
+                elif cmd == "register_capabilities":
+                    # 注册Agent能力
+                    caps = data.get("capabilities", [])
+                    registry = get_registry()
+                    registry.register(
+                        agent_id=agent_id,
+                        capabilities=caps,
+                        name=data.get("name", ""),
+                        emoji=data.get("emoji", ""),
+                        framework=data.get("framework", ""),
+                    )
+                    self.log.info(f"📋 能力注册: {agent_id} ({len(caps)} 项能力)")
+                    await self._send_json(ws, {"cmd": "ack", "success": True})
+
+                elif cmd == "query_capabilities":
+                    # 查询能力
+                    cap_id = data.get("capability_id")
+                    registry = get_registry()
+                    if cap_id:
+                        results = registry.query(cap_id)
+                    else:
+                        results = registry.get_all_agents()
+                    await self._send_json(ws, {
+                        "cmd": "capabilities_list",
+                        "agents": results,
+                    })
+
+                elif cmd == "select_agent":
+                    # 根据任务选择最佳Agent
+                    task = data.get("task", "")
+                    registry = get_registry()
+                    agent_id_result = registry.select_agent(task)
+                    cap_result = registry.match(task)
+                    await self._send_json(ws, {
+                        "cmd": "agent_selected",
+                        "agent_id": agent_id_result,
+                        "capability": cap_result.get("capability") if cap_result else None,
+                    })
+
+        except websockets.ConnectionClosed:
+            pass
+        except Exception as e:
+            self.log.error(f"连接异常: {e}")
+        finally:
+            if agent_id:
+                # 竞态修复：只在自己仍是活跃连接时才清理，避免旧连接误删新连接
+                if self._server_clients.get(agent_id) is ws:
+                    del self._server_clients[agent_id]
+                    agent = self.agents.get(agent_id)
+                    if agent:
+                        agent.online = False
+                        self.log.info(f"❌ {agent.emoji}{agent.name}({agent_id}) 断开")
+                    await self._broadcast({
+                        "cmd": "presence", "agent_id": agent_id,
+                        "status": "offline",
+                    }, exclude=agent_id)
+
+    def _query_history(self, from_id, target, limit=50, group=False):
+        results = []
+        for log_path in [self.MSG_FILE, self.MSG_FILE.with_suffix(".jsonl.old")]:
+            if not log_path.exists():
+                continue
+            with open(log_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        msg = json.loads(line.strip())
+                        if group:
+                            if msg.get("to") == target and msg.get("group"):
+                                results.append(msg)
+                        else:
+                            a, b = msg.get("from"), msg.get("to")
+                            if (a == from_id and b == target) or (a == target and b == from_id):
+                                results.append(msg)
+                    except (json.JSONDecodeError, OSError):
+                        continue
+        return results[-limit:]
+
+    # ── 客户端（连出到对等节点）───────────────────
+
+    async def _connect_peer(self, peer: PeerInfo):
+        """连接到对等节点"""
+        if peer.agent_id == self.my_id:
+            return
+
+        retry_delay = 2
+        while self._running:
+            try:
+                self.log.info(f"🔗 连接 {peer.emoji}{peer.name} @ {peer.ws_url}")
+                async with ws_connect(
+                    peer.ws_url,
+                    ping_interval=25,
+                    ping_timeout=10,
+                    open_timeout=10,
+                ) as ws:
+                    # 认证
+                    await self._send_json(ws, {
+                        "cmd": "auth",
+                        "agent_id": self.my_id,
+                        "token": self.token,
+                    })
+
+                    # 等待认证结果
+                    raw = await asyncio.wait_for(ws.recv(), timeout=10)
+                    resp = json.loads(raw)
+                    if resp.get("cmd") != "auth_ok":
+                        self.log.error(f"认证失败 {peer.name}: {resp.get('reason')}")
+                        await asyncio.sleep(retry_delay)
+                        continue
+
+                    self._peer_conns[peer.agent_id] = ws
+                    peer.online = True
+                    retry_delay = 2
+
+                    self.log.info(f"✅ 已连接 {peer.emoji}{peer.name}")
+
+                    # 处理离线消息
+                    unread = resp.get("unread", [])
+                    for um in unread:
+                        msg = Message(**{k: v for k, v in um.items()
+                                         if k in Message.__dataclass_fields__})
+                        self._on_local_message(msg)
+
+                    # 接收循环
+                    async for raw in ws:
+                        try:
+                            data = json.loads(raw)
+                            cmd = data.get("cmd", "")
+
+                            if cmd == "message":
+                                msg_data = data.get("msg", {})
+                                msg = Message(**{k: v for k, v in msg_data.items()
+                                                 if k in Message.__dataclass_fields__})
+                                self._persist(msg)
+                                self._on_local_message(msg)
+
+                            elif cmd == "relay":
+                                msg_data = data.get("msg", {})
+                                msg = Message(**{k: v for k, v in msg_data.items()
+                                                 if k in Message.__dataclass_fields__})
+                                await self._deliver(msg)
+
+                            elif cmd == "presence":
+                                aid = data.get("agent_id")
+                                if aid in self.agents:
+                                    self.agents[aid].online = data.get("status") == "online"
+                                self.log.info(
+                                    f"👤 {data.get('emoji','')}{data.get('name','')} "
+                                    f"{'上线' if data.get('status')=='online' else '下线'}"
+                                )
+
+                            elif cmd == "pong":
+                                pass
+
+                        except json.JSONDecodeError:
+                            continue
+
+            except (websockets.ConnectionClosed, ConnectionRefusedError, OSError) as e:
+                self._peer_conns.pop(peer.agent_id, None)
+                peer.online = False
+
+                if not self._running:
+                    break
+
+                self.log.warning(f"断开 {peer.name}: {e}，{retry_delay}s后重连...")
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 30)
+
+            except Exception as e:
+                self.log.error(f"连接 {peer.name} 异常: {e}")
+                if not self._running:
+                    break
+                await asyncio.sleep(5)
+
+    # ── 节点生命周期 ──────────────────────────────
+
+    async def _run_node(self):
+        """启动节点：服务端 + 客户端"""
+        tasks = []
+
+        # 1) 启动服务端
+        if self.tls_enabled and self._ssl_context:
+            server = ws_serve(
+                self._handle_server_client,
+                self.host, self.port,
+                ssl=self._ssl_context,
+            )
+            proto = "wss"
+        else:
+            server = ws_serve(
+                self._handle_server_client,
+                self.host, self.port,
+            )
+            proto = "ws"
+        server_task = asyncio.create_task(server.__aenter__())
+        tasks.append(server_task)
+
+        # 等服务端就绪
+        await asyncio.sleep(0.5)
+        self.log.info(f"🖥️  服务端就绪 {proto}://127.0.0.1:{self.port}"+ (" 🔒" if self.tls_enabled else ""))
+
+        # 2) 连接对等节点（Hub 模式下不连，只接受连入）
+        if self.role != "admin":
+            for peer in self.agents.values():
+                if peer.agent_id != self.my_id:
+                    task = asyncio.create_task(self._connect_peer(peer))
+                    tasks.append(task)
+        else:
+            self.log.info("   Hub 模式：仅接受连入，不主动连对等节点")
+
+        # 3) 等待停止信号
+        stop = asyncio.get_event_loop().create_future()
+
+        def handle_signal():
+            self.log.info("收到停止信号，执行优雅关闭...")
+            # 广播关闭通知给所有客户端
+            asyncio.ensure_future(self._broadcast({
+                "cmd": "shutdown",
+                "reason": "server_restart",
+                "message": "服务端正在重启，客户端将自动重连"
+            }))
+            if not stop.done():
+                stop.set_result(True)
+
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, handle_signal)
+            except NotImplementedError:
+                pass
+
+        await stop
+
+        # 清理
+        self._running = False
+        for t in tasks:
+            t.cancel()
+
+    def run(self):
+        """阻塞运行"""
+        self._running = True
+        self.log.info(f"🚀 AIM 节点启动: {self.emoji}{self.name}({self.my_id})")
+        self.log.info(f"   监听: {self.host}:{self.port}")
+        peers = [f"{a.emoji}{a.name}({a.agent_id})" for a in self.agents.values()
+                 if a.agent_id != self.my_id]
+        if peers:
+            self.log.info(f"   对等: {', '.join(peers)}")
+
+        try:
+            asyncio.run(self._run_node())
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self._running = False
+            self.log.info("节点已关闭")
+
+    # ── CLI 快捷操作 ──────────────────────────────
+
+    def send_once(self, to_id: str, content: str, group: bool = False):
+        """发送一条消息后退出（同步阻塞）"""
+        self._running = True
+        results = []
+
+        async def _do():
+            target_agent = self.agents.get(to_id)
+            if not target_agent and not group:
+                print(f"ERROR: 未知Agent {to_id}")
+                return
+            if group and to_id not in self.groups:
+                print(f"ERROR: 未知群组 {to_id}")
+                return
+
+            # 优先连 Hub（admin 节点），再试其它对等节点
+            peers_to_try = []
+
+            # admin 节点优先（通常是 Hub）
+            for peer in self.agents.values():
+                if peer.role == "admin" and peer.agent_id != self.my_id:
+                    peers_to_try.append((peer.agent_id, peer.ws_url))
+
+            # 自己的端口（如果正在运行）
+            my_url = f"ws://127.0.0.1:{self.port}"
+            if not any(url == my_url for _, url in peers_to_try):
+                peers_to_try.insert(0, ("self", my_url))
+
+            # 其它对等节点
+            for peer in self.agents.values():
+                if peer.agent_id != self.my_id and peer.role != "admin":
+                    peers_to_try.append((peer.agent_id, peer.ws_url))
+
+            connected = False
+            for peer_id, url in peers_to_try:
+                try:
+                    ws = await ws_connect(url, open_timeout=3)
+                    await self._send_json(ws, {
+                        "cmd": "auth", "agent_id": self.my_id, "token": self.token
+                    })
+                    raw = await asyncio.wait_for(ws.recv(), timeout=5)
+                    resp = json.loads(raw)
+                    if resp.get("cmd") == "auth_ok":
+                        await self._send_json(ws, {
+                            "cmd": "send", "to": to_id,
+                            "content": content, "group": group,
+                        })
+                        results.append(f"已发送 → {to_id}")
+                        connected = True
+                        # 等待 ack，确认消息已投递
+                        try:
+                            ack = await asyncio.wait_for(ws.recv(), timeout=3)
+                            results.append(f"ACK: {ack}")
+                        except (asyncio.TimeoutError, websockets.ConnectionClosed):
+                            results.append("⚠️ 未收到ACK，消息可能延时到达")
+                        await ws.close()
+                        break
+                except (websockets.ConnectionClosed, ConnectionRefusedError, OSError):
+                    continue
+
+            if not connected:
+                print(f"ERROR: 无法连接到任何节点（确保 aim.py start 已运行）")
+
+        asyncio.run(_do())
+        for r in results:
+            print(r)
+
+    def query_online_once(self):
+        """查询在线Agent后退出"""
+        async def _do():
+            # admin 节点优先，再试自己，再试其它
+            urls = []
+            for peer in self.agents.values():
+                if peer.role == "admin" and peer.agent_id != self.my_id:
+                    urls.append((peer.agent_id, peer.ws_url))
+            my_url = f"ws://127.0.0.1:{self.port}"
+            if not any(url == my_url for _, url in urls):
+                urls.insert(0, ("self", my_url))
+            for peer in self.agents.values():
+                if peer.agent_id != self.my_id and peer.role != "admin":
+                    urls.append((peer.agent_id, peer.ws_url))
+
+            for peer_id, url in urls:
+                try:
+                    ws = await ws_connect(url, open_timeout=3)
+                    await self._send_json(ws, {
+                        "cmd": "auth", "agent_id": self.my_id, "token": self.token
+                    })
+                    raw = await asyncio.wait_for(ws.recv(), timeout=5)
+                    resp = json.loads(raw)
+                    if resp.get("cmd") == "auth_ok":
+                        await self._send_json(ws, {"cmd": "online?"})
+                        raw = await asyncio.wait_for(ws.recv(), timeout=5)
+                        data = json.loads(raw)
+                        if data.get("cmd") == "online_list":
+                            agents = data.get("agents", [])
+                            if agents:
+                                for a in agents:
+                                    print(f"  {a.get('emoji','')}{a.get('name','')}({a.get('agent_id','')}) 🟢")
+                            else:
+                                print("  当前无其他在线Agent")
+                        await ws.close()
+                        return
+                except (websockets.ConnectionClosed, ConnectionRefusedError, OSError, asyncio.TimeoutError):
+                    continue
+            print("无法连接到任何节点（确保 aim.py start 已运行）")
+
+        asyncio.run(_do())
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="AIM Node")
+    parser.add_argument("--send", nargs=2, metavar=("TO", "MSG"), help="Send message")
+    parser.add_argument("--send-group", nargs=2, metavar=("GID", "MSG"), help="Send group message")
+    parser.add_argument("--online", action="store_true", help="Query online agents")
+    parser.add_argument("--node-id", help="Override node ID")
+    parser.add_argument("--config", help="Config file path")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    node = AIMNode(args.config, args.node_id)
+
+    if args.send:
+        node.send_once(args.send[0], args.send[1])
+    elif args.send_group:
+        node.send_once(args.send_group[0], args.send_group[1], group=True)
+    elif args.online:
+        node.query_online_once()
+    else:
+        node.run()
+
+
+if __name__ == "__main__":
+    main()

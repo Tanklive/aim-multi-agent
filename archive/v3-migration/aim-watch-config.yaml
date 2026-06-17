@@ -1,0 +1,56 @@
+# ============================================================
+# AIM Watch 配置规范
+# 路径: ~/.hermes/aim/aim-watch-config.yaml
+# 用途: 定义 aim-watch 和 observer 模块的默认行为
+# ============================================================
+
+# ─── 服务器连接 ───
+server: ws://127.0.0.1:18900
+
+# ─── Observer 身份 ───
+# agent_id: 当前 observer 使用的身份标识
+# 实际运行时应对应真实 Agent ID（如 ZS0002），便于 Server 区分不同观察者
+agent_id: "observer"
+
+# ─── 输出模式 ───
+# verbose: true  → 显示推理摘要、AI 回复内容等详细信息
+# verbose: false → 仅显示核心状态更新
+verbose: true
+
+# ─── 监控目标列表 ───
+# target: Agent ID 或 "*"（全部）
+# alias: 显示别名
+watches:
+  - target: "*"
+    alias: "全部消息"
+
+# ─── 日志配置 ───
+logging:
+  # 日志目录
+  dir: "~/shared/aim/logs/observer"
+  # 日志格式: jsonl（每行一个 JSON 事件）
+  format: jsonl
+  # 日志保留天数（0 = 永久保留）
+  retention_days: 30
+
+# ─── 显示过滤 ───
+display:
+  # 静默事件类型（不显示在终端，仍记录日志）
+  silent_events:
+    - heartbeat
+    - heartbeat_ack
+    - presence
+    - lifecycle
+  # 最大消息长度（字符），超过截断
+  max_message_length: 200
+  # 时间格式
+  time_format: "%H:%M:%S"
+
+# ─── 重连配置 ───
+reconnect:
+  # 初始重连延迟（秒）
+  initial_delay: 2
+  # 最大重连延迟（秒）
+  max_delay: 30
+  # 重连延迟倍数
+  backoff: 1.5

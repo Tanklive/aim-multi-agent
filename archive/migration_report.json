@@ -1,0 +1,36 @@
+{
+  "timestamp": 1780936002.306101,
+  "nats_url": "nats://127.0.0.1:4222",
+  "agents": [
+    {
+      "agent_id": "ZS0001",
+      "agent_name": "\u5471\u5471",
+      "emoji": "\ud83d\udc38"
+    },
+    {
+      "agent_id": "ZS0002",
+      "agent_name": "\u5409\u91cf",
+      "emoji": "\ud83d\udcca"
+    },
+    {
+      "agent_id": "ZS0005",
+      "agent_name": "\u5c0f\u706b\u9e21\u513f",
+      "emoji": "\ud83d\udc25"
+    }
+  ],
+  "status": "ready",
+  "files": {
+    "server": "aim_server_nats.py",
+    "agent": "aim_agent_nats.py",
+    "client": "aim_nats_client.py",
+    "test": "aim_nats/test_e2e.py",
+    "config": "~/.openclaw/config/nats-server.conf"
+  },
+  "next_steps": [
+    "1. \u505c\u6b62\u5f53\u524d WebSocket Server",
+    "2. \u542f\u52a8 NATS Server",
+    "3. \u542f\u52a8 NATS Server \u4e1a\u52a1\u5c42",
+    "4. \u5404 Agent \u5207\u6362\u5230 aim_agent_nats.py",
+    "5. \u8fd0\u884c\u7aef\u5230\u7aef\u6d4b\u8bd5"
+  ]
+}

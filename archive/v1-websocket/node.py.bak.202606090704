@@ -1,0 +1,1779 @@
+#!/usr/bin/env python3
+"""
+AIM Unified Node — 服务端+客户端合一
+每个节点同时监听（服务端）和连接对等节点（客户端）
+
+架构：
+  ┌─────────┐     WS      ┌─────────┐
+  │ ZS0001  │◄───────────►│ ZS0002  │
+  │ 🐸呱呱  │             │ 🐴吉量  │
+  └─────────┘             └────┬────┘
+       ▲                       │ WS
+       │          WS           │
+       └───────────────────────┘
+                        ┌─────────┐
+                        │ ZS0003  │
+                        │ 🐤小火鸡│
+                        └─────────┘
+
+每个节点：
+  - 启动 WebSocket 服务端（接受其它节点连入）
+  - 主动连接配置中的对等节点
+  - 消息路由：本地处理 / 转发给对等节点 / 存离线队列
+"""
+
+import asyncio
+import hashlib
+import json
+import logging
+import os
+import signal
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Optional, Set
+
+try:
+    import websockets
+    from websockets.asyncio.server import serve as ws_serve
+    from websockets.asyncio.client import connect as ws_connect
+except ImportError:
+    print("ERROR: websockets not installed. Run: pip install websockets")
+    sys.exit(1)
+
+from models import Message, PeerInfo, MsgType, ConnInfo
+from security import get_security_manager, audit_auth, audit_message
+from capability import get_registry
+from registry import OperatorRegistry, AgentRegistry, RegisterRequest, Operator, AgentStateManager
+from connection_pool import ConnectionPool, ConnectionInfo, MessageRingBuffer, ReloadableConnectionPool
+from delivery import DeliveryGuarantee, AckDedup
+from retry_integration import RetryManager
+
+BASE_DIR = Path(__file__).parent
+DATA_DIR = BASE_DIR / "data"
+LOGS_DIR = BASE_DIR / "logs"
+CONFIG_FILE = BASE_DIR / "config.json"
+
+DATA_DIR.mkdir(exist_ok=True)
+LOGS_DIR.mkdir(exist_ok=True)
+
+
+def _get_node_id():
+    """获取节点ID：环境变量 > 配置文件"""
+    return os.environ.get("JLM_NODE_ID") or None
+
+
+class AIMNode:
+    """统一节点 — 既是服务端又是客户端"""
+
+    def __init__(self, config_path: str = None, my_id: str = None):
+        self.config = self._load_config(config_path or CONFIG_FILE)
+        self.my_id = my_id or _get_node_id() or self.config.get("node_id", "ZS0002")
+        
+        # 安全Phase2开关：支持配置文件或环境变量控制
+        # 优先级：环境变量 > 配置文件 > 默认值
+        hmac_verify = os.environ.get('AIM_HMAC_VERIFY', '').lower()
+        if hmac_verify in ('true', '1', 'yes'):
+            self.hmac_verify_enabled = True
+        elif hmac_verify in ('false', '0', 'no'):
+            self.hmac_verify_enabled = False
+        else:
+            # 从配置文件读取
+            self.hmac_verify_enabled = self.config.get('security', {}).get('hmac_verify', False)
+
+        # 认证频率控制
+        rate_cfg = self.config.get('security', {}).get('rate_limit', {})
+        self.auth_max_attempts = rate_cfg.get('auth_max_attempts', 10)
+        self.auth_window_seconds = rate_cfg.get('auth_window_seconds', 30)
+        self._auth_attempts: Dict[str, list] = {}  # ip -> [timestamps]
+
+        # 所有已知 Agent（含自己）
+        self.tokens = self._load_tokens()  # 本节点的明文token
+        self.agents: Dict[str, PeerInfo] = {}
+        for aid, acfg in self.config["agents"].items():
+            self.agents[aid] = PeerInfo(
+                agent_id=aid, name=acfg["name"], emoji=acfg["emoji"],
+                token_hash=acfg.get("token_hash", ""),
+                token=self.tokens.get(aid, ""),
+                role=acfg.get("role", "member"),
+                host=acfg.get("host", "127.0.0.1"),
+                port=acfg.get("port", 18900),
+            )
+
+        # 本节点的明文token
+        self.token = self.tokens.get(self.my_id, "")
+
+        # 本节点配置（从 agents 中取自己）
+        my_cfg = self.config["agents"][self.my_id]
+        self.name = my_cfg["name"]
+        self.emoji = my_cfg["emoji"]
+        self.role = my_cfg.get("role", "member")
+        self.port = my_cfg.get("port", 18900)
+        self.host = my_cfg.get("host", "0.0.0.0")
+
+        # 群组
+        self.groups: Dict[str, dict] = {}
+        for gid, gcfg in self.config.get("groups", {}).items():
+            self.groups[gid] = {"group_id": gid, "name": gcfg["name"],
+                                "members": gcfg["members"]}
+
+        # 消息去重（ring buffer，500 条容量，FIFO 老化）
+        self._seen_msgs = MessageRingBuffer(500)      # 接收去重（防环）
+        self._sent_msgs = MessageRingBuffer(500)      # 发送去重（防重发）
+        self._sent_fingerprints: Dict[str, float] = {}   # 内容指纹去重 {fingerprint: timestamp}
+        self._fingerprint_ttl = 60                       # 指纹有效期（秒）
+        self._sent_ids = MessageRingBuffer(500)        # 接收端去重（防重复处理）
+
+        # Phase 2.1: DeliveryGuarantee 统一处理投递保达（含重传/离线/去重）
+
+        # 任务状态追踪
+        self._task_states: Dict[str, dict] = {}         # {msg_id: {state, ts, by, task_info}}
+        self._task_states_ttl = 3600                    # 状态保留 1 小时
+
+        # ── Status Feedback 机制 ──
+        # observer_bindings: {target_id: [observer_conn_info, ...]}
+        # observer 通过 channel="observer" 注册，指定 watch_target
+        # 服务端收到 status_feedback 后根据 watch_target 定向推给绑定的 observer
+        self._observer_bindings: Dict[str, list] = {}  # target_id -> [ConnectionInfo]
+        self._observer_status_file = DATA_DIR / "status_log.jsonl"
+        self._observer_status_max_size = 10 * 1024 * 1024  # 10MB 轮转
+        self._observer_last_seq: Dict[str, int] = {}  # observer_conn_id -> last_seq
+        
+        # Status Feedback 频率限制 {agent_id: [timestamps]}
+        self._sf_rate_limit: Dict[str, list] = {}
+        self._sf_max_per_second = 3  # 同一 agent_id 每秒最多 3 条
+
+        self._running = False
+        self._loop = None
+
+        # 日志
+        self.log = logging.getLogger(f"aim.{self.my_id}")
+
+    def _get_observers(self, target: str) -> list:
+        """获取监听 target 的所有 observer（含通配符 "*"）"""
+        observers = list(self._observer_bindings.get(target, []))
+        if target != "*":
+            observers.extend(self._observer_bindings.get("*", []))
+        return observers
+
+        # ── TLS（双栈模式：本地 ws + 可选公网 wss）
+        # tls.enabled 不再控制单端口的 ws/wss 切换
+        # 而是：证书存在 → 启动 wss 公网端口；证书不存在 → 仅 ws 本地端口
+        tls_cfg = self.config.get('security', {}).get('tls', {})
+        self.tls_cert = tls_cfg.get('cert_file', 'secrets/cert.pem')
+        self.tls_key = tls_cfg.get('key_file', 'secrets/key.pem')
+        self._ssl_context = None
+        self._init_tls_if_cert_exists()
+        # 连接池（替换旧的 _server_clients dict）
+        pool_config = {"max_per_agent": 5, "grace_period": 15}
+        self.connection_pool = ReloadableConnectionPool(config=pool_config)
+
+        # ── Agent 状态管理器（生命周期） ──
+        self.state_manager = AgentStateManager()
+        self.state_manager.set_lifecycle_callback(self._lifecycle_broadcast)
+        # 注入 state_manager 引用到 connection_pool，实现状态统一
+        self.connection_pool.set_state_manager(self.state_manager)
+        # 注入断连回调：优雅窗口超时后，所有连接断开时触发
+        self.connection_pool.set_disconnect_callback(self._on_agent_all_disconnect)
+
+        # Phase 2.2: RetryManager 断连回放 + 重传集成（需在 connection_pool 之后初始化）
+        self.retry_manager = None
+        self._init_retry_manager()
+
+        # Phase 2.1: DeliveryGuarantee 消息保达（需在 connection_pool 之后初始化）
+        self.delivery_guarantee = DeliveryGuarantee(
+            connection_pool=self.connection_pool,
+            send_fn=lambda to, md: self._dg_send_to_agent(to, md),
+            peer_send_fn=lambda pw, md: self._dg_send_to_peer(pw, md),
+            notify_fn=lambda fa, n: self._dg_notify_sender(fa, n),
+            retry_interval=30.0,
+            max_retries=3,
+            total_timeout=120.0,
+        )
+
+        self._peer_conns: Dict[str, object] = {}        # 我连出的节点 {agent_id: ws}
+        self.op_registry = OperatorRegistry()
+        self.ag_registry = AgentRegistry(self.op_registry)
+        operators_cfg = self.config.get("operators", {})
+        if operators_cfg:
+            self.op_registry.load_from_config(operators_cfg)
+            self.log.info(f"加载 {len(operators_cfg)} 个操作人")
+        op_id = list(operators_cfg.keys())[0] if operators_cfg else "OP0001"
+        for aid, acfg in self.config.get("agents", {}).items():
+            self.ag_registry.add_seed(agent_id=aid, operator_id=op_id, agent_name=acfg["name"], emoji=acfg.get("emoji",""), framework=acfg.get("framework",""))
+        id_config = self.config.get("registration",{}).get("id_pool",{})
+        start = id_config.get("start",4)
+        if isinstance(start,str): start = int(start.replace("ZS",""))
+        self.ag_registry._next_id = max(start,3)
+        self.log.info(f"注册表就绪 下一个: ZS{self.ag_registry._next_id:04d}")
+
+    def _init_tls_if_cert_exists(self):
+        """双栈模式：证书存在则加载 SSL context（用于公网 wss 端口），不存在则仅 ws"""
+        import ssl
+        cert_path = Path(self.tls_cert)
+        key_path = Path(self.tls_key)
+        if not cert_path.is_absolute():
+            cert_path = BASE_DIR / cert_path
+        if not key_path.is_absolute():
+            key_path = BASE_DIR / key_path
+        if not cert_path.exists() or not key_path.exists():
+            self.log.info("   (无 TLS 证书，仅启动 ws 本地端口)")
+            return
+        try:
+            self._ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            self._ssl_context.load_cert_chain(str(cert_path), str(key_path))
+            self.log.info(f"🔒 TLS 证书已加载，wss 端口就绪: {cert_path}")
+        except Exception as e:
+            self.log.error(f"TLS初始化失败: {e}")
+
+    def _init_tls(self):
+        """初始化TLS/SSL上下文（加载证书）"""
+        import ssl
+        cert_path = Path(self.tls_cert)
+        key_path = Path(self.tls_key)
+        if not cert_path.is_absolute():
+            cert_path = BASE_DIR / cert_path
+        if not key_path.is_absolute():
+            key_path = BASE_DIR / key_path
+        if not cert_path.exists():
+            self.log.warning(f"TLS证书不存在: {cert_path}，TLS未启用")
+            self.tls_enabled = False
+            return
+        if not key_path.exists():
+            self.log.warning(f"TLS密钥不存在: {key_path}，TLS未启用")
+            self.tls_enabled = False
+            return
+        try:
+            self._ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            self._ssl_context.load_cert_chain(str(cert_path), str(key_path))
+            self.log.info(f"🔒 TLS已启用: {cert_path}")
+        except Exception as e:
+            self.log.error(f"TLS初始化失败: {e}")
+            self.tls_enabled = False
+
+    def _init_retry_manager(self):
+        """初始化 RetryManager — 断连回放 + 重传集成
+        
+        注入回调：
+        - do_deliver: 通过连接池投递消息
+        - get_connection: 获取Agent连接信息
+        - notify_sender: 通知发送方投递失败
+        """
+        self.retry_manager = RetryManager(hub_ref=self)
+        
+        async def _rm_do_deliver(msg: dict, target_agent_id: str) -> bool:
+            """RetryManager 投递回调：通过连接池发送"""
+            status = self.connection_pool.get_status(target_agent_id)
+            if status.get("connections", 0) > 0:
+                targets = self.connection_pool.get_delivery_targets(target_agent_id, "chat_message")
+                if targets:
+                    for ws_target in targets:
+                        await self._send_json(ws_target, {"cmd": "message", "msg": msg})
+                    return True
+            if target_agent_id in self._peer_conns:
+                await self._send_json(self._peer_conns[target_agent_id], {"cmd": "relay", "msg": msg})
+                return True
+            return False
+        
+        def _rm_get_connection(target_agent_id: str):
+            """RetryManager 连接查询：返回连接信息或 None"""
+            status = self.connection_pool.get_status(target_agent_id)
+            if status.get("connections", 0) > 0:
+                handler = self.connection_pool.get_handler(target_agent_id)
+                return handler
+            return None
+        
+        async def _rm_notify_sender(msg_id: str, status: str, detail: dict):
+            """RetryManager 通知发送方回调"""
+            self.log.warning(f"[retry] 投递失败通知: msg={msg_id}, status={status}")
+            # 通知通过 status_update 机制广播
+            await self._broadcast({
+                "cmd": "delivery_notification",
+                "msg_id": msg_id,
+                "status": status,
+                "detail": detail,
+                "timestamp": time.time(),
+            })
+        
+        self.retry_manager.set_callbacks(
+            do_deliver=_rm_do_deliver,
+            get_connection=_rm_get_connection,
+            notify_sender=_rm_notify_sender,
+        )
+        self.log.info("RetryManager 初始化完成（回调已注入）")
+
+    def _check_auth_rate_limit(self, ip: str, agent_id: str = "") -> bool:
+        """认证频率控制：按 agent_id 隔离，窗口期内最多 N 次"""
+        now = time.time()
+        window = self.auth_window_seconds
+        max_attempts = self.auth_max_attempts
+        key = agent_id if agent_id else ip
+        if key not in self._auth_attempts:
+            self._auth_attempts[key] = []
+        # 清理过期记录
+        self._auth_attempts[key] = [t for t in self._auth_attempts[key] if now - t < window]
+        # 检查是否超限
+        if len(self._auth_attempts[key]) >= max_attempts:
+            self.log.warning(f"🚫 认证频率超限: {key} ({max_attempts}次/{window}s)")
+            return False
+        self._auth_attempts[key].append(now)
+        return True
+
+    # ── DeliveryGuarantee 辅助方法（Phase 2.1）──────────
+
+    async def _dg_send_to_agent(self, to_agent: str, msg_data: dict) -> bool:
+        """DeliveryGuarantee 的 send_fn — 发送消息到目标 agent"""
+        packed = msg_data if isinstance(msg_data, dict) else json.loads(msg_data.to_json())
+
+        # 1) 通过连接池投递
+        status = self.connection_pool.get_status(to_agent)
+        if status.get("connections", 0) > 0:
+            targets = self.connection_pool.get_delivery_targets(to_agent, "chat_message")
+            if targets:
+                for ws_target in targets:
+                    await self._send_json(ws_target, {"cmd": "message", "msg": packed})
+                return True
+
+        # 2) 通过 peer 连接投递
+        if to_agent in self._peer_conns:
+            await self._send_json(self._peer_conns[to_agent], {"cmd": "relay", "msg": packed})
+            return True
+
+        # 3) 路由转发
+        for peer_id, ws in self._peer_conns.items():
+            if peer_id != packed.get("from_id", ""):
+                fwd = dict(packed)
+                fwd["hop"] = packed.get("hop", 0) + 1
+                if fwd["hop"] < 3:
+                    await self._send_json(ws, {"cmd": "relay", "msg": fwd})
+                    return True
+
+        return False
+
+    async def _dg_send_to_peer(self, peer_ws, msg_data: dict) -> bool:
+        """DeliveryGuarantee 的 peer_send_fn — 通过 peer 连接发送"""
+        try:
+            await self._send_json(peer_ws, {"cmd": "relay", "msg": msg_data})
+            return True
+        except Exception:
+            return False
+
+    async def _dg_notify_sender(self, from_agent: str, notification: dict) -> None:
+        """DeliveryGuarantee 的 notify_fn — 通知发送方投递失败"""
+        status = self.connection_pool.get_status(from_agent)
+        if status.get("connections", 0) > 0:
+            for conn in self.connection_pool.get_all_connections(from_agent):
+                if not conn.is_disconnecting:
+                    await self._send_json(conn.ws, notification)
+        elif from_agent in self._peer_conns:
+            await self._send_json(self._peer_conns[from_agent], notification)
+
+    async def _broadcast_pool_reload(self, reason: str = "manual"):
+        """广播 pool_reload 消息给所有 handler"""
+        pool_msg = {
+            "msg_type": "pool_reload",
+            "generation": self.connection_pool.generation,
+            "reason": reason,
+            "timestamp": time.time(),
+        }
+        # 遍历所有已知 agent，推送给 handler
+        for agent_id in list(self.agents.keys()):
+            handler = self.connection_pool.get_handler(agent_id)
+            if handler and not handler.is_disconnecting:
+                await self._send_json(handler.ws, pool_msg)
+                self.log.info(f"📤 pool_reload 已推送 {agent_id} (handler, gen={pool_msg['generation']})")
+            # 也广播所有非 handler 连接（script/health 等用于信息同步）
+            for conn in self.connection_pool.get_all_connections(agent_id):
+                if conn != handler and not conn.is_disconnecting:
+                    await self._send_json(conn.ws, pool_msg)
+
+    async def _handle_ack_command(self, data: dict):
+        """处理 ACK 命令（Phase 2.1: 支持多层 ACK）"""
+        msg_id = data.get("msg_id", "")
+        status = data.get("status", "")
+
+        if not msg_id:
+            return
+
+        # 兼容旧格式：delivered=true → status=delivered
+        if data.get("delivered") and not status:
+            status = "delivered"
+
+        if status:
+            self.delivery_guarantee.handle_ack(data)
+            self.log.info(f"[delivery] ACK {status}: {msg_id[:12]}")
+
+    async def _push_offline_on_connect(self, agent_id: str):
+        """Agent 上线时推送离线消息"""
+        pushed = await self.delivery_guarantee.push_offline_messages(
+            agent_id,
+            send_fn=self._dg_send_to_agent
+        )
+        if pushed > 0:
+            self.log.info(f"📤 上线推送: {agent_id} ({pushed}条)")
+
+    # ── 连接池方法（已迁移到 connection_pool.py） ──
+
+    async def _deliver_with_retry(self, msg, to: str, max_retries: int = 1) -> bool:
+        """投递消息并等待 ACK，最多重试 max_retries 次"""
+        for attempt in range(max_retries + 1):
+            conns = []
+            handler = self.connection_pool.get_handler(to)
+            if handler is not None and not handler.is_disconnecting:
+                conns = [handler.ws]
+            else:
+                raw = self.connection_pool.get_all_connections(to)
+                conns = [c.ws for c in raw if not c.is_disconnecting]
+            if not conns:
+                if to in self._peer_conns:
+                    await self._send_json(self._peer_conns[to], {"cmd": "relay", "msg": json.loads(msg.to_json())})
+                    await self._send_ack(msg)
+                    return True
+                return False
+            target = conns[0]
+            await self._send_json(target, {"cmd": "message", "msg": json.loads(msg.to_json())})
+            await self._send_ack(msg)
+            if attempt < max_retries:
+                await asyncio.sleep(3)
+                # 重试时检查是否还有活跃连接
+                status = self.connection_pool.get_status(to)
+                if status.get("connections", 0) == 0:
+                    self.log.info(f"🔄 重试投递 {msg.from_id}→{to} (第{attempt+1}次)")
+                    continue
+            return True
+        return False
+
+
+    def _load_config(self, path) -> dict:
+        p = Path(path) if isinstance(path, str) else path
+        if not p.exists():
+            print(f"ERROR: 配置文件不存在: {p}")
+            sys.exit(1)
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _load_tokens(self) -> dict:
+        """加载明文token（仅本节点的token.json）"""
+        token_file = BASE_DIR / "tokens.json"
+        if token_file.exists():
+            with open(token_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        return {}
+
+    # ── 消息持久化 ────────────────────────────────
+
+    MSG_FILE = DATA_DIR / "messages.jsonl"
+    MAX_MSG_FILE = 10 * 1024 * 1024  # 10MB 轮转
+
+    def _persist(self, msg: Message):
+        try:
+            # 超过10MB轮转为 .old
+            if self.MSG_FILE.exists() and self.MSG_FILE.stat().st_size > self.MAX_MSG_FILE:
+                old = self.MSG_FILE.with_suffix(".jsonl.old")
+                self.MSG_FILE.rename(old)
+            msg_dict = json.loads(msg.to_log_line())
+            with open(self.MSG_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(msg_dict, ensure_ascii=False) + "\n")
+            # 归档到各Agent本地记录
+            try:
+                from archive import archive_message
+                archive_message(msg_dict)
+            except Exception:
+                pass
+        except Exception as e:
+            self.log.error(f"持久化失败: {e}")
+
+    def _get_offline(self, agent_id: str) -> list:
+        path = DATA_DIR / f"offline_{agent_id}.json"
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, OSError):
+                pass
+        return []
+
+    def _save_offline(self, agent_id: str, messages: list):
+        path = DATA_DIR / f"offline_{agent_id}.json"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(messages, f, ensure_ascii=False)
+
+    # ── JSON 收发 ─────────────────────────────────
+
+    async def _send_json(self, ws, data: dict):
+        try:
+            await ws.send(json.dumps(data, ensure_ascii=False))
+        except (websockets.ConnectionClosed, ConnectionError, OSError):
+            pass
+
+    async def _broadcast(self, data: dict, exclude: Optional[str] = None):
+        """广播给所有已连接节点"""
+        # 从连接池广播
+        for aid in list(self.connection_pool._connections.keys()):
+            if aid != exclude:
+                for conn in self.connection_pool.get_all_connections(aid):
+                    await self._send_json(conn.ws, data)
+        # peer 连接也需要广播
+        for aid, ws in self._peer_conns.items():
+            if aid != exclude:
+                await self._send_json(ws, data)
+
+    def _on_agent_all_disconnect(self, agent_id: str):
+        """优雅窗口超时后，Agent 所有连接断开回调
+        
+        由 ConnectionPool._remove_connection 在以下条件满足时触发：
+        1. 优雅窗口（15s）已过期
+        2. Agent 所有连接都已移除
+        
+        此时才设置 offline 状态，避免窗口期内误判。
+        """
+        agent = self.agents.get(agent_id)
+        if agent:
+            agent.online = False
+            self.log.info(f"❌ {agent.emoji}{agent.name}({agent_id}) 优雅窗口超时，标记离线")
+        # Agent 状态管理 — 离线
+        self.state_manager.handle_disconnect(agent_id)
+
+    async def _lifecycle_broadcast(self, event: str, data: dict):
+        """
+        生命周期事件广播回调
+        由 AgentStateManager 触发生命周期事件时调用
+        - agent_online / agent_offline / agent_status_change
+        """
+        exclude = data.get("agent_id")
+        # 发送生命周期事件
+        await self._broadcast({"cmd": "lifecycle", **data}, exclude=exclude)
+        # 同时发送 presence 兼容旧客户端
+        if event in ("agent_online",):
+            agent = self.agents.get(data["agent_id"])
+            await self._broadcast({
+                "cmd": "presence",
+                "agent_id": data["agent_id"],
+                "name": agent.name if agent else data["agent_id"],
+                "emoji": agent.emoji if agent else "",
+                "status": "online",
+            }, exclude=exclude)
+        elif event in ("agent_offline",):
+            await self._broadcast({
+                "cmd": "presence",
+                "agent_id": data["agent_id"],
+                "status": "offline",
+            }, exclude=exclude)
+
+    async def _broadcast_status(self, msg_id: str, state: str, by: str, data: dict):
+        """广播状态更新
+        - 私信：只回传给发送方
+        - 群消息：广播给群内所有参与者
+        """
+        status_msg = {
+            "cmd": "status_update",
+            "msg_id": msg_id,
+            "state": state,
+            "by": by,
+            "ts": data.get("ts", time.time()),
+            "detail": data.get("detail", ""),
+        }
+        
+        # 查找原始消息以确定是私信还是群消息
+        task_info = self._task_states.get(msg_id, {})
+        is_group = data.get("group", False)
+        
+        if is_group:
+            # 群消息：广播给群内所有成员
+            target_group = data.get("group_id", "grp_trio")
+            group = self.groups.get(target_group, {})
+            members = group.get("members", [])
+            for member_id in members:
+                if member_id != by:  # 不发给自己
+                    status = self.connection_pool.get_status(member_id)
+                    if status.get("connections", 0) > 0:
+                        targets = self.connection_pool.get_delivery_targets(member_id, "status_update")
+                        for t in targets:
+                            await self._send_json(t, status_msg)
+                    elif member_id in self._peer_conns:
+                        await self._send_json(self._peer_conns[member_id], status_msg)
+        else:
+            # 私信：只回传给发送方（原始消息的 from_id）
+            original_from = data.get("original_from", by)
+            status = self.connection_pool.get_status(original_from)
+            if status.get("connections", 0) > 0:
+                targets = self.connection_pool.get_delivery_targets(original_from, "status_update")
+                for t in targets:
+                    await self._send_json(t, status_msg)
+            elif original_from in self._peer_conns:
+                await self._send_json(self._peer_conns[original_from], status_msg)
+
+    # ── Status Feedback Watchdog ────────────────────
+
+    _sf_timeout_seconds = 60  # 同一 session 60s 无更新触发超时
+    _sf_inflight: Dict[str, dict] = {}  # {session_id: {last_ts, last_step, from, observer_notified}}
+
+    def _check_sf_timeouts(self):
+        """检查 status_feedback 超时：同一 session_id 60s 无更新发 timeout"""
+        now = time.time()
+        expired = [sid for sid, info in self._sf_inflight.items()
+                   if now - info.get("last_ts", 0) > self._sf_timeout_seconds
+                   and not info.get("observer_notified", False)]
+        for sid in expired:
+            info = self._sf_inflight[sid]
+            timeout_msg = {
+                "msg_type": "status_feedback",
+                "protocol_version": "aim-status-v1",
+                "from": info["from"],
+                "session_id": sid,
+                "step": info.get("last_step", "unknown"),
+                "status": "timeout",
+                "progress": f"⚠️ {info['from']} 在 {info.get('last_step', 'unknown')} 步骤已超时 {self._sf_timeout_seconds}s",
+                "timestamp": int(now),
+            }
+            # 推给绑定的 observer（含通配符 "*"）
+            observers = self._get_observers(info["from"])
+            if observers:
+                for obs in observers:
+                    if not obs.is_disconnecting:
+                        asyncio.ensure_future(self._send_json(obs.ws, timeout_msg))
+            self._sf_inflight[sid]["observer_notified"] = True
+            self.log.warning(f"⏰ status_feedback 超时: {info['from']} session={sid[:12]} step={info.get('last_step', '')}")
+
+    def _update_sf_inflight(self, sf: dict):
+        """更新 in-flight session 追踪"""
+        session_id = sf.get("session_id", "")
+        step = sf.get("step", "")
+        status = sf.get("status", "running")
+        from_agent = sf.get("from", "")
+        
+        if not session_id:
+            return
+        
+        if status in ("completed", "error", "timeout"):
+            # session 结束，从追踪中移除
+            self._sf_inflight.pop(session_id, None)
+            return
+        
+        # 更新追踪
+        self._sf_inflight[session_id] = {
+            "last_ts": time.time(),
+            "last_step": step,
+            "from": from_agent,
+            "observer_notified": False,
+        }
+
+    # ── Observer 断连回放 ──────────────────────────
+
+    def _get_observer_last_seq(self, conn_id: str) -> int:
+        """获取 observer 的 last_seq（断连前看到的最后一条 seq）"""
+        return self._observer_last_seq.get(conn_id, 0)
+
+    async def _replay_observer_status(self, ws, watch_target: str, last_seq: int):
+        """Observer 重连时回放断连期间的状态"""
+        try:
+            if not self._observer_status_file.exists():
+                return 0
+            replayed = 0
+            with open(self._observer_status_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        entry = json.loads(line.strip())
+                        if entry.get("from") == watch_target and entry.get("seq", 0) > last_seq:
+                            await self._send_json(ws, entry)
+                            replayed += 1
+                    except:
+                        continue
+            if replayed > 0:
+                self.log.info(f"📤 Observer 回放: {watch_target} ({replayed}条)")
+            return replayed
+        except Exception as e:
+            self.log.error(f"Observer 回放失败: {e}")
+            return 0
+
+    def _cleanup_task_states(self):
+        """清理过期的任务状态"""
+        now = time.time()
+        expired = [mid for mid, st in self._task_states.items()
+                   if now - st.get("ts", 0) > self._task_states_ttl]
+        for mid in expired:
+            del self._task_states[mid]
+
+    # ── 消息投递 ──────────────────────────────────
+
+    def _check_send_dedup(self, from_id: str, to_id: str, content: str) -> bool:
+        """内容指纹去重：同一发送者60秒内发相同内容返回True（重复）"""
+        key = f"{from_id}:{to_id}:{content[:200]}"
+        fp = hashlib.md5(key.encode()).hexdigest()[:16]
+        now = time.time()
+
+        # 清理过期指纹
+        expired = [k for k, t in self._sent_fingerprints.items()
+                   if now - t > self._fingerprint_ttl]
+        for k in expired:
+            del self._sent_fingerprints[k]
+
+        # 检查是否重复
+        if fp in self._sent_fingerprints:
+            return True
+
+        self._sent_fingerprints[fp] = now
+        return False
+
+    async def _deliver(self, msg: Message):
+        """投递消息：本地 / 对等节点 / 离线"""
+        # 发送端去重（防重发）— 按发送方隔离，不同 from 的同名 msg_id 不判重
+        from_id = msg.from_id or "unknown"
+        sent_key = f"{from_id}:{msg.msg_id}"
+        if sent_key in self._sent_msgs:
+            return
+        self._sent_msgs.add(sent_key)
+
+        if msg.msg_id in self._seen_msgs:
+            return  # 已处理过，防环
+        self._seen_msgs.add(msg.msg_id)
+
+        self._persist(msg)
+
+        if msg.group:
+            await self._deliver_group(msg)
+        else:
+            await self._deliver_single(msg)
+
+    async def _deliver_single(self, msg: Message):
+        """单聊投递 — 使用 DeliveryGuarantee 保达机制（Phase 2.1）"""
+        to = msg.to_id
+        packed = json.loads(msg.to_json())
+
+        # 0) 发给自己 — 本地处理
+        if to == self.my_id:
+            status = self.connection_pool.get_status(to)
+            if status.get("connections", 0) > 0:
+                handler = self.connection_pool.get_handler(to)
+                if handler and not handler.is_disconnecting:
+                    await self._send_json(handler.ws, {"cmd": "message", "msg": packed})
+                    # 发给自己不需重传，直接标记已处理
+                    self.delivery_guarantee.dedup.mark_processed(msg.msg_id)
+                    self.log.info(f"[delivery] 本地投递：{msg.from_id}→自己 msg_id={msg.msg_id[:12]}")
+                    return
+            self._on_local_message(msg)
+            return
+
+        # 1) 使用 DeliveryGuarantee 保达投递
+        ok = await self.delivery_guarantee.send(packed, to, from_agent=msg.from_id)
+        if ok:
+            self.log.info(f"[delivery] {msg.from_id}→{to}: 保达投递已启动 msg_id={msg.msg_id[:12]}")
+        else:
+            self.log.warning(f"[delivery] {msg.from_id}→{to}: 投递失败（含离线入队） msg_id={msg.msg_id[:12]}")
+
+        # DeliveryGuarantee.send() 已内部追踪，无需额外 tracker
+    
+    # Phase 2.1: 旧 _retry_loop 已移除，重传由 DeliveryGuarantee._retry_loop 统一处理
+
+
+    async def _deliver_group(self, msg: Message):
+        """群聊投递 — 按成员投递+离线存储（Phase 2.2: 统一使用 DeliveryGuarantee 的 OfflineQueue）"""
+        group = self.groups.get(msg.to_id)
+        if not group:
+            return
+
+        delivered_any = False
+        packed = json.loads(msg.to_json())
+        for mid in group["members"]:
+            if mid == msg.from_id:
+                continue
+            # 通过连接池投递
+            status = self.connection_pool.get_status(mid)
+            if status.get("connections", 0) > 0:
+                targets = self.connection_pool.get_delivery_targets(mid, "chat_message")
+                if targets:
+                    for ws_target in targets:
+                        await self._send_json(ws_target, {
+                            "cmd": "message", "msg": packed
+                        })
+                    delivered_any = True
+                    self.log.info(f"📨 群发→{mid}: 在线推送(pool)")
+            elif mid in self._peer_conns:
+                await self._send_json(self._peer_conns[mid], {
+                    "cmd": "relay", "msg": packed
+                })
+                delivered_any = True
+                self.log.info(f"📨 群发→{mid}: 在线推送(peer_conn)")
+            else:
+                # 离线存储 — 使用 DeliveryGuarantee 的统一 OfflineQueue（Phase 2.2）
+                queue = self.delivery_guarantee._get_offline_queue(mid)
+                ok = queue.push(packed)
+                if ok:
+                    self.log.info(f"📬 群发→{mid}: 离线存储(OfflineQueue)")
+                else:
+                    self.log.warning(f"📬 群发→{mid}: 离线队列已满，丢弃")
+
+        await self._send_ack(msg, delivered=delivered_any)
+
+    async def _send_ack(self, msg: Message, delivered: bool = True, target_ws=None):
+        status = self.connection_pool.get_status(msg.from_id)
+        if status.get("connections", 0) > 0:
+            if target_ws:
+                # 有指定目标 → 直接回复该连接
+                await self._send_json(target_ws, {
+                    "cmd": "ack", "msg_id": msg.msg_id, "delivered": delivered
+                })
+                return
+            # 没有指定目标 → 广播给所有活跃连接
+            for conn in self.connection_pool.get_all_connections(msg.from_id):
+                if not conn.is_disconnecting:
+                    await self._send_json(conn.ws, {
+                    "cmd": "ack", "msg_id": msg.msg_id, "delivered": delivered
+                })
+        elif msg.from_id in self._peer_conns:
+            await self._send_json(self._peer_conns[msg.from_id], {
+                "cmd": "ack", "msg_id": msg.msg_id, "delivered": delivered
+            })
+
+    def _on_local_message(self, msg: Message):
+        """收到发给本节点的消息"""
+        # 接收端去重
+        if msg.msg_id in self._sent_ids:
+            return
+        self._sent_ids.add(msg.msg_id)
+
+        dt = datetime.fromtimestamp(msg.timestamp).strftime("%H:%M:%S")
+        sender = self.agents.get(msg.from_id)
+        prefix = f"[群]" if msg.group else ""
+        self.log.info(f"📨 {dt} {prefix}[{msg.from_id}] {msg.content}")
+
+    # ── 服务端（接受连入）─────────────────────────
+
+    async def _handle_server_client(self, ws):
+        """处理连入的客户端"""
+        agent_id = None
+        try:
+            async for raw in ws:
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+
+                cmd = data.get("cmd", "")
+
+                if cmd == "register":
+                    # 注册制：允许匿名注册（不要求已认证）
+                    try:
+                        client_ip = ws.remote_address[0] if hasattr(ws, 'remote_address') and ws.remote_address else "127.0.0.1"
+                    except Exception:
+                        client_ip = "127.0.0.1"
+                    req = __import__('registry').RegisterRequest.from_dict(data)
+                    result = self.ag_registry.register(req, client_ip=client_ip)
+                    if result.success:
+                        await self._send_json(ws, {"cmd": "register_ok", "agent_id": result.agent_id, "agent_secret": result.agent_secret, "operator_id": result.operator_id, "agents_remaining": result.agents_remaining, "hub_version": "2.0"})
+                        self.log.info(f"📝 新 Agent 注册: {result.agent_id}")
+                    else:
+                        await self._send_json(ws, {"cmd": "register_denied", "reason": result.reason, "failed_check": result.failed_check})
+                        self.log.warning(f"🚫 注册被拒: {result.reason}")
+                    continue
+
+                if cmd == "auth":
+                    # 获取客户端IP
+                    try:
+                        client_ip = ws.remote_address[0] if hasattr(ws, 'remote_address') and ws.remote_address else "127.0.0.1"
+                    except Exception:
+                        client_ip = "127.0.0.1"
+                    aid = data.get("agent_id", "")
+                    channel = data.get("channel", "").strip()
+                    # V2 协议强制要求 channel 字段
+                    if not channel:
+                        await self._send_json(ws, {"cmd": "auth_fail", "reason": "缺少 channel 字段，请升级客户端"})
+                        continue
+                    # channel 白名单检查
+                    from connection_pool import CHANNEL_WHITELIST
+                    base_channel = channel.split(".")[0] if "." in channel else channel
+                    if base_channel not in CHANNEL_WHITELIST and base_channel != "legacy":
+                        await self._send_json(ws, {"cmd": "auth_fail", "reason": f"无效 channel: {channel}"})
+                        continue
+                    is_handler = data.get("handler", True if channel == "main" else False)
+                    term = data.get("term", 1)
+                    if not self._check_auth_rate_limit(client_ip, aid):
+                        await self._send_json(ws, {"cmd": "auth_fail", "reason": "认证频率过高，请稍后重试"})
+                        continue
+                    agent = self.agents.get(aid)
+                    # 支持新旧两种认证方式
+                    if "signature" in data and "timestamp" in data:
+                        # 防重放：时间戳窗口 60 秒
+                        ts = data.get("timestamp", 0)
+                        now = time.time()
+                        if abs(now - ts) > 60:
+                            self.log.warning(f"🚫 认证时间戳过期: {aid}, diff={abs(now-ts):.0f}s")
+                            audit_auth(aid, False, "hmac", "时间戳过期")
+                            await self._send_json(ws, {"cmd": "auth_fail", "reason": "时间戳过期"})
+                            continue
+                        if self.hmac_verify_enabled:
+                            # 新方式：HMAC签名认证
+                            signature = data.get("signature", "")
+                            sec = get_security_manager()
+                            if not sec.verify_signature(aid, ts, signature):
+                                audit_auth(aid, False, "hmac", "签名验证失败")
+                                await self._send_json(ws, {"cmd": "auth_fail", "reason": "签名验证失败"})
+                                continue
+                        # else: HMAC验证关闭，直接通过
+                    else:
+                        # 旧方式：token认证（向后兼容）
+                        token = data.get("token", "")
+                        if not agent or not agent.verify_token(aid, token):
+                            audit_auth(aid, False, "token", "认证失败")
+                            await self._send_json(ws, {"cmd": "auth_fail", "reason": "认证失败"})
+                            continue
+
+                    # 注册到连接池（先注销同 channel 旧连接，支持优雅切换）
+                    try:
+                        conn = self.connection_pool.register(aid, channel, ws, role="primary", metadata={"term": term, "is_handler": is_handler})
+                    except ConnectionError:
+                        await self._send_json(ws, {"cmd": "auth_fail", "reason": "连接数已达上限"})
+                        continue
+
+                    if agent:
+                        agent.online = True
+                    else:
+                        # 注册 Agent（非种子）或未知 Agent 添加到 agents 表
+                        reg_agent = self.ag_registry.get(aid)
+                        from models import PeerInfo
+                        agent = PeerInfo(
+                            agent_id=aid,
+                            name=reg_agent.agent_name if reg_agent else aid,
+                            emoji=reg_agent.emoji if reg_agent else "🤖",
+                        )
+                        agent.online = True
+                        self.agents[aid] = agent
+                    agent_id = aid
+
+                    # Observer 通道特殊处理
+                    if channel == "observer":
+                        watch_target = data.get("watch_target", "")
+                        if not watch_target:
+                            await self._send_json(ws, {"cmd": "auth_fail", "reason": "observer 需要指定 watch_target（用 \"*\" 看全部）"})
+                            continue
+                        # 权限校验：* 通配符允许看全部；其他需校验 agent 存在
+                        if watch_target != "*" and watch_target not in self.agents and not self.ag_registry.get(watch_target):
+                            await self._send_json(ws, {"cmd": "auth_fail", "reason": f"watch_target 不存在: {watch_target}"})
+                            continue
+                        # 注册 observer 绑定（不进行 handler 选举）
+                        conn.metadata["watch_target"] = watch_target
+                        conn.metadata["is_observer"] = True
+                        conn.metadata["verbose"] = data.get("verbose", False)
+                        if watch_target not in self._observer_bindings:
+                            self._observer_bindings[watch_target] = []
+                        self._observer_bindings[watch_target].append(conn)
+                        self.log.info(f"👀 Observer 注册: {aid}(id={id(conn)}) → watch {watch_target}")
+                        # observer 不需要 state_manager 上线处理
+                        # 直接发送 auth_ok
+                        await self._send_json(ws, {
+                            "cmd": "auth_ok",
+                            "observer": True,
+                            "watch_target": watch_target,
+                            "verbose": conn.metadata.get("verbose", False),
+                        })
+                        self.log.info(f"📤 observer auth_ok 已发送给 {aid} (watch {watch_target})")
+                        # Observer 断连回放：检查是否有断连期间遗漏的状态
+                        last_seq = data.get("last_seq", 0)
+                        if last_seq > 0 and watch_target != "*":
+                            asyncio.ensure_future(
+                                self._replay_observer_status(ws, watch_target, last_seq)
+                            )
+                        # observer 只监听，不处理后续命令
+                        # 继续监听 WS 连接，等待 status_feedback 推送
+                        continue  # 跳过 handler 选举和离线推送
+
+                    # Agent 状态管理 — 上线
+                    self.state_manager.handle_connect(agent_id)
+
+                    # Phase 2.2: RetryManager on_recovered — 从离线缓存推送积压消息
+                    if self.retry_manager and conn.is_handler and channel == "main":
+                        asyncio.create_task(self.retry_manager.on_agent_recovered(agent_id))
+
+                    if not agent:
+                        agent_name = aid
+                        agent_emoji = "🤖"
+                    else:
+                        agent_name = agent.name
+                        agent_emoji = agent.emoji
+                    # 日志格式: [agent_id:channel]
+                    self.log.info(f"✅ {agent_emoji}{agent_name}({aid}:{channel}) term={term} handler={conn.is_handler} 连入")
+
+                    # 返回认证成功 + 离线消息
+                    offline = self._get_offline(aid)
+                    if offline:
+                        self._save_offline(aid, [])
+
+                    await self._send_json(ws, {
+                        "cmd": "auth_ok",
+                        "agent": agent.to_dict() if agent else {"agent_id": aid, "name": agent_name, "emoji": agent_emoji},
+                        "groups": [g for g in self.groups.values() if aid in g["members"]],
+                        "unread": offline,
+                    })
+                    auth_method = "hmac" if "signature" in data else "token"
+                    audit_auth(aid, True, auth_method)
+                    self.log.info(f"📤 auth_ok已发送给 {aid}")
+
+                    # Phase 2.1: 推送新离线队列中的消息（DeliveryGuarantee）
+                    asyncio.create_task(self._push_offline_on_connect(aid))
+
+                    self.log.info(f"🔄 handler继续监听 {aid}...")
+
+                elif cmd == "ping":
+                    await self._send_json(ws, {"cmd": "pong"})
+
+                elif not agent_id:
+                    await self._send_json(ws, {"cmd": "error", "reason": "未认证"})
+
+                elif cmd == "send":
+                    to_id = data.get("to", "")
+                    content = data.get("content", "")
+                    # 内容指纹去重（防脚本重发）
+                    if self._check_send_dedup(agent_id, to_id, content):
+                        self.log.info(f"🔄 发送端去重: {agent_id}→{to_id}: {content[:30]}")
+                        await self._send_json(ws, {"cmd": "ack", "msg_id": "dedup", "delivered": True})
+                        continue
+                    # 消息签名验证（安全Phase2）
+                    msg_signature = data.get("signature")
+                    msg_timestamp = data.get("timestamp")
+                    msg_id = data.get("msg_id", "")
+                    if msg_signature and msg_timestamp and self.hmac_verify_enabled:
+                        # 消息防重放：时间戳窗口 120 秒
+                        now = time.time()
+                        if abs(now - msg_timestamp) > 120:
+                            self.log.warning(f"🚫 消息时间戳过期: {agent_id}→{to_id}")
+                            await self._send_json(ws, {"cmd": "error", "reason": "消息时间戳过期"})
+                            continue
+                        sec = get_security_manager()
+                        if not sec.verify_message_signature(agent_id, msg_id, content, msg_timestamp, msg_signature):
+                            self.log.warning(f"⚠️ 消息签名验证失败: {agent_id}→{to_id}")
+                            await self._send_json(ws, {"cmd": "error", "reason": "消息签名验证失败"})
+                            continue
+                    msg = Message(
+                        from_id=agent_id,
+                        to_id=to_id,
+                        content=content,
+                        group=data.get("group", False),
+                    )
+                    # 从连接池获取发送方的 channel 信息
+                    send_ch = data.get("channel", "")
+                    self.log.info(f"📨 {agent_id}({send_ch})→{msg.to_id}: {msg.content[:50]}")
+                    verified = bool(msg_signature) and bool(msg_timestamp)
+                    audit_message(agent_id, msg.to_id, verified, msg.group)
+                    # 发送前先回复 ack 给发送方（短连接需要立即确认）
+                    await self._send_json(ws, {"cmd": "ack", "msg_id": data.get("msg_id", ""), "delivered": True})
+                    await self._deliver(msg)
+
+                elif cmd == "relay":
+                    # 来自对等节点的消息转发
+                    msg_data = data.get("msg", {})
+                    msg = Message(**{k: v for k, v in msg_data.items()
+                                     if k in Message.__dataclass_fields__})
+                    await self._deliver(msg)
+
+                
+                elif cmd == "pool_reload":
+                    # 触发连接池 reload + 推送给所有 handler
+                    if not agent_id:
+                        await self._send_json(ws, {"cmd": "error", "reason": "未认证"})
+                        continue
+                    reason = data.get("reason", "manual")
+                    success = self.connection_pool.reload(reason=reason)
+                    if success:
+                        self.log.info(f"🔄 连接池 reload 触发 (reason={reason}, gen={self.connection_pool.generation})")
+                        # 推送给所有 handler
+                        await self._broadcast_pool_reload(reason)
+                        await self._send_json(ws, {"cmd": "pool_reload_ack", "generation": self.connection_pool.generation, "success": True})
+                    else:
+                        self.log.info(f"⏭️ 连接池 reload 跳过 (reason={reason})")
+                        await self._send_json(ws, {"cmd": "pool_reload_ack", "success": False, "reason": "跳过（限流或叠加上限）"})
+                    continue
+
+                elif cmd == "list_agents":
+                    agents = self.ag_registry.list_active()
+                    await self._send_json(ws, {"cmd": "agents_list", "agents": [a.to_public_dict() for a in agents]})
+                    continue
+
+                elif cmd == "operator_list":
+                    ops = self.op_registry.list_all()
+                    await self._send_json(ws, {"cmd": "operator_list_result", "operators": [op.to_dict() for op in ops]})
+                    continue
+
+                elif cmd == "status_feedback":
+                    # 客户端 AI 处理状态回推
+                    if not agent_id:
+                        await self._send_json(ws, {"cmd": "error", "reason": "未认证"})
+                        continue
+                    # 频率限制
+                    now_ts = time.time()
+                    if agent_id not in self._sf_rate_limit:
+                        self._sf_rate_limit[agent_id] = []
+                    self._sf_rate_limit[agent_id] = [t for t in self._sf_rate_limit[agent_id] if now_ts - t < 1.0]
+                    if len(self._sf_rate_limit[agent_id]) >= self._sf_max_per_second:
+                        self.log.warning(f"🚫 status_feedback 频率超限: {agent_id}")
+                        await self._send_json(ws, {"cmd": "status_feedback_ack", "dropped": True, "reason": "频率限制"})
+                        continue
+                    self._sf_rate_limit[agent_id].append(now_ts)
+
+                    # 获取字段
+                    sf = {
+                        "msg_type": "status_feedback",
+                        "protocol_version": "aim-status-v1",
+                        "from": agent_id,
+                        "session_id": data.get("session_id", ""),
+                        "step": data.get("step", ""),
+                        "status": data.get("status", "running"),
+                        "progress": data.get("progress", ""),
+                        "duration_ms": data.get("duration_ms", 0),
+                        "timestamp": int(now_ts),
+                    }
+                    self.log.info(f"📊 status_feedback: {agent_id} step={sf['step']} status={sf['status']} session={sf['session_id'][:12]}")
+
+                    # 更新 watchdog 追踪
+                    self._update_sf_inflight(sf)
+
+                    # 持久化到 status_log.jsonl
+                    try:
+                        if self._observer_status_file.exists() and self._observer_status_file.stat().st_size > self._observer_status_max_size:
+                            old = self._observer_status_file.with_suffix(".jsonl.old")
+                            self._observer_status_file.rename(old)
+                        # 分配 seq
+                        sf["seq"] = int(now_ts * 1000)
+                        with open(self._observer_status_file, "a", encoding="utf-8") as f:
+                            f.write(json.dumps(sf, ensure_ascii=False) + "\n")
+                    except Exception as e:
+                        self.log.error(f"status_feedback 持久化失败: {e}")
+
+                    # 定向推给绑定的 observer（含通配符 "*"）
+                    target = agent_id  # 这条 status_feedback 来自谁
+                    observers = self._get_observers(target)
+                    if observers:
+                        for obs in observers[:]:
+                            if not obs.is_disconnecting:
+                                await self._send_json(obs.ws, sf)
+                    
+                    # 如果这个 session 关联了原始消息，也推给原始消息的发送方
+                    session_id = data.get("session_id", "")
+                    if session_id:
+                        # 从 messages.jsonl 查找原始消息的 from
+                        try:
+                            with open(self.MSG_FILE, "r", encoding="utf-8") as f:
+                                for line in f:
+                                    try:
+                                        m = json.loads(line.strip())
+                                        if m.get("msg_id", "") == session_id:
+                                            original_from = m.get("from", "")
+                                            if original_from and original_from != agent_id:
+                                                orig_observers = self._get_observers(original_from)
+                                                for obs in orig_observers[:]:
+                                                    if not obs.is_disconnecting:
+                                                        await self._send_json(obs.ws, sf)
+                                            break
+                                    except:
+                                        continue
+                        except Exception:
+                            pass
+
+                    # 回复 ACK（dropped 标记）
+                    await self._send_json(ws, {"cmd": "status_feedback_ack", "dropped": False})
+                    continue
+
+                elif cmd == "retry_event":
+                    """处理 retry_event 并转发给 observer"""
+                    if not agent_id:
+                        await self._send_json(ws, {"cmd": "error", "reason": "未认证"})
+                        continue
+                    # 转发给 watch 当前 agent 的 observer（含通配符 "*"）
+                    target = agent_id
+                    observers = self._get_observers(target)
+                    if observers:
+                        re = {
+                            "msg_type": "retry_event",
+                            "from": agent_id,
+                            "event_type": data.get("event_type", ""),
+                            "msg_id": data.get("msg_id", ""),
+                            "to_id": data.get("to_id", ""),
+                            "retry_count": data.get("retry_count", 0),
+                            "max_retries": data.get("max_retries", 3),
+                            "detail": data.get("detail", ""),
+                            "timestamp": data.get("timestamp", time.time()),
+                        }
+                        for obs in observers[:]:
+                            if not obs.is_disconnecting:
+                                await self._send_json(obs.ws, re)
+                    await self._send_json(ws, {"cmd": "retry_event_ack"})
+                    continue
+
+                elif cmd == "heartbeat":
+                    if not agent_id:
+                        await self._send_json(ws, {"cmd": "error", "reason": "未认证"})
+                        continue
+                    # 解析心跳数据（load 只保留 pending_tasks）
+                    status = data.get("status", "online")
+                    load = data.get("load")
+                    # 同步更新 connection_pool 中的连接心跳
+                    self.connection_pool.update_heartbeat(agent_id, ws, status=status, load=load)
+                    # 处理心跳：更新时间戳+负载，检测状态变更
+                    old_status = self.state_manager.handle_heartbeat(
+                        agent_id, status=status, load=load
+                    )
+                    # 返回 heartbeat_ack（含在线列表 + server_generation）
+                    online_agents = [
+                        {"agent_id": a["agent_id"], "status": a["status"]}
+                        for a in self.state_manager.online_list()
+                    ]
+                    await self._send_json(ws, {
+                        "cmd": "heartbeat_ack",
+                        "agent_id": agent_id,
+                        "server_time": time.time(),
+                        "server_generation": self.connection_pool.generation,
+                        "agents_online": online_agents,
+                    })
+                    # 如果状态变更，触发生命周期事件
+                    if old_status is not None and old_status != status:
+                        # 状态变更：检测是 online/offline 还是单纯的 status_change
+                        if old_status == "offline" and status in ("online", "busy"):
+                            self.state_manager.handle_connect(agent_id)
+                        elif status == "offline":
+                            self.state_manager.handle_disconnect(agent_id)
+                        else:
+                            # online ↔ busy ↔ error 间切换
+                            await self._lifecycle_broadcast("agent_status_change", {
+                                "type": "agent_lifecycle",
+                                "event": "agent_status_change",
+                                "agent_id": agent_id,
+                                "old_status": old_status,
+                                "new_status": status,
+                                "reason": "heartbeat_status_change",
+                                "timestamp": time.time(),
+                            })
+                    continue
+
+                elif cmd == "deregister":
+                    if not agent_id:
+                        await self._send_json(ws, {"cmd": "error", "reason": "未认证"})
+                        continue
+                    target = data.get("agent_id", agent_id)
+                    if self.ag_registry.remove(target):
+                        await self._send_json(ws, {"cmd": "deregister_ok", "agent_id": target})
+                    else:
+                        await self._send_json(ws, {"cmd": "error", "reason": f"Agent 不存在: {target}"})
+                    continue
+
+                elif cmd == "lifecycle_status":
+                    # 查询生命周期状态
+                    # 格式: lifecycle_status:ZS0001 或 lifecycle_status 或 lifecycle_status:all
+                    target_id = data.get("agent_id", "all")
+                    result = self.state_manager.lifecycle_status(
+                        target_id if target_id != "all" else None
+                    )
+                    await self._send_json(ws, {
+                        "cmd": "lifecycle_status_result",
+                        "agents": result,
+                    })
+                    continue
+
+                elif cmd == "online?":
+                    online = [a.to_dict() for a in self.agents.values() if a.online]
+                    await self._send_json(ws, {"cmd": "online_list", "agents": online})
+
+                elif cmd == "groups?":
+                    glist = [g for g in self.groups.values()
+                             if agent_id in g["members"]]
+                    await self._send_json(ws, {"cmd": "groups_list", "groups": glist})
+
+                elif cmd == "history":
+                    results = self._query_history(
+                        agent_id, data.get("target", ""),
+                        data.get("limit", 50), data.get("group", False)
+                    )
+                    await self._send_json(ws, {
+                        "cmd": "history", "target": data.get("target"),
+                        "messages": results,
+                    })
+
+                elif cmd == "ack":
+                    # Phase 2.1: 多层 ACK（delivered/received/read/replied）
+                    await self._handle_ack_command(data)
+                    ack_msg_id = data.get("msg_id", "")
+                    await self._send_json(ws, {"cmd": "ack_ok", "msg_id": ack_msg_id})
+                    continue
+
+                elif cmd == "processing_ack":
+                    # Agent 端发来的处理确认（兼容旧协议）
+                    ack_msg_id = data.get("msg_id", "")
+                    if ack_msg_id:
+                        # 统一由 DeliveryGuarantee 处理
+                        self.delivery_guarantee.handle_ack({"msg_id": ack_msg_id, "status": "replied", "ts": time.time()})
+                        self.log.info(f"[delivery] 收到 processing_ack: {ack_msg_id[:12]} from {agent_id}")
+                    await self._send_json(ws, {"cmd": "processing_ack_ok", "msg_id": ack_msg_id})
+                    continue
+
+                elif cmd == "status_update":
+                    # 任务状态更新
+                    msg_id = data.get("msg_id", "")
+                    state = data.get("state", "")
+                    if msg_id and state:
+                        self._task_states[msg_id] = {
+                            "state": state,
+                            "ts": data.get("ts", time.time()),
+                            "by": agent_id,
+                            "detail": data.get("detail", ""),
+                            "task_info": data.get("task", None),
+                        }
+                        self.log.info(f"📊 状态更新: {msg_id} → {state} (by {agent_id})")
+                        # 传递群组信息
+                        broadcast_data = {
+                            **data,
+                            "group": data.get("group", False),
+                            "group_id": data.get("group_id", ""),
+                            "original_from": data.get("original_from", agent_id),
+                        }
+                        await self._broadcast_status(msg_id, state, agent_id, broadcast_data)
+                    await self._send_json(ws, {"cmd": "status_ack", "msg_id": msg_id})
+
+                elif cmd == "task_status":
+                    # 查询任务状态
+                    msg_id = data.get("msg_id", "")
+                    state = self._task_states.get(msg_id)
+                    await self._send_json(ws, {
+                        "cmd": "task_status_result",
+                        "msg_id": msg_id,
+                        "state": state,
+                    })
+
+                elif cmd == "register_capabilities":
+                    # 注册Agent能力
+                    caps = data.get("capabilities", [])
+                    registry = get_registry()
+                    registry.register(
+                        agent_id=agent_id,
+                        capabilities=caps,
+                        name=data.get("name", ""),
+                        emoji=data.get("emoji", ""),
+                        framework=data.get("framework", ""),
+                    )
+                    self.log.info(f"📋 能力注册: {agent_id} ({len(caps)} 项能力)")
+                    await self._send_json(ws, {"cmd": "ack", "success": True})
+
+                elif cmd == "query_capabilities":
+                    # 查询能力
+                    cap_id = data.get("capability_id")
+                    registry = get_registry()
+                    if cap_id:
+                        results = registry.query(cap_id)
+                    else:
+                        results = registry.get_all_agents()
+                    await self._send_json(ws, {
+                        "cmd": "capabilities_list",
+                        "agents": results,
+                    })
+
+                elif cmd == "select_agent":
+                    # 根据任务选择最佳Agent
+                    task = data.get("task", "")
+                    registry = get_registry()
+                    agent_id_result = registry.select_agent(task)
+                    cap_result = registry.match(task)
+                    await self._send_json(ws, {
+                        "cmd": "agent_selected",
+                        "agent_id": agent_id_result,
+                        "capability": cap_result.get("capability") if cap_result else None,
+                    })
+
+        except websockets.ConnectionClosed:
+            pass
+        except Exception as e:
+            self.log.error(f"连接异常: {e}")
+        finally:
+            if agent_id:
+                # 清理 observer 绑定
+                for target, observers in list(self._observer_bindings.items()):
+                    for obs in observers[:]:
+                        if hasattr(obs, 'ws') and obs.ws == ws:
+                            observers.remove(obs)
+                            self.log.info(f"👀 Observer 断开: {agent_id} → {target}")
+                    if not observers:
+                        del self._observer_bindings[target]
+
+                # 从连接池注销（触发优雅降级窗口）
+                self.connection_pool.unregister(agent_id, ws)
+                # 不再立即检查状态和调用 handle_disconnect
+                # 断连回调由 ConnectionPool._remove_connection 在优雅窗口超时后触发
+
+    def _query_history(self, from_id, target, limit=50, group=False):
+        results = []
+        for log_path in [self.MSG_FILE, self.MSG_FILE.with_suffix(".jsonl.old")]:
+            if not log_path.exists():
+                continue
+            with open(log_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        msg = json.loads(line.strip())
+                        if group:
+                            if msg.get("to") == target and msg.get("group"):
+                                results.append(msg)
+                        else:
+                            a, b = msg.get("from"), msg.get("to")
+                            if (a == from_id and b == target) or (a == target and b == from_id):
+                                results.append(msg)
+                    except (json.JSONDecodeError, OSError):
+                        continue
+        return results[-limit:]
+
+    # ── 客户端（连出到对等节点）───────────────────
+
+    async def _connect_peer(self, peer: PeerInfo):
+        """连接到对等节点"""
+        if peer.agent_id == self.my_id:
+            return
+
+        retry_delay = 2
+        while self._running:
+            try:
+                self.log.info(f"🔗 连接 {peer.emoji}{peer.name} @ {peer.ws_url}")
+                async with ws_connect(
+                    peer.ws_url,
+                    ping_interval=25,
+                    ping_timeout=10,
+                    open_timeout=10,
+                ) as ws:
+                    # 认证
+                    await self._send_json(ws, {
+                        "cmd": "auth",
+                        "agent_id": self.my_id,
+                        "token": self.token,
+                    })
+
+                    # 等待认证结果
+                    raw = await asyncio.wait_for(ws.recv(), timeout=10)
+                    resp = json.loads(raw)
+                    if resp.get("cmd") != "auth_ok":
+                        self.log.error(f"认证失败 {peer.name}: {resp.get('reason')}")
+                        await asyncio.sleep(retry_delay)
+                        continue
+
+                    self._peer_conns[peer.agent_id] = ws
+                    peer.online = True
+                    retry_delay = 2
+
+                    self.log.info(f"✅ 已连接 {peer.emoji}{peer.name}")
+
+                    # 处理离线消息
+                    unread = resp.get("unread", [])
+                    for um in unread:
+                        msg = Message(**{k: v for k, v in um.items()
+                                         if k in Message.__dataclass_fields__})
+                        self._on_local_message(msg)
+
+                    # 接收循环
+                    async for raw in ws:
+                        try:
+                            data = json.loads(raw)
+                            cmd = data.get("cmd", "")
+
+                            if cmd == "message":
+                                msg_data = data.get("msg", {})
+                                msg = Message(**{k: v for k, v in msg_data.items()
+                                                 if k in Message.__dataclass_fields__})
+                                self._persist(msg)
+                                self._on_local_message(msg)
+
+                            elif cmd == "relay":
+                                msg_data = data.get("msg", {})
+                                msg = Message(**{k: v for k, v in msg_data.items()
+                                                 if k in Message.__dataclass_fields__})
+                                await self._deliver(msg)
+
+                            elif cmd == "presence":
+                                aid = data.get("agent_id")
+                                if aid in self.agents:
+                                    self.agents[aid].online = data.get("status") == "online"
+                                self.log.info(
+                                    f"👤 {data.get('emoji','')}{data.get('name','')} "
+                                    f"{'上线' if data.get('status')=='online' else '下线'}"
+                                )
+
+                            elif cmd == "pong":
+                                pass
+
+                        except json.JSONDecodeError:
+                            continue
+
+            except (websockets.ConnectionClosed, ConnectionRefusedError, OSError) as e:
+                self._peer_conns.pop(peer.agent_id, None)
+                peer.online = False
+
+                if not self._running:
+                    break
+
+                self.log.warning(f"断开 {peer.name}: {e}，{retry_delay}s后重连...")
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 30)
+
+            except Exception as e:
+                self.log.error(f"连接 {peer.name} 异常: {e}")
+                if not self._running:
+                    break
+                await asyncio.sleep(5)
+
+    # ── 节点生命周期 ──────────────────────────────
+
+    async def _run_node(self):
+        """启动节点：服务端 + 客户端"""
+        tasks = []
+
+        # 当前配置的 tls 开关已不再用于单端口模式（双栈），改为：
+        #   本地端口 ws://host:port (无加密，高性能)
+        #   公网端口 wss://host:wss_port (加密，安全)
+        #
+        # 这样设计的原因是：
+        # - 本机 Agent（呱呱/小火鸡儿）走 ws 直连，无 TLS 开销
+        # - 公网/跨网络 Agent 走 wss 加密，安全传输
+        # - 两个端口共享同一个 _handle_server_client 处理逻辑
+        # - 证书仅用自签（开发/局域网验证），公网部署时换成 Let's Encrypt
+
+        # 1a) 启动 ws 本地端口
+        local_server = ws_serve(
+            self._handle_server_client,
+            self.host, self.port,
+        )
+        local_task = asyncio.create_task(self._run_server(local_server))
+        tasks.append(local_task)
+        self.log.info(f"🌐 本地端口: ws://{self.host}:{self.port}")
+
+        # 1b) 启动 wss 公网端口（如果证书存在）
+        wss_port = self.config.get('security', {}).get('wss_port', 18901)
+        if self._ssl_context:
+            wss_server = ws_serve(
+                self._handle_server_client,
+                self.host, wss_port,
+                ssl=self._ssl_context,
+            )
+            wss_task = asyncio.create_task(self._run_server(wss_server))
+            tasks.append(wss_task)
+            self.log.info(f"🔒 公网端口: wss://{self.host}:{wss_port}")
+        else:
+            self.log.info(f"   (无证书，wss 端口 {wss_port} 未启动)")
+
+        # 2) 连接对等节点（Hub 模式下不连，只接受连入）
+        if self.role != "admin":
+            for peer in self.agents.values():
+                if peer.agent_id != self.my_id:
+                    task = asyncio.create_task(self._connect_peer(peer))
+                    tasks.append(task)
+        else:
+            self.log.info("   Hub 模式：仅接受连入，不主动连对等节点")
+
+        # 3) 启动 DeliveryGuarantee 保达管理器（Phase 2.2）
+        await self.delivery_guarantee.start()
+        self.log.info("📬 DeliveryGuarantee 保达管理器已启动")
+
+        # 3.5) 启动 status_feedback 超时 watchdog
+        async def _sf_watchdog_loop():
+            while self._running:
+                await asyncio.sleep(15)  # 每 15s 检查一次
+                self._check_sf_timeouts()
+        sf_watchdog_task = asyncio.create_task(_sf_watchdog_loop())
+        tasks.append(sf_watchdog_task)
+        self.log.info("📊 Status Feedback watchdog 已启动 (检查间隔15s，超时阈值60s)")
+
+        # 4) 启动心跳超时扫描
+        self.state_manager.set_lifecycle_callback(self._lifecycle_broadcast)
+        self.state_manager.set_timeout_callback(
+            lambda agent_id: self.connection_pool.disconnect_agent(agent_id)
+        )
+        await self.state_manager.start_timeout_scanner()
+        self.log.info(f"❤️  心跳超时扫描已启动 (每隔{AgentStateManager.SCAN_INTERVAL}s)" +
+                      f"，超时阈值{AgentStateManager.HEARTBEAT_TIMEOUT}s")
+
+        # 5) 等待停止信号
+        stop = asyncio.get_event_loop().create_future()
+
+        def handle_signal():
+            self.log.info("收到停止信号，执行优雅关闭...")
+            # 广播关闭通知给所有客户端
+            asyncio.ensure_future(self._broadcast({
+                "cmd": "shutdown",
+                "reason": "server_restart",
+                "message": "服务端正在重启，客户端将自动重连"
+            }))
+            if not stop.done():
+                stop.set_result(True)
+
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, handle_signal)
+            except NotImplementedError:
+                pass
+
+        await stop
+
+        # 清理
+        self._running = False
+        await self.delivery_guarantee.stop()
+        await self.state_manager.stop_timeout_scanner()
+        for t in tasks:
+            t.cancel()
+
+    async def _run_server(self, server):
+        """以 async with 方式运行 WS serve（适配 websockets 13+）"""
+        async with server as s:
+            self._ws_server = s
+            await asyncio.Future()  # 永远运行
+
+    def run(self):
+        """阻塞运行"""
+        self._running = True
+        self.log.info(f"🚀 AIM 节点启动: {self.emoji}{self.name}({self.my_id})")
+        self.log.info(f"   监听: {self.host}:{self.port}")
+        peers = [f"{a.emoji}{a.name}({a.agent_id})" for a in self.agents.values()
+                 if a.agent_id != self.my_id]
+        if peers:
+            self.log.info(f"   对等: {', '.join(peers)}")
+
+        try:
+            asyncio.run(self._run_node())
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self._running = False
+            self.log.info("节点已关闭")
+
+    # ── CLI 快捷操作 ──────────────────────────────
+
+    def send_once(self, to_id: str, content: str, group: bool = False):
+        """发送一条消息后退出（同步阻塞）"""
+        self._running = True
+        results = []
+
+        async def _do():
+            target_agent = self.agents.get(to_id)
+            if not target_agent and not group:
+                print(f"ERROR: 未知Agent {to_id}")
+                return
+            if group and to_id not in self.groups:
+                print(f"ERROR: 未知群组 {to_id}")
+                return
+
+            # 优先连 Hub（admin 节点），再试其它对等节点
+            peers_to_try = []
+
+            # admin 节点优先（通常是 Hub）
+            for peer in self.agents.values():
+                if peer.role == "admin" and peer.agent_id != self.my_id:
+                    peers_to_try.append((peer.agent_id, peer.ws_url))
+
+            # 自己的端口（如果正在运行）
+            my_url = f"ws://127.0.0.1:{self.port}"
+            if not any(url == my_url for _, url in peers_to_try):
+                peers_to_try.insert(0, ("self", my_url))
+
+            # 其它对等节点
+            for peer in self.agents.values():
+                if peer.agent_id != self.my_id and peer.role != "admin":
+                    peers_to_try.append((peer.agent_id, peer.ws_url))
+
+            connected = False
+            for peer_id, url in peers_to_try:
+                try:
+                    ws = await ws_connect(url, open_timeout=3)
+                    await self._send_json(ws, {
+                        "cmd": "auth", "agent_id": self.my_id, "token": self.token
+                    })
+                    raw = await asyncio.wait_for(ws.recv(), timeout=5)
+                    resp = json.loads(raw)
+                    if resp.get("cmd") == "auth_ok":
+                        await self._send_json(ws, {
+                            "cmd": "send", "to": to_id,
+                            "content": content, "group": group,
+                        })
+                        results.append(f"已发送 → {to_id}")
+                        connected = True
+                        # 等待 ack，确认消息已投递
+                        try:
+                            ack = await asyncio.wait_for(ws.recv(), timeout=3)
+                            results.append(f"ACK: {ack}")
+                        except (asyncio.TimeoutError, websockets.ConnectionClosed):
+                            results.append("⚠️ 未收到ACK，消息可能延时到达")
+                        await ws.close()
+                        break
+                except (websockets.ConnectionClosed, ConnectionRefusedError, OSError):
+                    continue
+
+            if not connected:
+                print(f"ERROR: 无法连接到任何节点（确保 aim.py start 已运行）")
+
+        asyncio.run(_do())
+        for r in results:
+            print(r)
+
+    def query_online_once(self):
+        """查询在线Agent后退出"""
+        async def _do():
+            # admin 节点优先，再试自己，再试其它
+            urls = []
+            for peer in self.agents.values():
+                if peer.role == "admin" and peer.agent_id != self.my_id:
+                    urls.append((peer.agent_id, peer.ws_url))
+            my_url = f"ws://127.0.0.1:{self.port}"
+            if not any(url == my_url for _, url in urls):
+                urls.insert(0, ("self", my_url))
+            for peer in self.agents.values():
+                if peer.agent_id != self.my_id and peer.role != "admin":
+                    urls.append((peer.agent_id, peer.ws_url))
+
+            for peer_id, url in urls:
+                try:
+                    ws = await ws_connect(url, open_timeout=3)
+                    await self._send_json(ws, {
+                        "cmd": "auth", "agent_id": self.my_id, "token": self.token
+                    })
+                    raw = await asyncio.wait_for(ws.recv(), timeout=5)
+                    resp = json.loads(raw)
+                    if resp.get("cmd") == "auth_ok":
+                        await self._send_json(ws, {"cmd": "online?"})
+                        raw = await asyncio.wait_for(ws.recv(), timeout=5)
+                        data = json.loads(raw)
+                        if data.get("cmd") == "online_list":
+                            agents = data.get("agents", [])
+                            if agents:
+                                for a in agents:
+                                    print(f"  {a.get('emoji','')}{a.get('name','')}({a.get('agent_id','')}) 🟢")
+                            else:
+                                print("  当前无其他在线Agent")
+                        await ws.close()
+                        return
+                except (websockets.ConnectionClosed, ConnectionRefusedError, OSError, asyncio.TimeoutError):
+                    continue
+            print("无法连接到任何节点（确保 aim.py start 已运行）")
+
+        asyncio.run(_do())
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="AIM Node")
+    parser.add_argument("--send", nargs=2, metavar=("TO", "MSG"), help="Send message")
+    parser.add_argument("--send-group", nargs=2, metavar=("GID", "MSG"), help="Send group message")
+    parser.add_argument("--online", action="store_true", help="Query online agents")
+    parser.add_argument("--node-id", help="Override node ID")
+    parser.add_argument("--config", help="Config file path")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    node = AIMNode(args.config, args.node_id)
+
+    if args.send:
+        node.send_once(args.send[0], args.send[1])
+    elif args.send_group:
+        node.send_once(args.send_group[0], args.send_group[1], group=True)
+    elif args.online:
+        node.query_online_once()
+    else:
+        node.run()
+
+
+if __name__ == "__main__":
+    main()

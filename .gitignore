@@ -1,0 +1,15 @@
+# AIM 项目
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.letta/
+*.bak-*
+logs/
+*.log
+agents/
+config/
+events/
+.new_message_alert
+.nats/
+run/

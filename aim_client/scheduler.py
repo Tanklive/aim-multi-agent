@@ -18,7 +18,7 @@ import asyncio
 import logging
 import time
 
-from .types import AgentState, StateReport
+from .types import AgentState, StateReport, DegradeLevel, evaluate_degrade_level, get_probe_interval as _get_probe_interval
 
 logger = logging.getLogger(__name__)
 
@@ -53,25 +53,38 @@ class Scheduler:
         self,
         processing_timeout: float = 120.0,   # 单条处理超时
         health_probe_interval: float = 5.0,  # 探针间隔（秒）
+        # 降级阈值（Phase 1）
+        l1_trigger_timeouts: int = 3,        # 连续超时触发 L1 的阈值
+        l2_trigger_health_fails: int = 3,    # 连续 health 失败触发 L2 的阈值
     ):
         self.processing_timeout = processing_timeout
         self.health_probe_interval = health_probe_interval
+        self.l1_trigger_timeouts = l1_trigger_timeouts
+        self.l2_trigger_health_fails = l2_trigger_health_fails
 
         self._current_state = AgentState.IDLE
+        self._degrade_level = DegradeLevel.L0  # Phase 1：当前降级级别
         self._last_state_report: Optional[StateReport] = None
         self._offline_count: int = 0  # 连续 offline 次数（用于探针退避）
+        self._retry_count: int = 0    # 连续 exit=1 次数（Phase 1：L1 判定用）
         self._processing_since: float = 0.0
         self._msg_count: int = 0
 
         # 回调
         self._on_dispatch: Optional[Callable[[], Awaitable[None]]] = None
         self._on_state_change: Optional[Callable[[AgentState, AgentState], Awaitable[None]]] = None
+        self._on_degrade_change: Optional[Callable[[DegradeLevel, DegradeLevel, str], Awaitable[None]]] = None  # Phase 1
 
     # -- 属性 --
 
     @property
     def state(self) -> AgentState:
         return self._current_state
+
+    @property
+    def degrade_level(self) -> DegradeLevel:
+        """当前降级级别（Phase 1）"""
+        return self._degrade_level
 
     @property
     def is_idle(self) -> bool:
@@ -88,41 +101,59 @@ class Scheduler:
     # -- 输入：Monitor 报告 - Scheduler 决策 --
 
     def update_state(self, report: StateReport):
-        """Monitor 更新状态报告。Scheduler 据此调整状态机。
+        """Monitor 更新状态报告。Scheduler 据此调整状态机和降级级别。
 
-        判定规则 (v1.2，对齐小火鸡儿 scheduler-state-rules.md)：
-        - exit 2 (OFFLINE): Runtime 挂了 - 立即切 OFFLINE，退避探针
-        - exit 1 (BUSY): 框架忙 - 维持当前状态，不计数
-        - exit 0 (IDLE): 健康 - 重置探针间隔；若之前 OFFLINE 则恢复
+        Phase 1 (v1.3): 集成 evaluate_degrade_level()，health 恢复时自动 L1/L2→L0。
         """
         prev_state = self._current_state
         self._last_state_report = report
 
+        # ── 降级级别判定（Phase 1：health 探针带回的信息也走 evaluate）──
+        health_exit = 0
         if report.status == AgentState.OFFLINE:
-            # exit 2 = unhealthy，Runtime 进程挂了 - 立即 OFFLINE
+            health_exit = 2
+        elif report.status == AgentState.BUSY:
+            health_exit = 1
+
+        # OFFILNE 计数管理
+        if report.status == AgentState.OFFLINE:
             if self._current_state != AgentState.OFFLINE:
                 self._transition(AgentState.OFFLINE)
-                self._offline_count = 0  # 首次 OFFLINE，探针走第 0 档 (5s)
+                self._offline_count = 0
             else:
-                # 持续 OFFLINE - 递增计数用于探针退避
                 self._offline_count += 1
-
         elif report.status == AgentState.BUSY:
-            # exit 1 = degraded，框架忙 - 维持当前状态，不切换
-            pass
-
+            pass  # 维持当前状态
         else:
-            # exit 0 = healthy - 重置
             self._offline_count = 0
-
             if self._current_state == AgentState.OFFLINE:
-                # Runtime 恢复了 - IDLE
                 self._transition(AgentState.IDLE)
 
-            elif self._current_state == AgentState.BUSY and report.status == AgentState.IDLE:
-                # Monitor 说 IDLE，但我们还在 BUSY - 检查超时
-                if self._msg_count > 0 and time.time() - self._processing_since > self.processing_timeout:
-                    self._transition(AgentState.IDLE)
+        # ── Phase 1: health 恢复时评估降级恢复 ──
+        # health exit=0 时，如果之前是 L1/L2，评估能否恢复到 L0
+        if health_exit == 0 and self._degrade_level != DegradeLevel.L0:
+            new_level, reason = evaluate_degrade_level(
+                health_exit_code=0,
+                consecutive_timeouts=self._retry_count,
+                consecutive_health_fails=0,
+                current_level=self._degrade_level,
+                l1_trigger_timeouts=self.l1_trigger_timeouts,
+                l2_trigger_health_fails=self.l2_trigger_health_fails,
+            )
+            if new_level != self._degrade_level:
+                self._set_degrade_level(new_level, reason)
+        elif health_exit == 2:
+            # health 失败 → 评估是否触发 L2
+            new_level, reason = evaluate_degrade_level(
+                health_exit_code=2,
+                consecutive_timeouts=self._retry_count,
+                consecutive_health_fails=self._offline_count,
+                current_level=self._degrade_level,
+                l1_trigger_timeouts=self.l1_trigger_timeouts,
+                l2_trigger_health_fails=self.l2_trigger_health_fails,
+            )
+            if new_level != self._degrade_level:
+                self._set_degrade_level(new_level, reason)
 
     def on_message_enqueued(self):
         """新消息入队通知。不立即切 BUSY，由 _try_dispatch 触发。"""
@@ -134,6 +165,8 @@ class Scheduler:
             self._transition(AgentState.BUSY)
             self._processing_since = time.time()
             self._msg_count += 1
+            # Phase 1: 成功 dispatch 清零 retry 计数
+            self._retry_count = 0
 
     def on_processing_done(self):
         """当前消息处理完成（exit=0，已发送回复）"""
@@ -141,9 +174,24 @@ class Scheduler:
         self._transition(AgentState.IDLE)
 
     def on_retry(self):
-        """可重试（exit=1）：session 忙等。状态不变，等待下一轮探针。"""
-        # exit=1 不切换状态，探针按 degraded 处理
-        logger.info("Scheduler: adapter exit=1，可重试，状态不变")
+        """可重试（exit=1）：session 忙等。
+
+        Phase 1: 连续超时计数 → evaluate_degrade_level() 判定 L1。
+        """
+        self._retry_count += 1
+        logger.info("Scheduler: adapter exit=1，可重试 (连续第 %d 次)", self._retry_count)
+
+        new_level, reason = evaluate_degrade_level(
+            health_exit_code=0,  # health 探针不受 exit=1 影响
+            consecutive_timeouts=self._retry_count,
+            consecutive_health_fails=0,
+            current_level=self._degrade_level,
+            l1_trigger_timeouts=self.l1_trigger_timeouts,
+            l2_trigger_health_fails=self.l2_trigger_health_fails,
+        )
+        if new_level != self._degrade_level:
+            self._set_degrade_level(new_level, reason)
+        # exit=1 不切换三态状态机，维持当前 state
 
     def on_degrade(self):
         """降级（exit=2）：Runtime 不可用，切 OFFLINE。"""
@@ -173,6 +221,18 @@ class Scheduler:
         if self._on_state_change:
             asyncio.ensure_future(self._on_state_change(old, new_state))
 
+    def _set_degrade_level(self, new_level: DegradeLevel, reason: str):
+        """Phase 1: 降级级别变更，触发回调"""
+        if new_level == self._degrade_level:
+            return
+
+        old = self._degrade_level
+        self._degrade_level = new_level
+        logger.info(" Scheduler: DegradeLevel %s → %s (%s)", old.value, new_level.value, reason)
+
+        if self._on_degrade_change:
+            asyncio.ensure_future(self._on_degrade_change(old, new_level, reason))
+
     # -- 决策：是否应该投递 --
 
     def should_dispatch(self) -> bool:
@@ -189,11 +249,14 @@ class Scheduler:
     def get_probe_interval(self) -> float:
         """返回当前探针间隔（秒）
 
-        对齐小火鸡儿规则文档固定数组 [5, 10, 15, 30, 60]：
-        - IDLE/正常: 固定 5s
-        - OFFLINE: 按连续 offline 次数从数组中取值，上限 60s
+        Phase 1: L1 降级时使用 DegradeLevel 对应的探针递增策略。
+        L0: 固定 5s
+        L1: 5s→10s→15s（按连续 retry 次数）
+        L2/OFFLINE: 按连续 offline 次数从数组 [5,10,15,30,60] 取值
         """
-        if self._current_state == AgentState.OFFLINE:
+        if self._degrade_level == DegradeLevel.L1:
+            return float(_get_probe_interval(DegradeLevel.L1, self._retry_count))
+        if self._current_state == AgentState.OFFLINE or self._degrade_level == DegradeLevel.L2:
             idx = min(self._offline_count, len(_PROBE_INTERVALS) - 1)
             return float(_PROBE_INTERVALS[idx])
         return float(self.health_probe_interval)
@@ -203,8 +266,10 @@ class Scheduler:
     def status_summary(self) -> dict:
         return {
             "state": self._current_state.value,
+            "degrade_level": self._degrade_level.value,  # Phase 1
             "probe_interval": self.get_probe_interval(),
             "offline_count": self._offline_count,
+            "retry_count": self._retry_count,  # Phase 1
             "msg_count": self._msg_count,
             "processing_elapsed": time.time() - self._processing_since if self._processing_since else 0,
             "last_report": self._last_state_report.status.value if self._last_state_report else "N/A",

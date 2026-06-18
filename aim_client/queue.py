@@ -1,17 +1,20 @@
 """AIM Client Queue — 消息缓存队列
 
-Phase 0：内存队列 + 可选的 JetStream 双写
-Phase 1：JetStream KV 持久化
+Phase 1：内存队列 + JSONL 持久化
+  - enqueue/ack/nack 异步写入 JSONL
+  - 启动时从文件恢复未 ack 的消息
+  - 文件 > 50KB 自动压缩
 """
 from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, List, Callable
 import time
-import json
+import asyncio
 import logging
 
 from .types import Message
+from .queue_persist import QueuePersist
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +35,10 @@ class MessageQueue:
       pending: deque[Message]      # 等待投递
       processing: Optional[Message] # 正在处理（同时只一个）
       dead: deque[Message]         # 超时/失败（TTL 24h）
+
+    持久化：
+      JSONL 追加写入 ~/shared/aim/data/queue.jsonl
+      enqueue/ack/nack 异步记录，启动时恢复
     """
 
     def __init__(
@@ -51,6 +58,7 @@ class MessageQueue:
         self._dead: deque[tuple[Message, float]] = deque()  # (msg, expired_at)
         self._stats = QueueStats()
         self._on_dequeue: Optional[Callable] = None  # Scheduler 回调
+        self._persist: Optional[QueuePersist] = None
 
     # ── 核心接口 ──────────────────────────────────────────
 
@@ -63,6 +71,10 @@ class MessageQueue:
 
         self._pending.append(msg)
         self._stats.pending = len(self._pending)
+
+        # 异步持久化
+        self._schedule_persist(lambda: self._persist.write_enqueue(msg))
+
         logger.debug(f"📥 enqueue: {msg.msg_id} (pending={self._stats.pending})")
         return msg.msg_id
 
@@ -87,6 +99,10 @@ class MessageQueue:
             self._stats.total_processed += 1
             self._processing = None
             self._stats.processing = 0
+
+            # 异步持久化
+            self._schedule_persist(lambda: self._persist.write_ack(msg_id))
+
             logger.debug(f"✅ ack: {msg_id}")
         else:
             logger.warning(f"ack 未知消息: {msg_id}（当前 processing={getattr(self._processing, 'msg_id', None)}）")
@@ -95,10 +111,12 @@ class MessageQueue:
         """处理失败，放回队头（重试）或丢入 dead 队列"""
         if self._processing and self._processing.msg_id == msg_id:
             msg = self._processing
+            is_dead = False
             if msg.received_at and (time.time() - msg.received_at) > self.processing_timeout:
                 # 超时 → dead 队列
                 self._dead.append((msg, time.time() + self.dead_ttl))
                 self._stats.total_failed += 1
+                is_dead = True
                 logger.warning(f"💀 超时进 dead: {msg_id} reason={reason}")
             else:
                 # 未超时 → 放回队头重试
@@ -107,6 +125,10 @@ class MessageQueue:
             self._processing = None
             self._stats.processing = 0
             self._stats.pending = len(self._pending)
+
+            # 持久化：仅 dead 记录 nack，retry 消息仍处于 pending 状态
+            if is_dead and self._persist:
+                self._schedule_persist(lambda: self._persist.write_nack(msg_id, reason))
         else:
             logger.warning(f"nack 未知消息: {msg_id}")
 
@@ -141,3 +163,39 @@ class MessageQueue:
     def set_on_dequeue(self, callback: Callable):
         """设置 dequeue 时的回调（供 Scheduler 使用）"""
         self._on_dequeue = callback
+
+    # ── 持久化接口 ────────────────────────────────────────
+
+    async def init_persist(self, filepath: str = ""):
+        """初始化持久化层并恢复消息"""
+        from pathlib import Path
+        path = Path(filepath) if filepath else None
+        self._persist = QueuePersist(filepath=path)
+        await self._persist.start()
+
+        # 从文件恢复未 ack 的消息
+        restored = await self._persist.restore()
+        if restored:
+            for msg in restored:
+                self._pending.append(msg)
+            self._stats.pending = len(self._pending)
+            logger.info(f"📦 持久化恢复 {len(restored)} 条消息到 pending 队列")
+
+    async def close_persist(self):
+        """关闭持久化层"""
+        if self._persist:
+            await self._persist.stop()
+            self._persist = None
+
+    @property
+    def has_persist(self) -> bool:
+        return self._persist is not None
+
+    def _schedule_persist(self, fn: Callable):
+        """在当前事件循环中调度持久化写入"""
+        if self._persist is None:
+            return
+        try:
+            asyncio.create_task(fn())
+        except RuntimeError:
+            pass  # 不在事件循环中，跳过

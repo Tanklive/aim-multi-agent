@@ -1,9 +1,9 @@
 # AIM 项目版本管理标准
 
 
-> 版本：1.0
+> 版本：1.1
 
-> 更新：2026-06-18
+> 更新：2026-06-18 16:20
 
 > 负责人：呱呱（基建/开发/安全/底层逻辑）
 
@@ -14,7 +14,7 @@
 ## 一、版本号格式
 
 
-**简化版 SemVer**：MAJOR.MINOR.PATCH（如 1.2.1）
+**简化版 SemVer**：MAJOR.MINOR.PATCH（如 1.3.0）
 
 
 - **MAJOR**：不兼容的 API 变更
@@ -24,7 +24,7 @@
 - **PATCH**：向后兼容的问题修复
 
 
-**预发布版本**：1.2.1-alpha.1 / 1.2.1-beta.2 / 1.2.1-rc.1
+**预发布版本**：1.3.0-alpha.1 / 1.3.0-beta.1 / 1.3.0-rc.1
 
 
 **注意**：
@@ -44,17 +44,17 @@
 
 |------|------|-----------|----------|
 
-| 项目级 | shared/aim/VERSION | 无 | 1.2.1（文件内容） |
+| 项目级 | shared/aim/VERSION | 无 | 1.3.0（文件内容） |
 
-| SDK | aim_nats_sdk.py | VERSION | VERSION = "1.2.1" |
+| SDK | src/aim_nats_sdk.py | VERSION | VERSION = "1.3.0" |
 
-| Protocol | aim_nats_sdk.py | PROTOCOL_VERSION | PROTOCOL_VERSION = "1.0" |
+| Protocol | src/aim_nats_sdk.py | PROTOCOL_VERSION | PROTOCOL_VERSION = "1.0" |
 
-| Protocol | aim_nats_sdk.py | MIN_PROTOCOL_VERSION | MIN_PROTOCOL_VERSION = "1.0" |
+| Protocol | src/aim_nats_sdk.py | MIN_PROTOCOL_VERSION | MIN_PROTOCOL_VERSION = "1.0" |
 
-|.aim-client | aim_client/__init__.py | VERSION | VERSION = "1.2.1" |
+|.aim-client | aim_client/__init__.py | VERSION | VERSION = "1.3.0" |
 
-| aim-watch | aim-watch.py | VERSION | VERSION = "2.1.0"（下次项目 MAJOR→2.0 时纳入统一版本） |
+| aim-watch | src/aim-watch.py | VERSION | VERSION = "2.1.0"（下次项目 MAJOR→2.0 时纳入统一版本） |
 
 | 适配器 | 各 adapter.sh | 注释标记 | `# v1.7`（当前用注释标记，后续标准化为 adapter info 模式的 version 字段） |
 
@@ -142,7 +142,7 @@
 
 ```python
 
-# aim_nats_sdk.py
+# src/aim_nats_sdk.py
 
 PROTOCOL_VERSION = "1.0"
 
@@ -513,11 +513,11 @@ AIM 项目版本检查
 
 ==================
 
-项目级 VERSION: 1.2.1
+项目级 VERSION: 1.3.0
 
-aim_client: 1.2.1
+aim_client: 1.3.0
 
-SDK: 1.2.1
+SDK: 1.3.0
 
 aim-watch: 2.1.0（独立工具）
 
@@ -550,9 +550,9 @@ bash version_update.sh <模块> <MAJOR|MINOR>
 
 ```bash
 
-bash version_update.sh aim_client MINOR  # aim_client: 1.2.1 → 1.3.0
+bash version_update.sh aim_client MINOR  # aim_client: 1.3.0 → 1.3.0
 
-bash version_update.sh SDK MAJOR       # SDK: 1.2.1 → 2.0.0
+bash version_update.sh SDK MAJOR       # SDK: 1.3.0 → 2.0.0
 
 ```
 
@@ -565,11 +565,11 @@ bash version_update.sh SDK MAJOR       # SDK: 1.2.1 → 2.0.0
 
 ============
 
-aim_client: 1.2.1 → 1.3.0
+aim_client: 1.3.0 → 1.3.0
 
-SDK: 1.2.1 → 1.3.0（联动升级）
+SDK: 1.3.0 → 1.3.0（联动升级）
 
-项目级 VERSION: 1.2.1 → 1.3.0（联动升级）
+项目级 VERSION: 1.3.0 → 1.3.0（联动升级）
 
 ```
 
@@ -735,9 +735,9 @@ ZS0003: PROTOCOL_VERSION=1.0 ✅
 
 - aim_client/__init__.py：aim_client 版本号（统一入口）
 
-- aim_nats_sdk.py：SDK 版本号 + 协议版本号
+- src/aim_nats_sdk.py：SDK 版本号 + 协议版本号
 
-- aim-watch.py：aim-watch 版本号（独立工具）
+- src/aim-watch.py：aim-watch 版本号（独立工具）
 
 
 ---

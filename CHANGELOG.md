@@ -1,16 +1,13 @@
 # AIM 项目变更日志
 
-## [1.2.1] — 2026-06-17
+## [1.3.0] — 2026-06-18
 
 ### 新增
-- 版本号统一：SDK/aim_client/项目级全部 1.2.1（aim-watch 保持 2.1.0 独立）
-- aim_client VERSION = "1.2.1"（呱呱）
-- SDK PROTOCOL_VERSION = "1.0" + MIN_PROTOCOL_VERSION = "1.0"（吉量）
-- Scheduler 集成 DegradeLevel L0/L1/L2 三级降级模型（小火鸡儿）
-- aim_send_nats.py 恢复 + JWT creds 自动注入（小火鸡儿）
-- aim-watch 显示名称映射 ZS→呱呱/吉量/小火鸡儿（呱呱修复）
+- Queue 持久化：JSONL 异步追加写入 + 启动恢复 + 自动压缩（呱呱）
+  - `aim_client/queue_persist.py`：独立持久化层
+  - enqueue/ack/nack 异步写入 JSONL
+  - 文件 > 50KB 自动压缩，压缩后仅保留 pending 消息
 
-### 新增
 - 认证链 v1.1：AuthStep 链式认证 + 来源身份验证（呱呱）
   - `aim-client/security.py`：重构为 AuthStep 链式架构
   - Step 1: SourceIdentityCheck — from_id 必须在注册 Agent 列表中
@@ -20,14 +17,27 @@
   - 支持动态注册（Registry 回调 register_agent）
   - 配置：config.json security.auth.chain 可显式指定链步骤
 
-- Queue 持久化：JSONL 追加写入 + 启动恢复 + 自动压缩（呱呱）
-  - `aim_client/queue_persist.py`：独立持久化层
-  - enqueue/ack/nack 异步写入 JSONL
-  - 启动时恢复未 ack 消息到内存队列
-  - 文件 > 50KB 自动压缩，压缩后仅保留 pending 消息
+- Registry 独立运行：作为 NATS 微服务 + launchd 持久化（呱呱）
+  - 创建 `com.aim.registry.plist` launchd 配置
+  - 三方 Agent 启动时自动向 Registry 注册
+  - Registry PID 92552，KeepAlive Crashed+NetworkState
 
-### 变更
-- 记忆管理：金字塔分层（热431行/温1635行/冷归档）
+### 修复
+- A1：queue nack() 改用 dequeued_at 计算超时，避免队列积压误判 dead（呱呱）
+  - Message 新增 dequeued_at 字段
+  - dequeue() 时打时间戳，nack() 用 dequeued_at 替代 received_at
+  - queue_persist 序列化同步更新
+
+- launchd zombie 修复：三方 plist KeepAlive SuccessfulExit→Crashed+NetworkState（呱呱）
+  - ZS0001/ZS0002/ZS0003 plist 全部统一
+  - ThrottleInterval 10s→30s
+
+- 版本管理标准化 v1.1：修正 VERSION-STANDARD.md 路径 + 下发三方（呱呱）
+  - SDK 路径修正：aim_nats_sdk.py → src/aim_nats_sdk.py
+  - aim-watch 路径修正：aim-watch.py → src/aim-watch.py
+  - 版本号 1.2.1→1.3.0（3 个新功能 + 2 个修复）
+
+## [1.2.1] — 2026-06-17
 - gotchas 冷热分层（21活跃 + 废弃归档）
 - aim_client/__init__.py：去 Phase 标记，改用 v1.2（呱呱）
 

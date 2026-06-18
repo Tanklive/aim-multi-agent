@@ -1,8 +1,10 @@
 """AIM Client — OAS 公民接入层
 
 Phase 0：嵌入 V3 验证 Queue + Scheduler
-Phase 1：独立 aim-client 进程 + 三级降级模型
+v1.2：独立 aim-client 进程 + 三级降级模型
 """
+
+VERSION = "1.2.1"
 from .types import (
     AgentState, DegradeLevel, StateReport, Message,
     AgentCard, AdapterInfo, DeliveryMode,

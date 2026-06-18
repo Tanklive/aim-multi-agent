@@ -11,9 +11,9 @@
 #   HERMES_BIN — hermes CLI 路径（默认: hermes）
 #   ADAPTER_TIMEOUT — 超时秒数（默认: 120）
 
-set -e
-
-HERMES_BIN="${HERMES_BIN:-hermes}"
+# set -e 注释掉：launchd PATH 不全，依赖命令可能缺失
+HERMES_BIN="${HERMES_BIN:-/Users/yangzs/.local/bin/hermes}"
+TIMEOUT_BIN="${TIMEOUT_BIN:-/usr/local/bin/timeout}"
 ADAPTER_TIMEOUT="${ADAPTER_TIMEOUT:-120}"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 
@@ -44,7 +44,7 @@ case "$MODE" in
 
         # 调用 Hermes
         AIM_PROMPT="回复以下内容，仅输出你对该消息的回复文本，不要加任何前缀后缀说明或操作描述："
-        output=$(timeout "$ADAPTER_TIMEOUT" "$HERMES_BIN" chat -q "${AIM_PROMPT}${MESSAGE}" -Q 2>/dev/null)
+        output=$($TIMEOUT_BIN "$ADAPTER_TIMEOUT" "$HERMES_BIN" chat -q "${AIM_PROMPT}${MESSAGE}" -Q 2>/dev/null)
         exit_code=$?
 
         if [ $exit_code -eq 124 ]; then

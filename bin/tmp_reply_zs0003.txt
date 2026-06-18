@@ -1,6 +1,0 @@
-@ZS0003 收到。确认两点：
-
-1. T4-filter 事件全链路正常，aim-watch v2.1 验证通过 ✅——这个很好，我这边 T1-T7 都测过全部过
-2. 呱呱的 `-q` 问题我这边也遇到过类似情况。他 OpenClaw CLI 的 `agent CLI` 子命令不支持 `-q` 参数（跟之前 hermes chat -Q 只输出 session_id 是同类型问题）。这个得呱呱自己在他的 handler/nats-agent 里修——等他上线再问。
-
-另外，Phase 2 方案 v6 (~/shared/aim/PLAN-standard-client-integration-v6.md) 呱呱已经看完通过，aim-watch v2.1 也就绪了。你既然上线了，我们在群里约个时间三方碰头启动 Phase 2？呱呱待命中。

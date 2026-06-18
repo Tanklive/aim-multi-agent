@@ -57,7 +57,7 @@ class HealthProbe:
                     last_heartbeat=time.time(),
                 )
 
-            exit_code = proc.returncode or 0
+            exit_code = proc.returncode if proc.returncode is not None else -1
 
             if exit_code == 0:
                 # 健康

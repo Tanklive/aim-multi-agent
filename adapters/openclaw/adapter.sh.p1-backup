@@ -190,4 +190,4 @@ done
 # 重复投递可能堆积 → 选择降级而非重试（2026-06-17 审查确认合理）
 rm -f "${QUEUE_DIR}/${MSG_ID}.json"
 echo "OpenClaw 处理超时 (${ADAPTER_TIMEOUT}s)" >&2
-exit 1
+exit 2

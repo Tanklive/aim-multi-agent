@@ -16,6 +16,19 @@ Usage:
     await client.send_dm("ZS0001", "你好呱呱")
 """
 
+# ============================================================
+# AIM SDK 版本（SemVer 2.0.0）
+# 核心模块变更时所有模块同步升级
+# ============================================================
+VERSION = "1.2.1"
+"""SDK 版本号——代码发布标识"""
+
+# 协议版本——Agent 握手时兼容性检查用
+PROTOCOL_VERSION = "1.0"
+"""当前协议版本，Agent 之间握手协商用"""
+MIN_PROTOCOL_VERSION = "1.0"
+"""最低兼容的协议版本"""
+
 import asyncio
 import json
 import logging
@@ -933,6 +946,9 @@ class AIMNATSClient:
     统一使用 aim. 命名空间。
     """
 
+    # Protocol Version（协议版本）
+    __protocol_version__ = "1.0"
+
     def __init__(
         self,
         agent_id: str,
@@ -1091,6 +1107,10 @@ class AIMNATSClient:
         self.js = self.nc.jetstream()
         self._running = True
         log.info(f"✅ [{self.agent_id}] NATS connected: {self.server}")
+
+        # Protocol Version 检查（轻量级）
+        # TODO: Phase 2+ 实现 AgentCard 查询和版本比对
+        log.warning(f"⚠️  [{self.agent_id}] Protocol Version 检查未实现（当前: {self.__protocol_version__}）")
 
         # 启动定时 flush
         self._flush_task = asyncio.create_task(self._periodic_flush())

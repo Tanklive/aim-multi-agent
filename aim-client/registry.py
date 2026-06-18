@@ -71,8 +71,9 @@ class Registry:
     SUBJ_LIST     = "aim.registry.list"
     SUBJ_HEARTBEAT = "aim.registry.heartbeat"
 
-    def __init__(self, nats_url: str = "nats://127.0.0.1:4222"):
+    def __init__(self, nats_url: str = "nats://127.0.0.1:4222", credentials: str = ""):
         self.nats_url = nats_url
+        self.credentials = credentials
         self.nc = None
         self.js = None
         self.kv = None
@@ -84,7 +85,11 @@ class Registry:
         """启动 Registry — 连接 NATS + 加载 KV"""
         from nats import connect as nats_connect
 
-        self.nc = await nats_connect(self.nats_url)
+        opts = {}
+        if self.credentials:
+            opts["user_credentials"] = self.credentials
+
+        self.nc = await nats_connect(self.nats_url, **opts)
         self.js = self.nc.jetstream()
 
         # 初始化 KV 存储
@@ -118,7 +123,10 @@ class Registry:
         from nats import connect as _connect
         if self.nc and self.nc.is_connected:
             return self.nc
-        return await _connect(self.nats_url)
+        opts = {}
+        if self.credentials:
+            opts["user_credentials"] = self.credentials
+        return await _connect(self.nats_url, **opts)
 
     # ── 客户端方法（Agent 侧调用） ────────────────────────
 
@@ -285,9 +293,10 @@ def main():
 
     parser = argparse.ArgumentParser(description="AIM Registry Service v1.0")
     parser.add_argument("--nats-url", default="nats://127.0.0.1:4222")
+    parser.add_argument("--credentials", default="", help="NATS credentials file")
     args = parser.parse_args()
 
-    registry = Registry(nats_url=args.nats_url)
+    registry = Registry(nats_url=args.nats_url, credentials=args.credentials)
 
     async def run():
         await registry.start()

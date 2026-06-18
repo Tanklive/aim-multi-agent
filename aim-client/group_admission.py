@@ -65,11 +65,12 @@ class GroupAdmission:
     SUBJ_MEMBERS = "aim.groups.members"
     SUBJ_LIST    = "aim.groups.list"
 
-    def __init__(self, nats_url: str = ""):
+    def __init__(self, nats_url: str = "", credentials: str = ""):
         if not nats_url:
             cfg = load_global_config()
             nats_url = cfg.get("nats_server", "nats://127.0.0.1:4222")
         self.nats_url = nats_url
+        self.credentials = credentials
         self.nc = None
         self.js = None
         self.kv = None
@@ -82,7 +83,11 @@ class GroupAdmission:
         """启动群聊准入服务"""
         from nats import connect as nats_connect
 
-        self.nc = await nats_connect(self.nats_url)
+        opts = {}
+        if self.credentials:
+            opts["user_credentials"] = self.credentials
+
+        self.nc = await nats_connect(self.nats_url, **opts)
         self.js = self.nc.jetstream()
 
         try:

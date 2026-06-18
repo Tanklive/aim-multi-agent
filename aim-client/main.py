@@ -47,9 +47,8 @@ from typing import Optional
 # -- 路径注入 --
 SHARED_AIM = Path.home() / "shared" / "aim"
 SDK_DIR = Path.home() / ".aim" / "bin"
-WORKSPACE = Path.home() / ".openclaw" / "workspace"
 
-for p in [SDK_DIR, WORKSPACE, SHARED_AIM]:
+for p in [SDK_DIR, SHARED_AIM]:
     if p.exists() and str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
@@ -62,114 +61,28 @@ from aim_client.scheduler import Scheduler
 from aim_client.health_probe import HealthProbe
 from aim_nats_sdk import load_global_config
 
-# AIM Client 内部模块
-from security import SecurityManager
-from registry import Registry
+# AIM Client 内部模块（绝对导入）
+import sys
+import importlib.util
 
-# -- QueueProcessor: 标准队列处理器（文件队列模式 adapter 专用） --
-class QueueProcessor:
-    """标准 Queue Processor — 文件队列模式 adapter 专用
+# 先设置 sys.path
+sys.path.insert(0, str(Path.home() / 'shared' / 'aim' / 'aim-client'))
 
-    aim-client 内置模块，不依赖外部 cron/平台特性。
-    通过 config.queue_processor.enabled 控制开关。
+# 动态导入 security
+security_path = Path.home() / 'shared' / 'aim' / 'aim-client' / 'security.py'
+security_spec = importlib.util.spec_from_file_location('security', security_path)
+security_module = importlib.util.module_from_spec(security_spec)
+sys.modules['security'] = security_module
+security_spec.loader.exec_module(security_module)
+SecurityManager = security_module.SecurityManager
 
-    工作原理:
-      1. 每 poll_interval_s 秒检查 .aim-trigger
-      2. 检测到 trigger → 读取 .aim-queue/ 最旧消息
-      3. 调用 adapter.sh generate-reply → adapter 直调框架 AI → 写 reply 文件
-      4. adapter process 模式的 poll 读取 reply → 返回
-    """
-
-    def __init__(self, config, adapter_cmd, adapter_env, workspace, logger):
-        qp_cfg = config.get("queue_processor", {})
-        self.enabled = qp_cfg.get("enabled", False)
-        self.poll_interval = float(qp_cfg.get("poll_interval_s", 2))
-        self.adapter_cmd = adapter_cmd
-        self.adapter_env = adapter_env
-        self.workspace = Path(workspace).expanduser()
-        self.logger = logger
-        self._trigger_file = self.workspace / ".aim-trigger"
-        self._queue_dir = self.workspace / ".aim-queue"
-        self._reply_dir = self.workspace / ".aim-replies"
-        if self.enabled:
-            self.logger.info(f"[QueueProcessor] 启用 poll={self.poll_interval}s ws={self.workspace}")
-
-    async def run(self):
-        """事件循环入口，由 AIMClient.start() 作为 async task 启动"""
-        if not self.enabled:
-            return
-        while True:
-            await asyncio.sleep(self.poll_interval)
-            try:
-                if self._trigger_file.exists():
-                    self.logger.info("[QP] trigger detected, processing...")
-                    await self._process_one()
-            except Exception as e:
-                self.logger.error(f"[QP] 异常: {e}")
-
-    async def _process_one(self):
-        """处理一个队列项"""
-        items = sorted(self._queue_dir.glob("*.json"), key=lambda p: p.stat().st_mtime)
-        if not items:
-            try:
-                self._trigger_file.unlink(missing_ok=True)
-            except OSError:
-                pass
-            return
-
-        item_path = items[0]
-        try:
-            data = json.loads(item_path.read_text())
-        except Exception:
-            item_path.unlink(missing_ok=True)
-            return
-
-        msg_id = data.get("msg_id", "")
-        content = data.get("content", "")
-        from_id = data.get("from", "unknown")
-        safe_content = content.replace("'", "'\\''")
-        safe_from = from_id.replace("'", "'\\''")
-        cmd = (
-            f"bash {self.adapter_cmd} generate-reply "
-            f"--msg-id '{msg_id}' --from '{safe_from}' --content '{safe_content}'"
-        )
-
-        try:
-            proc = await asyncio.create_subprocess_shell(
-                cmd, stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE, env=self.adapter_env,
-            )
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=30.0
-                )
-            except asyncio.TimeoutError:
-                proc.kill(); await proc.wait()
-                self.logger.warning(f" [QP] 超时: {msg_id[:8]}")
-                self._write_reply(msg_id, "")
-                item_path.unlink(missing_ok=True)
-                return
-
-            if proc.returncode == 0 and stdout:
-                reply = stdout.decode().strip()
-                self._write_reply(msg_id, reply)
-                self.logger.debug(f" [QP] 已回复 {msg_id[:8]} -> {reply[:50]}")
-            else:
-                err = stderr.decode()[:100] if stderr else ""
-                self.logger.warning(f" [QP] 失败 rc={proc.returncode}: {err}")
-                self._write_reply(msg_id, "")
-
-            item_path.unlink(missing_ok=True)
-
-        except Exception as e:
-            self.logger.error(f" [QP] 异常: {e}")
-            self._write_reply(msg_id, "")
-            item_path.unlink(missing_ok=True)
-
-    def _write_reply(self, msg_id, text):
-        os.makedirs(self._reply_dir, exist_ok=True)
-        (self._reply_dir / f"{msg_id}.txt").write_text(text)
-
+# 动态导入 registry
+registry_path = Path.home() / 'shared' / 'aim' / 'aim-client' / 'registry.py'
+registry_spec = importlib.util.spec_from_file_location('registry', registry_path)
+registry_module = importlib.util.module_from_spec(registry_spec)
+sys.modules['registry'] = registry_module
+registry_spec.loader.exec_module(registry_module)
+Registry = registry_module.Registry
 
 # -- 单实例互斥 --
 LOCK_DIR = Path.home() / ".aim" / "run"
@@ -177,26 +90,20 @@ LOCK_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class SingleInstance:
-    """单实例互斥：PID 检查前置 + fcntl.flock 竞态防护。
+    """文件锁 + PID 存活检查，防止僵尸锁残留。
 
-    策略（PID 优先）：
-    1. 读锁文件 PID → 存活则 SIGTERM(3s)→SIGKILL 强杀 → unlink
-    2. 创建新锁文件 + fcntl.flock（防同时启动的竞态窗口）
-    3. 写入自身 PID
+    两层防护：
+    1. fcntl.flock (L295): OS 进程退出时自动释放
+    2. PID 存活检查 (L312): flock 失败时，检查锁文件中的 PID 是否存活
+       → 存活 → 真冲突，拒绝启动
+       → 已死 → 僵尸锁，清理后重试
     """
 
     def __init__(self, agent_id: str):
         self.lock_file = LOCK_DIR / f"aim-client-{agent_id}.lock"
         self.fp: Optional[object] = None
-        self.agent_id = agent_id
 
     def acquire(self) -> bool:
-        # 第一步：pgrep 扫描所有同名旧进程（兜底漏网之鱼）
-        self._pgrep_kill_old_instances()
-        # 第二步：检查锁文件 PID 并清理
-        self._kill_old_process_if_alive()
-        
-        # 第三步：获取文件锁（防竞态）
         try:
             self.fp = open(self.lock_file, "w")
             fcntl.flock(self.fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -206,73 +113,19 @@ class SingleInstance:
         except (IOError, OSError):
             return self._try_recover_stale()
 
-    def _pgrep_kill_old_instances(self):
-        """pgrep 扫描同 agent-id 的所有旧进程，杀之"""
-        import subprocess
+    def _try_recover_stale(self) -> bool:
+        """检查锁文件中 PID 是否存活，清理僵尸锁"""
         try:
-            pattern = f"main.py.*--agent-id {self.agent_id}"
-            result = subprocess.run(
-                ["pgrep", "-f", pattern],
-                capture_output=True, text=True, timeout=5
-            )
-            if result.returncode != 0 or not result.stdout.strip():
-                return
-            my_pid = os.getpid()
-            for line in result.stdout.strip().split("\n"):
-                try:
-                    old_pid = int(line.strip())
-                    if old_pid == my_pid:
-                        continue
-                    os.kill(old_pid, signal.SIGTERM)
-                except (ValueError, OSError):
-                    continue
-            time.sleep(3)
-            for line in result.stdout.strip().split("\n"):
-                try:
-                    old_pid = int(line.strip())
-                    if old_pid == my_pid:
-                        continue
-                    os.kill(old_pid, 0)
-                    os.kill(old_pid, signal.SIGKILL)
-                except (ValueError, OSError):
-                    continue
-            time.sleep(0.5)
-        except Exception:
-            pass  # pgrep 不可用时静默跳过
-
-    def _kill_old_process_if_alive(self):
-        """检查锁文件中的 PID，存活则杀，最后清理旧锁"""
-        try:
-            if not self.lock_file.exists():
-                return
             old_pid_str = self.lock_file.read_text().strip()
             old_pid = int(old_pid_str)
-            os.kill(old_pid, 0)  # 检查进程是否存在
-            # PID 存活 → 杀旧接管
-            os.kill(old_pid, signal.SIGTERM)
-            time.sleep(3)
-            try:
-                os.kill(old_pid, 0)
-                os.kill(old_pid, signal.SIGKILL)
-                time.sleep(0.5)
-            except OSError:
-                pass
-        except (ValueError, OSError):
-            pass
-        # 无论如何清理旧锁文件，确保干净状态
-        self.lock_file.unlink(missing_ok=True)
-
-    def _try_recover_stale(self) -> bool:
-        """flock 竞态兜底：某个进程抢先获取了锁，尝试杀它接管"""
-        self._kill_old_process_if_alive()
-        try:
-            self.fp = open(self.lock_file, "w")
-            fcntl.flock(self.fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.fp.write(str(os.getpid()))
-            self.fp.flush()
-            return True
-        except (IOError, OSError):
+            # os.kill(pid, 0) 不发送信号，只检查进程是否存在
+            os.kill(old_pid, 0)
+            # PID 存活 → 真冲突
             return False
+        except (ValueError, OSError):
+            # PID 不存在或无效 → 僵尸锁，清理后重试
+            self.lock_file.unlink(missing_ok=True)
+            return self.acquire()  # 递归重试一次
 
     def release(self):
         if self.fp:
@@ -373,21 +226,15 @@ class Transport:
         """发送群聊消息"""
         await self._sdk.send_grp(group_id, text)
 
-    async def send_ack(self, to_id: str, original_msg_id: str):
-        """发送已读回执（type: ack）"""
-        import json as _json
-        from aim_nats_sdk import make_envelope, Subjects
-        envelope = make_envelope(
-            from_id=self.agent_id, msg_type="ack",
-            payload={"text": ""}, reply_to=original_msg_id,
-        )
-        subject = Subjects.dm(to_id)
-        data = _json.dumps(envelope, ensure_ascii=False).encode()
-        await self._sdk.nc.publish(subject, data)
-        self._logger.debug(f" ACK → {to_id} (msg={original_msg_id[:8]})")
-
     async def authenticate(self) -> bool:
         return True
+
+    async def emit_obs(self, status: str, msg_id: str = "", detail: str = ""):
+        """发布 Observer 状态事件（委托给 SDK）"""
+        try:
+            await self._sdk.emit_obs(status, msg_id, detail)
+        except Exception as e:
+            self._logger.debug(f"emit_obs 失败: {e}")
 
     async def verify_peer(self, peer_id: str) -> bool:
         cfg = load_global_config()
@@ -418,7 +265,8 @@ class AIMClient:
 
         # Security v1
         self.security = SecurityManager(self.config)
-        self.registry_client = Registry(nats_url)
+        creds_path = Path.home() / ".aim" / "agents" / self.agent_id / "aim.creds"
+        self.registry_client = Registry(nats_url, credentials=str(creds_path) if creds_path.exists() else "")
 
         # Phase 0: Queue + Scheduler + HealthProbe
         self.queue = MessageQueue(capacity=self.config.get("queue_capacity", 1000))
@@ -430,29 +278,58 @@ class AIMClient:
         if adapter_cmd:
             adapter_cmd = str(Path(adapter_cmd).expanduser())
         self.adapter_cmd = adapter_cmd
-
-        # 从 config.env 读取环境变量，传递 adapter（解决 HERMES_BIN/LETTA_BIN 等问题）
-        self.adapter_env = os.environ.copy()
-        for k, v in self.config.get("env", {}).items():
-            self.adapter_env[k] = str(Path(v).expanduser()) if v else v
-
         self.health_probe = HealthProbe(
             health_cmd=f"bash {self.adapter_cmd} health",
-            timeout=10.0,
-            env=self.adapter_env,
-        )
-
-        # 工作目录路径（QueueProcessor 需要）
-        self.workspace_path = str(
-            Path(self.config.get("paths", {}).get(
-                "workspace", "~/.openclaw/workspace"
-            )).expanduser()
+            timeout=self.config.get("health_probe_timeout", 25.0),
         )
 
         self.running = False
+        self._dispatch_event = asyncio.Event()
         self.logger.info(f"Framework: {self.config.get('framework', 'unknown')}")
         self.logger.info(f"Adapter: {self.adapter_cmd}")
         self.logger.info(f"Queue+Scheduler 已嵌入 (capacity={self.queue.capacity})")
+
+    async def _dispatch_loop(self):
+        """独立消息投递：Event驱动 + scheduler控制 + 2s退避"""
+        while self.running:
+            try:
+                await self._dispatch_event.wait()
+                self._dispatch_event.clear()
+                while self.scheduler.should_dispatch() and self.queue.size() > 0:
+                    msg = self.queue.dequeue()
+                    if not msg:
+                        break
+                    self.scheduler.on_dispatch_started()
+                    self.logger.info(f"投递: {msg.msg_id[:8]} from={msg.from_id}")
+                    try:
+                        await self.transport.send_ack(msg.from_id, msg.msg_id)
+                    except Exception:
+                        pass
+                    try:
+                        reply = await self._call_adapter(msg)
+                        if reply:
+                            if msg.grp_id:
+                                await self.transport.send_grp(msg.grp_id, reply)
+                            else:
+                                await self.transport.send_dm(msg.from_id, reply)
+                        self.scheduler.on_processing_done()
+                        self.queue.ack(msg.msg_id)
+                    except DegradeError:
+                        self.scheduler.on_degrade()
+                        self.queue.nack(msg.msg_id, "degrade")
+                        break
+                    except RetryableError:
+                        self.scheduler.on_retry()
+                        self.queue.nack(msg.msg_id, "retry")
+                        await asyncio.sleep(2)
+                    except HumanInterventionError:
+                        self.scheduler.on_human_intervention()
+                        self.queue.nack(msg.msg_id, "human_intervention")
+                    except Exception as e:
+                        self.logger.error(f"投递异常 [{msg.msg_id[:8]}]: {e}")
+            except Exception as e:
+                self.logger.error(f"投递循环异常: {e}")
+                await asyncio.sleep(5)
 
     async def start(self):
         if not self.lock.acquire():
@@ -462,7 +339,13 @@ class AIMClient:
         atexit.register(self.lock.release)
         signal.signal(signal.SIGTERM, lambda *_: self._shutdown())
 
-        if not await self.transport.connect():
+        # NATS 连接重试（最多3次）
+        for attempt in range(3):
+            if await self.transport.connect():
+                break
+            self.logger.warning(f"NATS 连接失败 (attempt {attempt+1}/3)")
+            await asyncio.sleep(3)
+        else:
             self.logger.error("NATS 连接失败，退出")
             sys.exit(1)
 
@@ -482,17 +365,12 @@ class AIMClient:
             await self.transport.subscribe_grp(gid.strip(), self._on_grp)
 
         self.running = True
-        self.logger.info(f" {self.agent_id} AIM Client v1.0.0 启动完成")
+        self.logger.info(f" {self.agent_id} AIM Client v1.2.1 启动完成")
 
         # 健康探针循环
         asyncio.create_task(self._health_probe_loop())
-
-        # QueueProcessor（标准模块，config.queue_processor.enabled 控制）
-        self.queue_processor = QueueProcessor(
-            self.config, self.adapter_cmd, self.adapter_env,
-            self.workspace_path, self.logger,
-        )
-        asyncio.create_task(self.queue_processor.run())
+        asyncio.create_task(self._dispatch_loop())
+        self._dispatch_event.set()
 
         # 主循环保持
         while self.running:
@@ -503,71 +381,16 @@ class AIMClient:
         while self.running:
             try:
                 report = await self.health_probe.probe()
+                prev_can = self.scheduler.should_dispatch()
                 self.scheduler.update_state(report)
-                await self._try_dispatch()
+                if not prev_can and self.scheduler.should_dispatch():
+                    self._dispatch_event.set()
+                # Observer 事件推送：心跳
+                await self.transport.emit_obs("heartbeat", "", "alive")
             except Exception as e:
                 self.logger.error(f"健康探针异常: {e}")
             interval = self.scheduler.get_probe_interval()
             await asyncio.sleep(interval)
-
-    async def _try_dispatch(self):
-        """Scheduler 驱动的消息投递"""
-        while self.scheduler.should_dispatch() and self.queue.size() > 0:
-            msg = self.queue.dequeue()
-            if not msg:
-                break
-            self.scheduler.on_dispatch_started()
-            self.logger.info(f" 投递: {msg.msg_id[:8]} from={msg.from_id} (q={self.queue.size()})")
-            # 已读回执：出队即发送（WeChat 已读语义）
-            try:
-                await self.transport.send_ack(msg.from_id, msg.msg_id)
-            except Exception as ack_err:
-                self.logger.debug(f" ACK 发送失败（不阻塞）: {ack_err}")
-            try:
-                reply = await self._call_adapter(msg)
-                if reply:
-                    if msg.grp_id:
-                        await self.transport.send_grp(msg.grp_id, reply)
-                        self.logger.info(f" [{msg.msg_id[:8]}] 已回复群聊 {msg.grp_id}")
-                    else:
-                        await self.transport.send_dm(msg.from_id, reply)
-                        self.logger.info(f" [{msg.msg_id[:8]}] 已回复 {msg.from_id}")
-                else:
-                    self.logger.info(f" [{msg.msg_id[:8]}] 空回复，不发送")
-                self.scheduler.on_processing_done()
-                self.queue.ack(msg.msg_id)
-            except RetryableError:
-                self.logger.warning(f" [{msg.msg_id[:8]}] 可重试，exit=1")
-                self.scheduler.on_retry()
-                if msg.retry_count < 3:
-                    msg.retry_count += 1
-                    # nack 会将消息放回队头 + 清除 _processing
-                    self.queue.nack(msg.msg_id, "retryable")
-                    self.logger.info(f" RETRY #{msg.retry_count}/3")
-                else:
-                    # 超过重试次数
-                    self.queue.nack(msg.msg_id, "max_retries")
-                    self.logger.info(f" MAX RETRIES exceeded for {msg.msg_id[:8]}")
-            except DegradeError:
-                self.logger.error(f" [{msg.msg_id[:8]}] 降级 (exit=2)")
-                self.scheduler.on_degrade()
-                self.queue.nack(msg.msg_id, "degrade")
-            except HumanInterventionError:
-                self.logger.error(f" [{msg.msg_id[:8]}] 需人工介入 (exit=3)")
-                self.scheduler.on_human_intervention()
-                self.queue.nack(msg.msg_id, "human_intervention")
-            except Exception as e:
-                self.logger.error(f" [{msg.msg_id[:8]}] 投递异常: {e}")
-                self.scheduler.on_timeout()
-                if msg.retry_count < 3:
-                    msg.retry_count += 1
-                    self.queue.nack(msg.msg_id, str(e))
-                    self.logger.info(f" RETRY #{msg.retry_count}/3")
-                else:
-                    self.queue.nack(msg.msg_id, "max_retries")
-                if msg.retry_count < 3:
-                    msg.retry_count += 1
-                    self.queue.enqueue(msg)
 
     async def _call_adapter(self, msg: Message) -> Optional[str]:
         """调用 adapter.sh process，返回回复文本
@@ -585,7 +408,6 @@ class AIMClient:
         cmd = f"bash {self.adapter_cmd} process --from '{msg.from_id}' --message '{safe_content}'"
         proc = await asyncio.create_subprocess_shell(
             cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env=self.adapter_env,
         )
         try:
             stdout, stderr = await asyncio.wait_for(
@@ -633,6 +455,8 @@ class AIMClient:
         self.logger.info(f" DM收到: from={from_id} id={str(envelope.get('id','?'))[:8]}")
         if from_id == self.agent_id:
             return
+        # Observer 事件推送：收到消息
+        await self.transport.emit_obs("received", str(envelope.get('id','?'))[:8], f"from={from_id}")
         await self._handle_message(envelope, is_dm=True)
 
     async def _on_grp(self, envelope: dict, raw_msg):
@@ -668,10 +492,8 @@ class AIMClient:
             content=content, raw_envelope=envelope,
         )
         self.queue.enqueue(msg)
+        self._dispatch_event.set()
         self.scheduler.on_message_enqueued()
-
-        if self.scheduler.is_idle:
-            await self._try_dispatch()
 
     async def _register_with_registry(self):
         """向 Registry 注册本 Agent"""
@@ -681,8 +503,13 @@ class AIMClient:
                 "execution_model": self.card.execution_model,
                 "protocol_version": "1.0",
             }
-            result = await self.registry_client.register(self.agent_id, card_data)
+            result = await asyncio.wait_for(
+                self.registry_client.register(self.agent_id, card_data),
+                timeout=10.0
+            )
             self.logger.info(f"Registry 注册: {result.get('action')} serial={result.get('serial')}")
+        except asyncio.TimeoutError:
+            self.logger.warning("Registry 注册超时（Registry 可能未运行）")
         except Exception as e:
             self.logger.warning(f"Registry 注册失败（Registry 可能未运行）: {e}")
 
@@ -691,6 +518,8 @@ class AIMClient:
         self.running = False
 
     async def close(self):
+        self.running = False
+        await asyncio.sleep(0.5)  # 等 _health_probe_loop / _dispatch_loop 退出
         await self.transport.disconnect()
         self.lock.release()
 
@@ -716,10 +545,11 @@ async def _run_services(args):
     """--service 模式：启动 Registry + GroupAdmission 服务"""
     from registry import Registry
     from group_admission import GroupAdmission
-    
+
     nats_url = args.nats_url or "nats://127.0.0.1:4222"
-    registry = Registry(nats_url=nats_url)
-    group_admission = GroupAdmission(nats_url=nats_url)
+    creds = args.credentials or ""
+    registry = Registry(nats_url=nats_url, credentials=creds)
+    group_admission = GroupAdmission(nats_url=nats_url, credentials=creds)
     
     # start() 返回后 subscriptions 持续生效，需保持 event loop
     await registry.start()
@@ -742,13 +572,14 @@ async def _run_services(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AIM Client -- 统一通信终端 v1.0.0")
+    parser = argparse.ArgumentParser(description="AIM Client -- 统一通信终端 v1.2.1")
     parser.add_argument("--agent-id", required=True, help="Agent ID")
     parser.add_argument("--config", required=True, help="config.json 路径")
     parser.add_argument("--nats-url", default=None, help="NATS 服务器地址")
     parser.add_argument("--mode", default="direct", choices=["direct", "legacy", "service"])
     parser.add_argument("--services", action="store_true", default=False,
                        help="同时启动 Registry + GroupAdmission 服务")
+    parser.add_argument("--credentials", default="", help="NATS credentials file")
     args = parser.parse_args()
 
     if args.mode == "legacy":

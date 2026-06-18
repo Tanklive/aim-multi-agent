@@ -104,15 +104,137 @@ class AIMTask:
 
 @dataclass
 class AgentCard:
-    """Agent Card Schema v1"""
+    """Agent Card Schema v1 — 完整版
+
+    对应 docs/agent-card-schema-v1.md
+    Agent 数字身份证，Registry 注册时写入 KV，其他 Agent 通过 Discovery 读取。
+    """
+    # ── 身份 ──
     global_id: str = ""
     serial: str = ""
     name: str = ""
-    execution_model: str = "deferred"  # realtime | deferred | batch
+
+    # ── Client & Runtime ──
+    client_type: str = "aim-client"
+    client_version: str = ""
+    runtime_provider: str = ""
+    runtime_version: str = ""
+
+    # ── 网络 ──
+    endpoint: str = ""
+    alt_endpoints: list[str] = field(default_factory=list)
+    reachable_from: list[str] = field(default_factory=lambda: ["local"])
+    requires_relay: bool = False
+    preferred_transport: str = "nats"
+
+    # ── 投递 ──
     delivery_mode: str = "deferred"
+    expects_reply: bool = True
     max_concurrency: int = 1
     queue_capacity: int = 1000
-    preferred_transport: str = "nats"
+
+    # ── 执行 & 生命周期 ──
+    execution_model: str = "deferred"
+    lifecycle: str = "AVAILABLE"
+
+    # ── 协议 ──
+    protocol_version: str = "1.0"
+    min_protocol_version: str = "0.8"
+
+    # ── 能力 ──
+    capabilities: list[dict] = field(default_factory=lambda: [{"name": "chat", "version": "1.0", "level": "native"}])
+
+    # ── 信任 & 钱包（P2+ 预留）─
+    trust_citizenship: str = "L2"
+    trust_reputation: float = 0.0
+    trust_completed_tasks: int = 0
+    trust_success_rate: float = 0.0
+    trust_endorsements: int = 0
+    wallet_address: str = ""
+    wallet_balance: int = 0
+    wallet_stake: int = 0
+
+    def to_dict(self) -> dict:
+        """序列化为 JSON schema 格式"""
+        return {
+            "global_id": self.global_id,
+            "serial": self.serial,
+            "name": self.name,
+            "client": {"type": self.client_type, "version": self.client_version},
+            "runtime": {"provider": self.runtime_provider, "version": self.runtime_version},
+            "network": {
+                "endpoint": self.endpoint,
+                "alt_endpoints": self.alt_endpoints,
+                "reachable_from": self.reachable_from,
+                "requires_relay": self.requires_relay,
+                "preferred_transport": self.preferred_transport,
+            },
+            "delivery": {
+                "mode": self.delivery_mode,
+                "expects_reply": self.expects_reply,
+                "max_concurrency": self.max_concurrency,
+                "queue_capacity": self.queue_capacity,
+            },
+            "execution_model": self.execution_model,
+            "lifecycle": self.lifecycle,
+            "protocol_version": self.protocol_version,
+            "min_protocol_version": self.min_protocol_version,
+            "capabilities": self.capabilities,
+            "trust": {
+                "citizenship": self.trust_citizenship,
+                "reputation": self.trust_reputation,
+                "completed_tasks": self.trust_completed_tasks,
+                "success_rate": self.trust_success_rate,
+                "endorsements": self.trust_endorsements,
+            },
+            "wallet": {
+                "address": self.wallet_address,
+                "balance": self.wallet_balance,
+                "stake": self.wallet_stake,
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "AgentCard":
+        """从 JSON dict 反序列化"""
+        net = data.get("network", {})
+        deli = data.get("delivery", {})
+        client = data.get("client", {})
+        runtime = data.get("runtime", {})
+        trust = data.get("trust", {})
+        wallet = data.get("wallet", {})
+        caps = data.get("capabilities", [{"name": "chat", "version": "1.0", "level": "native"}])
+        return cls(
+            global_id=data.get("global_id", ""),
+            serial=data.get("serial", ""),
+            name=data.get("name", ""),
+            client_type=client.get("type", "aim-client"),
+            client_version=client.get("version", ""),
+            runtime_provider=runtime.get("provider", ""),
+            runtime_version=runtime.get("version", ""),
+            endpoint=net.get("endpoint", ""),
+            alt_endpoints=net.get("alt_endpoints", []),
+            reachable_from=net.get("reachable_from", ["local"]),
+            requires_relay=net.get("requires_relay", False),
+            preferred_transport=net.get("preferred_transport", "nats"),
+            delivery_mode=deli.get("mode", "deferred"),
+            expects_reply=deli.get("expects_reply", True),
+            max_concurrency=deli.get("max_concurrency", 1),
+            queue_capacity=deli.get("queue_capacity", 1000),
+            execution_model=data.get("execution_model", "deferred"),
+            lifecycle=data.get("lifecycle", "AVAILABLE"),
+            protocol_version=data.get("protocol_version", "1.0"),
+            min_protocol_version=data.get("min_protocol_version", "0.8"),
+            capabilities=caps,
+            trust_citizenship=trust.get("citizenship", "L2"),
+            trust_reputation=trust.get("reputation", 0.0),
+            trust_completed_tasks=trust.get("completed_tasks", 0),
+            trust_success_rate=trust.get("success_rate", 0.0),
+            trust_endorsements=trust.get("endorsements", 0),
+            wallet_address=wallet.get("address", ""),
+            wallet_balance=wallet.get("balance", 0),
+            wallet_stake=wallet.get("stake", 0),
+        )
 
 @dataclass
 class AdapterInfo:

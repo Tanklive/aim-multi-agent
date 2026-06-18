@@ -98,6 +98,17 @@ def load_agent_frameworks(config: dict) -> dict:
     return mapping
 
 
+def load_agent_names(config: dict) -> dict:
+    """从 aim.json 加载 Agent ID→名称映射"""
+    mapping = {}
+    agents = config.get("agents", {})
+    if isinstance(agents, dict):
+        for agent_id, info in agents.items():
+            if isinstance(info, dict) and "name" in info:
+                mapping[agent_id] = info["name"]
+    return mapping
+
+
 def fmt_time(ts) -> str:
     """格式化时间戳为 HH:MM:SS"""
     try:
@@ -130,7 +141,8 @@ class WatchDisplay:
 
     def __init__(self, json_mode=False, compact=False, show_heartbeat=False,
                  save_path="", agent_filter=">", framework_filter="",
-                 framework_map: dict = None):
+                 framework_map: dict = None, agent_name_map: dict = None,
+                 max_text=300):
         self.json_mode = json_mode
         self.compact = compact
         self.show_heartbeat = show_heartbeat
@@ -138,7 +150,9 @@ class WatchDisplay:
         self.agent_filter = agent_filter
         self.framework_filter = framework_filter
         self.framework_map = framework_map or {}  # agent_id → framework
+        self.agent_name_map = agent_name_map or {}  # agent_id → 显示名称
         self.save_fp = None
+        self.max_text = max_text  # 消息预览最大字符数（0=不截断）
 
         # 统计
         self.total_events = 0
@@ -240,7 +254,7 @@ class WatchDisplay:
         if framework and (self.framework_filter or status == "agent_online"):
             fw_label = f"[{framework}]"
 
-        parts = [f"{time_str} {icon} {agent_id}"]
+        parts = [f"{time_str} {icon} {self.agent_name_map.get(agent_id, agent_id)}"]
         if fw_label:
             parts.append(fw_label)
 
@@ -258,7 +272,8 @@ class WatchDisplay:
             if isinstance(meta, dict):
                 from_id = meta.get("from_id", "")
                 if from_id:
-                    parts.append(f"(from {from_id})")
+                    display_fid = self.agent_name_map.get(from_id, from_id)
+                    parts.append(f"(from {display_fid})")
 
         line = " ".join(parts)
         print(line, flush=True)
@@ -419,6 +434,9 @@ class EventSource:
         ts = envelope.get("ts", 0)
         meta = envelope.get("meta", {})
 
+        # 显示名称映射（ZS0001→呱呱, ZS0003→小火鸡儿...）
+        display_from = self.display.agent_name_map.get(from_id, from_id)
+
         # 群聊
         if msg_type == "grp":
             group = meta.get("group", to_id) if isinstance(meta, dict) else to_id
@@ -429,9 +447,10 @@ class EventSource:
         # 显示为带图标的行
         icon = STATUS_ICONS.get(msg_type, "📢")
         time_str = fmt_time(ts)
-        text_preview = text[:150].replace("\n", " ")
+        text_preview = text if self.display.max_text == 0 else text[:self.display.max_text]
+        text_preview = text_preview.replace("\n", " ")
 
-        line = f"{time_str} {icon} {from_id} {target_str} | {text_preview}"
+        line = f"{time_str} {icon} {display_from} {target_str} | {text_preview}"
         print(line, flush=True)
         if self.display.save_fp:
             self.display.save_fp.write(line + "\n")
@@ -560,6 +579,10 @@ def main():
                         help="[experimental] 从 JSONL 文件回放（离线模式，不连 NATS）")
     parser.add_argument("--since", type=int, default=0,
                         help="只看过去 N 秒的事件（配合 --history 或 --file 过滤）")
+    parser.add_argument("--full-text", action="store_true",
+                        help="显示完整消息内容（不截断）")
+    parser.add_argument("--max-text", type=int, default=300,
+                        help="消息预览最大字符数（默认 300，0=不截断）")
     parser.add_argument("--nats-url", default="",
                         help="NATS Server URL（默认从配置读取）")
     parser.add_argument("--version", action="store_true",
@@ -570,6 +593,10 @@ def main():
     if args.version:
         print(f"AIM Watch v{VERSION}")
         sys.exit(0)
+
+    # --full-text 等于 --max-text 0
+    if args.full_text:
+        args.max_text = 0
 
     # compact 模式隐含隐藏心跳
     if args.compact:
@@ -588,10 +615,13 @@ def main():
 
     # 默认只看自己，加 --all 才看全部
     show_all = args.all or (args.agent != ">")
-    agent_id_from_config = config.get("agent_id", "ZS0003")
+    agent_id_from_config = config.get("agent_id", "ZS0001")
 
     # Agent→Framework 映射
     fw_map = load_agent_frameworks(config)
+
+    # Agent ID→名称映射（aim-watch 显示用）
+    name_map = load_agent_names(config)
 
     # 离线文件回放模式（不连 NATS）
     if args.file:
@@ -603,6 +633,8 @@ def main():
             agent_filter=args.agent,
             framework_filter=args.framework,
             framework_map=fw_map,
+            agent_name_map=name_map,
+            max_text=args.max_text,
         )
         since_ts = time.time() - args.since if args.since else 0
         source = EventSource(None, display, since=since_ts)
@@ -625,6 +657,8 @@ def main():
         agent_filter=agent_id_from_config if not show_all else ">",
         framework_filter=args.framework,
         framework_map=fw_map,
+        agent_name_map=name_map,
+        max_text=args.max_text,
     )
 
     observer = AIMObserverClient(

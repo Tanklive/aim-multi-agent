@@ -367,6 +367,9 @@ class AIMClient:
         self.running = True
         self.logger.info(f" {self.agent_id} AIM Client v1.2.1 启动完成")
 
+        # 初始化持久化队列（恢复未 ack 消息）
+        await self.queue.init_persist()
+
         # 健康探针循环
         asyncio.create_task(self._health_probe_loop())
         asyncio.create_task(self._dispatch_loop())
@@ -474,9 +477,9 @@ class AIMClient:
 
         from_id = envelope.get("from", envelope.get("from_id", ""))
 
-        # 安全过滤
-        if not self.security.allow(from_id): return
-        if not self.security.rate_ok(from_id): return
+        # 安全过滤 — 认证链
+        if not await self.security.authenticate(from_id, token=payload.get("token", ""), msg_id=envelope.get("id", ""), envelope=envelope):
+            return
         msg_id = envelope.get("id", str(uuid.uuid4()))
 
         # Phase 1: 识别 Task
@@ -520,6 +523,7 @@ class AIMClient:
     async def close(self):
         self.running = False
         await asyncio.sleep(0.5)  # 等 _health_probe_loop / _dispatch_loop 退出
+        await self.queue.close_persist()
         await self.transport.disconnect()
         self.lock.release()
 

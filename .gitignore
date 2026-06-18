@@ -13,3 +13,5 @@ events/
 .new_message_alert
 .nats/
 run/
+configs/
+data/

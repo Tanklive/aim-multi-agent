@@ -87,6 +87,7 @@ class MessageQueue:
             return None
 
         msg = self._pending.popleft()
+        msg.dequeued_at = time.time()
         self._processing = msg
         self._stats.processing = 1
         self._stats.pending = len(self._pending)
@@ -112,7 +113,7 @@ class MessageQueue:
         if self._processing and self._processing.msg_id == msg_id:
             msg = self._processing
             is_dead = False
-            if msg.received_at and (time.time() - msg.received_at) > self.processing_timeout:
+            if msg.dequeued_at > 0 and (time.time() - msg.dequeued_at) > self.processing_timeout:
                 # 超时 → dead 队列
                 self._dead.append((msg, time.time() + self.dead_ttl))
                 self._stats.total_failed += 1

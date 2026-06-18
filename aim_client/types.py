@@ -75,6 +75,7 @@ class Message:
     content: str = ""
     raw_envelope: dict = field(default_factory=dict)
     received_at: float = field(default_factory=time.time)
+    dequeued_at: float = 0.0
     retry_count: int = 0
 
 @dataclass

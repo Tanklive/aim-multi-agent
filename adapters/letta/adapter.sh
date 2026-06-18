@@ -1,6 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 # AIM Letta adapter — AIM Client v1.2 标准接口
+# VERSION = "1.3.0"  (adapter 独立版本号，对应项目级 1.3.0)
+# adapter version: v1.7  (标准注释标记)
 #
 # 4 个标准模式:
 #   adapter.sh process --message "..." --from "ZSxxxx"   处理消息

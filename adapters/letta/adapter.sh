@@ -190,7 +190,8 @@ if [ "$MODE" = "trim" ]; then
     KEEP="${TRIM_KEEP:-10}"
 
     # 获取当前 conversation 消息数
-    # letta messages list 在 conversation 不存在时可能非零退出，管道左边失败时回退到 0
+    # Letta 当前架构不支持 conversations trim 子命令 (v0.27.11)
+    # 清理方式: 删除 conversation 对应磁盘目录 → 下次 process 新建
     MSG_COUNT=0
     set +e
     MSG_COUNT=$("$LETTA_BIN" messages list --conversation "$TRIM_CONV" 2>/dev/null | wc -l | tr -d '[:space:]')
@@ -199,18 +200,20 @@ if [ "$MODE" = "trim" ]; then
     [ -n "$MSG_COUNT" ] || MSG_COUNT=0
 
     if [ "$MSG_COUNT" -gt "$KEEP" ]; then
-        set +e
-        TRIM_OUTPUT=$("$LETTA_BIN" conversations trim "$TRIM_CONV" --keep-last "$KEEP" 2>&1)
-        TRIM_RC=$?
-        set -e
+        # 清理 dispatch conv 磁盘目录
+        CONV_DIR="${HOME}/.letta/lc-local-backend/conversations"
+        DELETED=0
+        for d in "$CONV_DIR"/*/; do
+            [ -d "$d" ] || continue
+            DIRNAME=$(basename "$d")
+            DECODED=$(echo "$DIRNAME" | base64 -d 2>/dev/null || echo "")
+            if echo "$DECODED" | grep -q "conversation:${TRIM_CONV}\$"; then
+                rm -rf "$d" 2>/dev/null && DELETED=$((DELETED + 1))
+            fi
+        done
 
-        if [ $TRIM_RC -eq 0 ]; then
-            echo "{\"status\":\"trimmed\",\"conv\":\"$TRIM_CONV\",\"msg_count_before\":$MSG_COUNT,\"keep\":$KEEP}"
-            exit 0
-        else
-            echo "{\"status\":\"trim_failed\",\"conv\":\"$TRIM_CONV\",\"error\":\"$(echo "$TRIM_OUTPUT" | tr '\n' ' ' | head -c 200)\"}"
-            exit 1
-        fi
+        echo "{\"status\":\"trimmed\",\"conv\":\"$TRIM_CONV\",\"msg_count_before\":$MSG_COUNT,\"keep\":$KEEP,\"dirs_deleted\":$DELETED}"
+        exit 0
     else
         echo "{\"status\":\"skipped\",\"conv\":\"$TRIM_CONV\",\"msg_count\":$MSG_COUNT,\"reason\":\"below threshold ($KEEP)\"}"
         exit 0

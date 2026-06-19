@@ -66,10 +66,10 @@ degrade/offline 事件到达阈值后触发推送：
 | 连续 5 次 degrade | critical | NATS `aim.obs.alert` 广播 |
 | agent offline > 5 分钟 | critical | NATS `aim.obs.alert` 广播 |
 
-推送通道（各框架各自实现）：
-- OpenClaw → Slack
-- Hermes → 系统通知
-- Letta → macOS `osascript` 系统通知
+推送通道：
+
+> **吉量建议改为独立 alertd 守护进程**（不绑 Agent），订阅 `aim.obs.alert`，统一写日志 + 推群聊。
+> 理由：Agent 自己可能正在 degrade，让 degrade 的 Agent 推送自己的告警不可靠。独立 alertd 不受影响。
 
 ### L3 自修复层（自己修）
 
@@ -79,13 +79,20 @@ degrade/offline 事件到达阈值后触发推送：
 | adapter timeout 累积 3 次 | exit=1 计数 | `letta conversations trim --keep-last 5` 清上下文 |
 | conversation 膨胀 | 磁盘 > 阈值 | Cron 定期清理旧 conv |
 
+**⚠️ 自修复护栏**（吉量提出）：自修复 N 次仍失败（N=3）→ 触发 `agent_stalled` 告警 → 发 `aim.obs.alert(level=critical)` → 停止自修复，等人工介入。防止自修复无限循环掩盖根因。
+
+**⚠️ DEGRADE 恢复后无端到端验证**（吉量提出）：health probe 只查进程活着，不查能不能处理消息。恢复后应自动发 ping 测试。
+
 ### 分工
 
 | 模块 | 谁 | 做什么 |
 |------|-----|------|
 | **Registry 健康追踪** (L1) | 呱呱 | `_health_monitor` 加 Runtime degrade 追踪 + `agent_degraded`/`agent_stalled` 告警 |
-| **Observer 推送 + 持久化** (L2) | 吉量 | degrade 阈值累计 → `aim.obs.alert`；aim-watch 加告警持久化 + 框架推送通知 |
+| **alertd 守护进程** (L2) | 吉量 | 独立进程订阅 `aim.obs.alert`，阈值累计 + 写 `alerts.log` + 推群聊 |
+| **aim-watch 持久化** (L2) | 吉量 | 告警持久化到 `~/.aim/system/alerts.log` |
+| **自修复护栏** (L3) | 吉量 | N=3 升级 agent_stalled + 停止自修复 |
 | **adapter 自修复** (L3) | 火鸡儿 | Letta agent 离线自动 ping 触发注册；conv 膨胀清理 cron；adapter timeout 自愈 |
+| **DEGRADE 恢复验证** | 三方 | 复用 deploy-verify 模板做端到端 ping |
 
 ---
 
@@ -93,7 +100,7 @@ degrade/offline 事件到达阈值后触发推送：
 
 | 项 | 内容 | 谁 | 当前状态 |
 |----|------|-----|----------|
-| **P1-3 exit code** | adapter exit=2/3/4 语义三方统一 | 吉量 + 火鸡儿 | Hermes adapter 还差 3 行对齐 |
+| **P1-3 exit code** | adapter exit=2/3/4 语义三方统一 | 三方 | ✅ 全部对齐（含 Hermes v1.2 exit=3×3） |
 | **620-07** | adapter health exit 3/4 是否被 main.py 健康探针路径正确解读 | 呱呱验证 | 待确认 |
 | **620-08** | 单点 Runtime 故障全群静默 → 架构层面需要降级通知机制 | 三方讨论 | 待讨论 |
 | **L3 自修复** | `letta conversations trim` 命令可用性、`letta -p "ping"` 触发注册、cron 清理策略 | 火鸡儿验证 | 待验证 |

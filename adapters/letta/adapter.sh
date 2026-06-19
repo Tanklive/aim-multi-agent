@@ -1,8 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 # AIM Letta adapter — AIM Client v1.2 标准接口
-# VERSION = "1.3.0"  (adapter 独立版本号，对应项目级 1.3.0)
-# adapter version: v1.7  (标准注释标记)
+# VERSION: 1.7
 #
 # 4 个标准模式:
 #   adapter.sh process --message "..." --from "ZSxxxx"   处理消息
@@ -21,9 +20,22 @@ MESSAGE=""
 FROM_ID=""
 TASK_ID=""
 TIMEOUT="${ADAPTER_TIMEOUT:-120}"
-LETTA_BIN="${LETTA_BIN:-$HOME/.npm-global/bin/letta}"
-LETTA_AGENT_ID="${LETTA_AGENT_ID:-}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONFIG_FILE="$SCRIPT_DIR/config.json"
+
+# 优先环境变量，回退到 config.json
+LETTA_BIN="${LETTA_BIN:-}"
+LETTA_AGENT_ID="${LETTA_AGENT_ID:-}"
+
+if [ -z "$LETTA_BIN" ] || [ -z "$LETTA_AGENT_ID" ]; then
+    if [ -f "$CONFIG_FILE" ]; then
+        [ -z "$LETTA_BIN" ] && LETTA_BIN=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE')).get('letta_bin',''))" 2>/dev/null || true)
+        [ -z "$LETTA_AGENT_ID" ] && LETTA_AGENT_ID=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE')).get('letta_agent_id',''))" 2>/dev/null || true)
+    fi
+fi
+
+# 最终默认值
+LETTA_BIN="${LETTA_BIN:-$HOME/.npm-global/bin/letta}"
 FILTER_SCRIPT="$SCRIPT_DIR/filter_letta_output.sh"
 
 shift
@@ -52,10 +64,15 @@ _detect_letta() {
 
 # ── 验证 Agent ID ──────────────────────
 _verify_agent_id() {
+    # v1.7: 磁盘持久化检查，替代 letta agents list
+    #       letta -p "ping" --agent 会发起完整 LLM 对话(>10s)，不适合 health check
+    #       memfs 目录存在 → agent 数据完好 → letta -p 可加载
     if [ -n "$LETTA_AGENT_ID" ]; then
-        AGENT_CHECK=$(timeout 5 "$LETTA_BIN" agents list 2>/dev/null | grep -c "$LETTA_AGENT_ID" || echo "0" || true)
-        if [ "$AGENT_CHECK" -eq 0 ]; then
-            echo "[letta-adapter] Agent ID 不存在或已漂移: $LETTA_AGENT_ID" >&2
+        local memfs_dir="${HOME}/.letta/lc-local-backend/memfs/${LETTA_AGENT_ID}/memory"
+        if [ -d "$memfs_dir" ]; then
+            : # Agent 持久化数据存在
+        else
+            echo "[letta-adapter] Agent 数据不存在: $memfs_dir" >&2
             return 1
         fi
     fi
@@ -66,24 +83,14 @@ _verify_agent_id() {
 # MODE: health — 健康探针
 # ═══════════════════════════════════════
 if [ "$MODE" = "health" ]; then
-    _detect_letta || exit 2
-    _verify_agent_id || exit 2
+    _detect_letta || exit 3
+    _verify_agent_id || exit 4
 
-    # v1.6: 改用 letta agents list（JSON API，不受 TUI session 阻塞）
-    # 原理: agents list 走独立后端，TUI 活跃对话中也秒回。
-    # health 只回答 "letta CLI 还可不可以用"，session 忙不忙交给 Scheduler 的超时处理。
-    AGENT_CHECK=$(timeout 10 "$LETTA_BIN" agents list 2>/dev/null | grep -c "$LETTA_AGENT_ID" || true)
-
-    # 防御：AGENT_CHECK 可能为空（timeout 10 超时 + grep -c 无匹配），默认为 0
-    AGENT_CHECK="${AGENT_CHECK:-0}"
-
-    if [ "$AGENT_CHECK" -gt 0 ]; then
-        echo '{"status":"healthy","detail":"letta CLI reachable"}'
-        exit 0
-    else
-        echo '{"status":"unhealthy","active_sessions":-1,"detail":"letta agents list failed or agent ID not found"}'
-        exit 2
-    fi
+    # v1.7: 磁盘持久化检查（memfs/ 目录）
+    #       移除 agents list 依赖（主 agent 不在子 agent 列表中）
+    #       不用 -p "ping" --agent（会发起完整 LLM 对话 >10s，不适合 health check）
+    _verify_agent_id && echo '{"status":"healthy","detail":"letta CLI reachable"}' && exit 0
+    echo '{"status":"unhealthy","detail":"agent data not found on disk"}' && exit 4
 fi
 
 # ═══════════════════════════════════════
@@ -128,53 +135,78 @@ fi
 [ -n "$FROM_ID" ] || FROM_ID="unknown"
 
 _detect_letta || exit 3
-_verify_agent_id || exit 3
+_verify_agent_id || exit 4
 
-# ═══ 分层超时策略 ═══
-# Letta Code 是单 session 架构 + TTY 限制：
-#   1. 非 TTY 环境：letta -p stdout 为空 → 必须用 script -q 模拟 TTY
-#   2. 单 session：当前对话中时 subprocess 阻塞排队
-# 分层策略：
-#   第 1 层 (PROBE_TIMEOUT=30s): script -q letta -p，给 session 排队机会
-#      - 空闲时通常 3-5s 就回
-#      - 30s 超时 → exit 1 → call_adapter 返回 RETRY → 降级文件队列重试
-#   第 2 层 (ADAPTER_TIMEOUT=120s): call_adapter 层兜底，防止进程僵尸
-PROBE_TIMEOUT=30
-PROMPT="[AIM消息] 收到来自 ${FROM_ID} 的消息：${MESSAGE}"
+# ═══ 并发会话策略 ═══
+# v1.5: 使用固定 dispatch conversation 复用，替代 v1.4 的 --new
+#   - --conversation <固定ID>: 复用同一会话，TUI 开着也能并发，零磁盘增长
+#   - --new 问题: 每条消息 +1 会话 (80KB)，50条/天=4MB/天
+#   - 固定会话: 消息历史积累在同一会话，debug 可追溯，不膨胀
+#   - 15s 超时兜底（正常 3-8s 返回）
+PROBE_TIMEOUT=15
+DISPATCH_CONV="${LETTA_DISPATCH_CONV:-local-conv-1422}"
 
-# set -e 下 timeout 124 会触发脚本退出，先关再开
+# v1.5.1: prompt 加约束前缀，防止 conversation 历史导致多次回复
+#   问题: --conversation 复用带入历史上下文，Letta 看到之前的 "收到" 也会跟着回
+#   修复: 前缀明确指令「只回一次，不回历史」，去 [[:space:]] 首尾空白
+PROMPT="[AIM dispatch - 仅回复本条消息，不要回复历史] ${MESSAGE}"
+
+# v1.6.1: 去掉 --conversation（conversation 漂移/清理会导致永久降级）
+# letta v0.27.11 默认行为复用最后活跃会话，无需显式指定
 set +e
-RAW_OUTPUT=$(timeout "$PROBE_TIMEOUT" /usr/bin/script -q /dev/null "$LETTA_BIN" \
-    --agent "$LETTA_AGENT_ID" \
-    -p "$PROMPT" </dev/null 2>/dev/null)
+RAW_OUTPUT=$(timeout "$PROBE_TIMEOUT" "$LETTA_BIN" \
+    -p "$PROMPT" 2>/dev/null)
 RC=$?
 set -e
 
 if [ $RC -eq 124 ]; then
-    # 30s 超时 → session 忙（TUI 对话中） → 可重试
-    echo "[letta-adapter] 处理超时 (${PROBE_TIMEOUT}s)，session 可能忙，可重试" >&2
-    echo "DEADLINE_HINT: retry_after_idle" >&2
+    echo "[letta-adapter] 处理超时 (${PROBE_TIMEOUT}s)，可重试" >&2
     exit 1
 elif [ $RC -ne 0 ]; then
-    # 非 timeout 的错误 → letta CLI 本身挂了 → 不可用
     echo "[letta-adapter] 调用失败 rc=$RC" >&2
     exit 2
 fi
 
-# 噪声过滤 + 输出
-if [ -n "$RAW_OUTPUT" ]; then
-    # 先清理 script -q 输出的控制字符
-    # script -q 输出开头有 ^D、退格等控制字符，需要清理
-    CLEAN_OUTPUT=$(echo "$RAW_OUTPUT" | sed 's/^\^D//' | tr -d '\010' | sed 's/^[[:space:]]*//')
+# ── 输出处理 ─────────────────
+REPLIES_DIR="$SCRIPT_DIR/.aim-replies"
+mkdir -p "$REPLIES_DIR"
 
+if [ -n "$RAW_OUTPUT" ]; then
     if [ -x "$FILTER_SCRIPT" ]; then
-        REPLY=$("$FILTER_SCRIPT" "$CLEAN_OUTPUT")
+        REPLY=$("$FILTER_SCRIPT" "$RAW_OUTPUT")
     else
-        REPLY=$(echo "$CLEAN_OUTPUT" | grep -v -E \
-            '^Connected|^Loading|^Error saving|^ENOENT|^/Users/|^\s+at |^Session:|^Duration:|^Messages:')
+        REPLY="$RAW_OUTPUT"
     fi
     if [ -n "$REPLY" ]; then
         echo "$REPLY"
+        # v1.6: 记录回复到 .aim-replies/
+        TIMESTAMP=$(date +%s)
+        BODY_JSON=$(python3 -c "import json; print(json.dumps('''$REPLY'''.strip()))" 2>/dev/null || echo "\"$REPLY\"")
+        printf '{"ts":%s,"from":"%s","reply":%s}\n' "$TIMESTAMP" "${FROM_ID:-unknown}" "$BODY_JSON" >> "$REPLIES_DIR/replies.jsonl"
+    fi
+else
+    # v1.6: 无回复时也记录（避免静默丢回复）
+    TIMESTAMP=$(date +%s)
+    printf '{"ts":%s,"from":"%s","reply":null,"note":"empty output"}\n' "$TIMESTAMP" "${FROM_ID:-unknown}" >> "$REPLIES_DIR/replies.jsonl"
+fi
+
+# v1.6: Trim dispatch conversation history（每10条消息触发一次 trim）
+TRIM_COUNTER_FILE="$REPLIES_DIR/.trim_counter"
+TRIM_INTERVAL=10
+COUNT=$(cat "$TRIM_COUNTER_FILE" 2>/dev/null || echo 0)
+COUNT=$((COUNT + 1))
+echo "$COUNT" > "$TRIM_COUNTER_FILE"
+
+if [ "$COUNT" -ge "$TRIM_INTERVAL" ]; then
+    echo "0" > "$TRIM_COUNTER_FILE"
+    # trim: 用 letta messages list 获取 conversation 消息数，超过阈值则用 letta conversations trim
+    MSG_COUNT=$("$LETTA_BIN" messages list --conversation "$DISPATCH_CONV" 2>/dev/null | wc -l || echo 0)
+    if [ "$MSG_COUNT" -gt 100 ]; then
+        TRIM_TO=20
+        "$LETTA_BIN" conversations trim "$DISPATCH_CONV" --keep-last "$TRIM_TO" 2>/dev/null || \
+            echo "[letta-adapter] trim failed (non-fatal)" >&2
+        printf '{"ts":%s,"event":"trim","msg_count":%s,"trim_to":%s}\n' "$(date +%s)" "$MSG_COUNT" "$TRIM_TO" >> "$REPLIES_DIR/replies.jsonl"
     fi
 fi
+
 exit 0

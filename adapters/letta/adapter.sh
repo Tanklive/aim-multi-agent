@@ -1,9 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 # AIM Letta adapter — AIM Client v1.2 标准接口
-# VERSION: 1.8
+# VERSION: 1.8.1
 #
-# 5 个标准模式:
+# 6 个标准模式:
 #   adapter.sh process --message "..." --from "ZSxxxx"   处理消息
 #   adapter.sh health                                    健康探针
 #   adapter.sh info                                      返回 Runtime 元信息
@@ -132,8 +132,8 @@ if [ "$MODE" = "recover" ]; then
     _detect_letta || exit 2
     _verify_agent_id || exit 4
 
-    RECOVER_TIMEOUT=30
-    MAX_RETRIES=3
+    RECOVER_TIMEOUT=10
+    MAX_RETRIES=2
     RETRY=0
     RECOVER_OK=0
 
@@ -149,7 +149,7 @@ if [ "$MODE" = "recover" ]; then
         if [ $PING_RC -eq 0 ]; then
             # Step 2: 验证恢复——再发一条 ping 确认不是侥幸
             set +e
-            VERIFY_OUTPUT=$(timeout 15 "$LETTA_BIN" -p "ping" 2>/dev/null)
+            VERIFY_OUTPUT=$(timeout 5 "$LETTA_BIN" -p "ping" 2>/dev/null)
             VERIFY_RC=$?
             set -e
 

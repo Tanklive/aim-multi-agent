@@ -1,19 +1,21 @@
 #!/bin/bash
 set -euo pipefail
 # AIM Letta adapter — AIM Client v1.2 标准接口
-# VERSION: 1.7
+# VERSION: 1.8
 #
-# 4 个标准模式:
+# 5 个标准模式:
 #   adapter.sh process --message "..." --from "ZSxxxx"   处理消息
 #   adapter.sh health                                    健康探针
 #   adapter.sh info                                      返回 Runtime 元信息
 #   adapter.sh cancel --task-id "..."                    取消任务
+#   adapter.sh recover                                   自修复（620 L3）
 #
 # 返回码:
 #   process: 0=正常回复, 1=可重试, 2=降级, 3=人工介入
 #   health:  0=健康,     1=降级,   2=挂
 #   info:    0=正常
 #   cancel:  0=已取消,   1=任务不存在, 2=无法取消
+#   recover: 0=恢复成功, 1=恢复失败可重试, 2=恢复失败需人工, 4=不可恢复(数据丢失)
 
 MODE="${1:-}"
 MESSAGE=""
@@ -124,10 +126,102 @@ if [ "$MODE" = "cancel" ]; then
 fi
 
 # ═══════════════════════════════════════
+# MODE: recover — L3 自修复（620）
+# ═══════════════════════════════════════
+if [ "$MODE" = "recover" ]; then
+    _detect_letta || exit 2
+    _verify_agent_id || exit 4
+
+    RECOVER_TIMEOUT=30
+    MAX_RETRIES=3
+    RETRY=0
+    RECOVER_OK=0
+
+    while [ "$RETRY" -lt "$MAX_RETRIES" ]; do
+        RETRY=$((RETRY + 1))
+
+        # Step 1: ping 唤醒 agent（v1.6.1: 不加 --conversation，复用最后活跃会话）
+        set +e
+        PING_OUTPUT=$(timeout "$RECOVER_TIMEOUT" "$LETTA_BIN" -p "ping" 2>/dev/null)
+        PING_RC=$?
+        set -e
+
+        if [ $PING_RC -eq 0 ]; then
+            # Step 2: 验证恢复——再发一条 ping 确认不是侥幸
+            set +e
+            VERIFY_OUTPUT=$(timeout 15 "$LETTA_BIN" -p "ping" 2>/dev/null)
+            VERIFY_RC=$?
+            set -e
+
+            if [ $VERIFY_RC -eq 0 ]; then
+                echo "{\"status\":\"recovered\",\"retries\":$RETRY,\"detail\":\"agent responsive after recovery\"}"
+                RECOVER_OK=1
+                break
+            fi
+        fi
+
+        if [ $PING_RC -eq 124 ]; then
+            echo "[letta-adapter] recover ping 超时 (attempt $RETRY/$MAX_RETRIES)" >&2
+        else
+            echo "[letta-adapter] recover ping 失败 rc=$PING_RC (attempt $RETRY/$MAX_RETRIES)" >&2
+        fi
+
+        # 退避：2s / 4s / 8s
+        DELAY=$([ "$RETRY" -eq 1 ] && echo 2 || ([ "$RETRY" -eq 2 ] && echo 4 || echo 8))
+        sleep "$DELAY"
+    done
+
+    if [ "$RECOVER_OK" -eq 1 ]; then
+        exit 0
+    fi
+
+    # 恢复失败 → 可重试（Scheduler 护栏 N=3 控制重试次数）
+    echo "{\"status\":\"failed\",\"retries\":$MAX_RETRIES,\"detail\":\"agent unresponsive after $MAX_RETRIES recovery attempts\"}"
+    exit 1
+fi
+
+# ═══════════════════════════════════════
+# MODE: trim — 清理 dispatch conversation（620 L3）
+# ═══════════════════════════════════════
+if [ "$MODE" = "trim" ]; then
+    _detect_letta || exit 2
+
+    TRIM_CONV="${LETTA_DISPATCH_CONV:-local-conv-1422}"
+    KEEP="${TRIM_KEEP:-10}"
+
+    # 获取当前 conversation 消息数
+    # letta messages list 在 conversation 不存在时可能非零退出，管道左边失败时回退到 0
+    MSG_COUNT=0
+    set +e
+    MSG_COUNT=$("$LETTA_BIN" messages list --conversation "$TRIM_CONV" 2>/dev/null | wc -l | tr -d '[:space:]')
+    set -e
+    MSG_COUNT="${MSG_COUNT:-0}"
+    [ -n "$MSG_COUNT" ] || MSG_COUNT=0
+
+    if [ "$MSG_COUNT" -gt "$KEEP" ]; then
+        set +e
+        TRIM_OUTPUT=$("$LETTA_BIN" conversations trim "$TRIM_CONV" --keep-last "$KEEP" 2>&1)
+        TRIM_RC=$?
+        set -e
+
+        if [ $TRIM_RC -eq 0 ]; then
+            echo "{\"status\":\"trimmed\",\"conv\":\"$TRIM_CONV\",\"msg_count_before\":$MSG_COUNT,\"keep\":$KEEP}"
+            exit 0
+        else
+            echo "{\"status\":\"trim_failed\",\"conv\":\"$TRIM_CONV\",\"error\":\"$(echo "$TRIM_OUTPUT" | tr '\n' ' ' | head -c 200)\"}"
+            exit 1
+        fi
+    else
+        echo "{\"status\":\"skipped\",\"conv\":\"$TRIM_CONV\",\"msg_count\":$MSG_COUNT,\"reason\":\"below threshold ($KEEP)\"}"
+        exit 0
+    fi
+fi
+
+# ═══════════════════════════════════════
 # MODE: process — 处理消息
 # ═══════════════════════════════════════
 if [ "$MODE" != "process" ]; then
-    echo "用法: adapter.sh {process|health|info|cancel} [--message ...] [--from ...] [--task-id ...]" >&2
+    echo "用法: adapter.sh {process|health|info|cancel|recover|trim} [--message ...] [--from ...] [--task-id ...]" >&2
     exit 3
 fi
 
@@ -148,7 +242,7 @@ DISPATCH_CONV="${LETTA_DISPATCH_CONV:-local-conv-1422}"
 
 # v1.5.1: prompt 加约束前缀，防止 conversation 历史导致多次回复
 #   问题: --conversation 复用带入历史上下文，Letta 看到之前的 "收到" 也会跟着回
-#   修复: 前缀明确指令「只回一次，不回历史」，去 [[:space:]] 首尾空白
+#   修复: 前缀明确指令「只回一次，不回历史」
 PROMPT="[AIM dispatch - 仅回复本条消息，不要回复历史] ${MESSAGE}"
 
 # v1.6.1: 去掉 --conversation（conversation 漂移/清理会导致永久降级）
@@ -188,25 +282,6 @@ else
     # v1.6: 无回复时也记录（避免静默丢回复）
     TIMESTAMP=$(date +%s)
     printf '{"ts":%s,"from":"%s","reply":null,"note":"empty output"}\n' "$TIMESTAMP" "${FROM_ID:-unknown}" >> "$REPLIES_DIR/replies.jsonl"
-fi
-
-# v1.6: Trim dispatch conversation history（每10条消息触发一次 trim）
-TRIM_COUNTER_FILE="$REPLIES_DIR/.trim_counter"
-TRIM_INTERVAL=10
-COUNT=$(cat "$TRIM_COUNTER_FILE" 2>/dev/null || echo 0)
-COUNT=$((COUNT + 1))
-echo "$COUNT" > "$TRIM_COUNTER_FILE"
-
-if [ "$COUNT" -ge "$TRIM_INTERVAL" ]; then
-    echo "0" > "$TRIM_COUNTER_FILE"
-    # trim: 用 letta messages list 获取 conversation 消息数，超过阈值则用 letta conversations trim
-    MSG_COUNT=$("$LETTA_BIN" messages list --conversation "$DISPATCH_CONV" 2>/dev/null | wc -l || echo 0)
-    if [ "$MSG_COUNT" -gt 100 ]; then
-        TRIM_TO=20
-        "$LETTA_BIN" conversations trim "$DISPATCH_CONV" --keep-last "$TRIM_TO" 2>/dev/null || \
-            echo "[letta-adapter] trim failed (non-fatal)" >&2
-        printf '{"ts":%s,"event":"trim","msg_count":%s,"trim_to":%s}\n' "$(date +%s)" "$MSG_COUNT" "$TRIM_TO" >> "$REPLIES_DIR/replies.jsonl"
-    fi
 fi
 
 exit 0

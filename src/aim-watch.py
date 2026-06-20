@@ -196,6 +196,8 @@ class WatchDisplay:
 
         # compact 模式追踪每个 msg_id 的 ai 事件链
         self._ai_chains: dict = {}  # msg_id → [events...]
+        # 去重：SDK emit_obs 双发(JS+raw)导致同一事件出现两次
+        self._seen_events: set = set()  # (agent_id, msg_id, status, ts_int)
 
         # 打开保存文件
         if save_path:
@@ -231,6 +233,17 @@ class WatchDisplay:
         status = event.get("status", "")
         agent_id = event.get("agent_id", "???")
         framework = event.get("framework", "")
+
+        # 去重：SDK emit_obs 双发(JS+raw)导致重复
+        msg_id = event.get("msg_id", "")
+        ts_int = int(event.get("ts", 0) * 10)  # 0.1s 精度
+        dedup_key = (agent_id, msg_id, status, ts_int)
+        if dedup_key in self._seen_events:
+            return
+        self._seen_events.add(dedup_key)
+        # 定期清理旧 key（保留最近 10000 条）
+        if len(self._seen_events) > 10000:
+            self._seen_events = set(list(self._seen_events)[-5000:])
 
         # 框架解析：事件里没有 framework 字段时，从映射表查找
         if not framework and agent_id in self.framework_map:

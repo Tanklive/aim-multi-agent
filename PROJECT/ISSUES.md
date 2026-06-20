@@ -95,3 +95,5 @@
 - 所有问题在此文件统一维护
 - 关闭项保留记录，不删除
 - 每条新发现问题追加到对应区，不新建文件
+| 2026-06-20 22:41 | ZS0003 | 🟢 P2 | Worker E2E 端到端测试 | 验证链路: ZS0003 → NATS aim.issue.update → Worker → ISSUES.md append → git commit 测试时间: 2026年 6月20日 星期六 22时41分28秒 CST |
+| 2026-06-20 22:43 | ZS0002 | 🔴 P0 | ZS0001 exit=-9 | adapter 返回未定义退出码-9，Scheduler 无法归类，消息无限重试，StallWatchdog 持续自愈失败 | 责任: 呱呱 | 来源: 620-5轮审计 |

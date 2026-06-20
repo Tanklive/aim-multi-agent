@@ -107,3 +107,8 @@
 | 2026-06-20 22:43 | ZS0002 | 🟢 P2 | JetStream consumer 旧配置 | 旧consumer需重建生效retention=max_age=7d/max_deliver=5 | 责任: 吉量 | 来源: 620-5轮审计 |
 | 2026-06-20 22:43 | ZS0002 | 🟢 P2 | 日志目录分散 | 4个不同路径。已出~/.aim/logs/README.md统一规范 | 责任: 吉量 | 来源: 620-5轮审计 |
 | 2026-06-20 22:43 | ZS0002 | 🟢 P2 | deploy-verify 缺validator功能测试 | 仅检查文件存在，不测试validate_envelope()实际拦截 | 责任: 三方 | 来源: 620-5轮审计 |
+| 2026-06-20 22:43 | ZS0002 | 🟢 P2 | 确认循环检测器冗余 | shared main.py 有两套检测器(吉量_is_confirm_loop+呱呱纯确认消息)，待合并 | 责任: 吉量/呱呱 | 来源: 620-5轮审计 |
+| 2026-06-20 22:43 | ZS0003 | 🔴 P0 | POST-01: health _detect_letta() which 回退绕过 CLI 校验 | LETTA_BIN=/tmp/fake 时仍返回 healthy, 根因: _detect_letta() 回退到 which letta 找到系统版本 修复: 去 which 兜底, LETTA_BIN 必须精确从 config.json 解析, 不存在直接 exit 3 已修: adapter.sh v2.0.1 |
+| 2026-06-20 22:43 | ZS0003 | 🟡 P1 | POST-02: dispatch conv 冷启动首次超时 | 首次 --conversation 需要加载 agent (15-20s) > 15s PROBE_TIMEOUT 修复: RC≠0 & RC≠124 时自动重试一次, 第二次 agent 已缓存秒级 已修: adapter.sh v2.0.1 |
+| 2026-06-20 22:43 | ZS0003 | 🟡 P1 | POST-06: adapter trim 调用卡住/被降级为 no-op | 根因: trim 调 letta messages list 在主 session 占用时超时, 被迫降级为 no-op, 导致 dispatch conv 消息历史不断累积 修复: trim 改为直接 truncate messages.jsonl (不调 letta CLI) 已修: adapter.sh v2.1 |
+| 2026-06-20 22:43 | ZS0003 | 🔴 P0 | recover 模式走 LLM 消耗 token | 每次 recover 调 letta -p "ping" → 12K+ tokens, 违反 AIM 运维零 Token 铁律 修复: recover 改为 pgrep + memfs 磁盘探活, 零 token 秒级返回 已修: adapter.sh v2.1 |

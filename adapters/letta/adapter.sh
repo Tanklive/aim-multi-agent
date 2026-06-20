@@ -54,11 +54,10 @@ export PATH="$HOME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
 # ── 检测 letta CLI ─────────────────────
 _detect_letta() {
-    if [ ! -x "$LETTA_BIN" ]; then
-        LETTA_BIN=$(which letta 2>/dev/null || echo "")
-    fi
+    # v2.0.1: 不再回退到 which letta — 必须从环境变量或 config.json 精确解析
+    #         which 兜底会绕过 LETTA_BIN 校验，掩盖 npm 包丢失问题
     if [ -z "$LETTA_BIN" ] || [ ! -x "$LETTA_BIN" ]; then
-        echo "[letta-adapter] letta CLI 不可用" >&2
+        echo "[letta-adapter] letta CLI 不可用 (LETTA_BIN=$LETTA_BIN)" >&2
         return 1
     fi
     return 0
@@ -284,6 +283,18 @@ RAW_OUTPUT=$(timeout "$PROBE_TIMEOUT" "$LETTA_BIN" \
     -p "$PROMPT" 2>/dev/null)
 RC=$?
 set -e
+
+# v2.0.1: dispatch conv 冷启动重试 — 首次 --conversation 需要加载 agent 到内存 (15-20s)，
+#         15s 超时边界可能不够。非超时的失败（RC≠0 & RC≠124）在 agent 已加载后
+#         第二次调用通常秒级成功。重试一次即可覆盖冷启动。
+if [ $RC -ne 0 ] && [ $RC -ne 124 ]; then
+    set +e
+    RAW_OUTPUT=$(timeout "$PROBE_TIMEOUT" "$LETTA_BIN" \
+        --conversation "$DISPATCH_CONV" \
+        -p "$PROMPT" 2>/dev/null)
+    RC=$?
+    set -e
+fi
 
 if [ $RC -eq 124 ]; then
     echo "[letta-adapter] 处理超时 (${PROBE_TIMEOUT}s)，可重试" >&2

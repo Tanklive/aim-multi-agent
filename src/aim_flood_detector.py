@@ -24,9 +24,7 @@ from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
 
-SDK_DIR = Path.home() / ".aim" / "bin"
-sys.path.insert(0, str(SDK_DIR))
-from aim_nats_sdk import AIMObserverClient
+import nats
 
 VERSION = "0.1.0"
 
@@ -114,8 +112,9 @@ async def main():
     print(f"[flood-detector v{VERSION}] 启动中…")
     detector = FloodDetector()
 
-    client = AIMObserverClient(agent_id="aim-watch")
-    await client.connect()
+    creds = str(Path.home() / ".aim" / "agents" / "ZS0001" / "aim.creds")
+    nc = nats.aio.client.Client()
+    await nc.connect("nats://127.0.0.1:4222", user_credentials=creds)
 
     async def on_grp(msg):
         try:
@@ -129,7 +128,8 @@ async def main():
         except Exception:
             pass
 
-    await client.subscribe_grp("grp_trio", on_grp)
+    await nc.subscribe("aim.grp.grp_trio", cb=on_grp)
+    print(f"[flood-detector v{VERSION}] 已订阅 aim.grp.grp_trio")
 
     # 维持运行
     while True:

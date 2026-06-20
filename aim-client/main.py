@@ -362,6 +362,7 @@ class AIMClient:
         # 以父进程环境打底（必须！空 dict 会清空 PATH/HOME 等）
         self.adapter_env: dict[str, str] = dict(os.environ)
         self._degrade_history = deque(maxlen=100)  # P1-2: (ts, exit_code) 窗口
+        self._init_loop_state()  # 循环检测追踪
         for config_key in ("letta_bin", "letta_agent_id"):
             val = self.config.get(config_key)
             if val:
@@ -783,29 +784,51 @@ class AIMClient:
                 )
             )
 
-    # ── 纯确认模式（防 ping-pong 循环）──
-    PURE_ACK_PATTERNS = [
-        r'^[✨🐴🐸]*[1]+[✨🐴🐸]*$',
-        r'^[👍👌✅⏸️🟢]*$',
-        r'收到',           # 含"收到"即跳过
-        r'^好的',
-        r'^知道了',
-        r'^OK\s*$',
-        r'^行$',
-        r'^嗯$',
-        r'^哦$',
-        r'^👂',           # 👂 开头（👂 收到）
-    ]
+    # ── 循环检测（行为模式，非关键词）──
+    _LOOP_WINDOW_SEC = 60
+    _LOOP_REPEAT_THRESHOLD = 3        # 同一 (from_id, 短内容) 窗口内 ≥3 次 → 视为循环
+    _LOOP_CONTENT_MAX_LEN = 20        # 只有短消息参与循环检测
 
-    @classmethod
-    def _is_pure_ack(cls, text: str) -> bool:
-        """判断消息是否为纯确认（无需回复）"""
-        t = text.strip()
-        if len(t) <= 1:
+    def _init_loop_state(self):
+        """初始化循环追踪状态（在 __init__ 中调用）"""
+        # {(from_id, content_fingerprint): deque[timestamp]}
+        self._loop_tracker: dict = {}
+
+    def _check_loop(self, from_id: str, content: str, msg_id: str) -> bool:
+        """检测消息是否处于循环中（行为模式：同发送者+同短内容高频重复）
+
+        大哥原则：不看固定词汇，看行为——同一来源反复发同样的短消息。
+        真正的对话（如"收到，确认我的归属项：…"）不会重复，不会被误杀。
+        """
+        import time as _time
+        now = _time.time()
+        text = content.strip()
+
+        # 只追踪短消息（长消息几乎不可能进入循环）
+        if len(text) > self._LOOP_CONTENT_MAX_LEN:
+            return False
+
+        # 指纹：from_id + 内容前 20 字
+        key = (from_id, text[:20])
+        dq = self._loop_tracker.get(key)
+        if dq is None:
+            dq = __import__("collections").deque(maxlen=50)
+            self._loop_tracker[key] = dq
+
+        # 清理过期
+        cutoff = now - self._LOOP_WINDOW_SEC
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+
+        dq.append(now)
+        count = len(dq)
+
+        if count >= self._LOOP_REPEAT_THRESHOLD:
+            self.logger.warning(
+                f" [{msg_id[:8]}] 🔁 循环检测: from={from_id} cnt={count}/{self._LOOP_WINDOW_SEC}s "
+                f"content={text[:30]!r}"
+            )
             return True
-        for pat in cls.PURE_ACK_PATTERNS:
-            if __import__("re").search(pat, t):
-                return True
         return False
 
     async def _call_adapter(self, msg: Message) -> Optional[str]:
@@ -820,9 +843,8 @@ class AIMClient:
             DegradeError: exit=2
             HumanInterventionError: exit=3
         """
-        # ── 纯确认过滤：收到/1/👍/👂 等 → 静默 ack，不发回复 ──
-        if self._is_pure_ack(msg.content):
-            self.logger.debug(f" [{msg.msg_id[:8]}] 纯确认消息，静默跳过")
+        # ── 循环抑制：同来源同内容高频重复 → 静默跳过 ──
+        if self._check_loop(msg.from_id, msg.content, msg.msg_id):
             return None
 
         safe_content = msg.content.replace("'", "'\\''")

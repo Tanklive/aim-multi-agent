@@ -783,6 +783,31 @@ class AIMClient:
                 )
             )
 
+    # ── 纯确认模式（防 ping-pong 循环）──
+    PURE_ACK_PATTERNS = [
+        r'^[✨🐴🐸]*[1]+[✨🐴🐸]*$',
+        r'^[👍👌✅⏸️🟢]*$',
+        r'收到',           # 含"收到"即跳过
+        r'^好的',
+        r'^知道了',
+        r'^OK\s*$',
+        r'^行$',
+        r'^嗯$',
+        r'^哦$',
+        r'^👂',           # 👂 开头（👂 收到）
+    ]
+
+    @classmethod
+    def _is_pure_ack(cls, text: str) -> bool:
+        """判断消息是否为纯确认（无需回复）"""
+        t = text.strip()
+        if len(t) <= 1:
+            return True
+        for pat in cls.PURE_ACK_PATTERNS:
+            if __import__("re").search(pat, t):
+                return True
+        return False
+
     async def _call_adapter(self, msg: Message) -> Optional[str]:
         """调用 adapter.sh process，返回回复文本
 
@@ -795,6 +820,11 @@ class AIMClient:
             DegradeError: exit=2
             HumanInterventionError: exit=3
         """
+        # ── 纯确认过滤：收到/1/👍/👂 等 → 静默 ack，不发回复 ──
+        if self._is_pure_ack(msg.content):
+            self.logger.debug(f" [{msg.msg_id[:8]}] 纯确认消息，静默跳过")
+            return None
+
         safe_content = msg.content.replace("'", "'\\''")
         cmd = f"bash {self.adapter_cmd} process --from '{msg.from_id}' --message '{safe_content}'"
         proc = await asyncio.create_subprocess_shell(

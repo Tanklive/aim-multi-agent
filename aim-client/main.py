@@ -1025,13 +1025,15 @@ class AIMClient:
             return
 
         # ── 送达确认替代 ACK：短 ACK 不进 dispatch ──
-        # "收到"/"ok"/"✅" 等 ≤3 字纯 ACK 不触发 adapter 处理
         # 传输层 NATS publish ack 已保证送达，应用层 ACK 是冗余
+        import re
         stripped = content.strip()
-        _ACK_PATTERNS = {"收到", "ok", "OK", "Ok", "✅", "👌", "👍", "🤝", "done", "Done", "ack", "ACK", "Ack"}
-        if len(stripped) <= 3 and stripped in _ACK_PATTERNS:
+        # 去除 emoji/符号/表情（非文字非标点部分），判断剩余文本是否为纯 ACK
+        _text_only = re.sub(r'[^\w\s\u4e00-\u9fff\u3000-\u303f\uff00-\uffef,.!?;:。，！？；：]', '', stripped).strip()
+        _ACK_PATTERNS = {"收到", "ok", "OK", "Ok", "done", "Done", "ack", "ACK", "Ack"}
+        if _text_only in _ACK_PATTERNS:
             eid = (envelope.get("id", "?"))[:8]
-            self.logger.info(f" [{eid}] ACK skip: '{stripped}' (送达已由传输层确认)")
+            self.logger.info(f" [{eid}] ACK skip: '{stripped[:20]}' (送达已由传输层确认)")
             return
 
         from_id = envelope.get("from", "")

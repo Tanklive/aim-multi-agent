@@ -615,6 +615,23 @@ class AIMClient:
                 _last_state = new_state
                 if not prev_can and self.scheduler.should_dispatch():
                     self._dispatch_event.set()
+                # ── 0-ack 告警（项6）：队列堆积但无处理进展 → observer 事件 ──
+                qsize = self.queue.size()
+                prev_qsize = getattr(self, '_prev_queue_size', 0)
+                self._prev_queue_size = qsize
+                # 队列有货 且 数量未减少（无 ack 消化）
+                if qsize > 0 and qsize >= prev_qsize:
+                    zs = getattr(self, '_zero_ack_streak', 0) + 1
+                    self._zero_ack_streak = zs
+                else:
+                    self._zero_ack_streak = 0
+                if self._zero_ack_streak >= 3 and qsize > 0:
+                    self.logger.warning(f"⚠️ 0-ack: queue={qsize} pending, {self._zero_ack_streak} 周期未消化")
+                    await self.transport.emit_obs(
+                        "0-ack", "",
+                        f"queue={qsize} pending, streak={self._zero_ack_streak}"
+                    )
+
                 # Observer 事件推送：心跳
                 await self.transport.emit_obs("heartbeat", "", "alive")
                 # Registry 心跳：更新 last_seen

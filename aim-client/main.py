@@ -387,6 +387,10 @@ class AIMClient:
         # L3 护栏: N=3 次自修复失败 → 永久停止 + 告警
         self._repair_failures: int = 0
         self._repair_disabled: bool = False
+        # 620: envelope 准入校验 (Phase 1: warn, Phase 2: reject)
+        self._envelope_strict_mode = self.config.get("envelope_strict_mode", "warn")
+        self._envelope_violations: int = 0  # 累计不合规消息数
+        self._reject_hard_errors: bool = self._envelope_strict_mode == "reject"
         self.logger.info(f"Framework: {self.config.get('framework', 'unknown')}")
         self.logger.info(f"Adapter: {self.adapter_cmd}")
         self.logger.info(f"Queue+Scheduler 已嵌入 (capacity={self.queue.capacity})")
@@ -823,12 +827,30 @@ class AIMClient:
         await self._handle_message(envelope, is_dm=False)
 
     async def _handle_message(self, envelope: dict, *, is_dm: bool):
+        # ── 620: envelope 准入校验 (三方共识: 吉量SDK + 呱呱handler + 火鸡儿E2E) ──
+        violation = self._validate_envelope(envelope)
+        if violation:
+            self._envelope_violations += 1
+            sev, reason = violation
+            detail = f"{sev} envelope from={envelope.get('from','?')} id={(envelope.get('id','?') or '?')[:8]}: {reason}"
+            if sev == "hard" and self._reject_hard_errors:
+                self.logger.warning(f"🚫 [envelope] REJECT {detail}")
+                asyncio.ensure_future(self.transport.emit_obs("envelope_reject", "", detail))
+                return
+            else:
+                self.logger.warning(f"⚠️ [envelope] WARN {detail} (violations={self._envelope_violations})")
+                asyncio.ensure_future(self.transport.emit_obs("envelope_warn", "", detail))
+
         payload = envelope.get("payload", {})
-        content = payload.get("text", "") or envelope.get("content", "")
+        content = payload.get("text", "")
+        # 620: 移除 envelope.get("content") 容错回退，不合规格式已在上面告警
         if not content:
             return
 
-        from_id = envelope.get("from", envelope.get("from_id", ""))
+        from_id = envelope.get("from", "")
+        # 620: 移除 envelope.get("from_id") 容错回退
+        if not from_id:
+            return
         msg_id = envelope.get("id", str(uuid.uuid4()))
 
         # 安全过滤 — 认证链
@@ -864,6 +886,39 @@ class AIMClient:
         self.queue.enqueue(msg)
         self._dispatch_event.set()
         self.scheduler.on_message_enqueued()
+
+    def _validate_envelope(self, envelope: dict):
+        """620: veritas v1.0 信封格式校验
+
+        返回 (severity, reason) 或 None (合规)。
+        - hard: ver缺失、from缺失、payload非dict → Phase 2 reject
+        - soft: content在顶层、from_id旧字段 → Phase 1 warn
+
+        三方共识：吉量SDK校验 + 呱呱handler清容错 + 火鸡儿E2E验证
+        标准文档：~/shared/aim/specs/aim-envelope-spec.md
+        """
+        # hard: ver 缺失
+        if "ver" not in envelope:
+            return ("hard", "missing 'ver' field")
+
+        # hard: from 缺失
+        if not envelope.get("from"):
+            return ("hard", "missing 'from' field")
+
+        # hard: payload 非 dict
+        payload = envelope.get("payload")
+        if not isinstance(payload, dict):
+            return ("hard", "payload is not a dict")
+
+        # soft: content 在 envelope 顶层而非 payload.text (兼容旧格式)
+        if "content" in envelope and "text" not in payload:
+            return ("soft", "content at envelope level, expected payload.text")
+
+        # soft: 使用旧字段名 from_id 而非 from
+        if "from_id" in envelope and "from" not in envelope:
+            return ("soft", "using legacy 'from_id' instead of 'from'")
+
+        return None
 
     async def _register_with_registry(self):
         """向 Registry 注册本 Agent"""

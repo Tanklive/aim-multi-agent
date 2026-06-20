@@ -155,12 +155,15 @@ def setup_logging(agent_id: str) -> logging.Logger:
     fh = RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=3)
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)-5s] %(message)s", datefmt="%H:%M:%S"))
+    # 只保留 FileHandler；StreamHandler 已移除（shell 用 2>&1 捕获 stderr，
+    # 同时保留 StreamHandler 会导致每行日志在文件中出现两次）
     logger.addHandler(fh)
-
-    sh = logging.StreamHandler(sys.stderr)
-    sh.setLevel(logging.INFO)
-    sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)-5s] %(message)s", datefmt="%H:%M:%S"))
-    logger.addHandler(sh)
+    # Debug 输出走 stdout（不双写，shell 不重定向时不丢调试信息）
+    dh = logging.StreamHandler(sys.stdout)
+    dh.setLevel(logging.DEBUG)
+    dh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)-5s] %(message)s", datefmt="%H:%M:%S"))
+    if os.environ.get("AIM_LOG_NO_CONSOLE"):
+        dh.setLevel(logging.CRITICAL)  # 静默
     return logger
 
 
@@ -413,6 +416,8 @@ class AIMClient:
         self._seen_msg_keys: dict[str, float] = {}  # 内容去重 (from_id:content[:200]→timestamp)
         self._processed_ids: set = set()  # U-005: msg_id L1 去重（接收时）
         self._dispatched_ids: set = set()  # U-006: 已 dispatch 去重（发送 adapter 后）
+        self._recv_lock = asyncio.Lock()   # U-006: _on_dm/_on_grp 去重竞态防护
+        self._recv_in_progress: set = set()  # U-006: 正在处理的 msg_id（锁保护）
         # 619-20: StallWatchdog — 检测 dispatch_loop 假死
         self._last_dispatch_time: float = 0.0
         self._stall_timeout_sec = self.config.get("stall_watchdog_sec", 30.0)
@@ -1013,26 +1018,48 @@ class AIMClient:
     async def _on_dm(self, envelope: dict, raw_msg):
         from_id = envelope.get("from", envelope.get("from_id", ""))
         mid = str(envelope.get('id','?'))[:8]
-        preview = self._preview(envelope, maxlen=50)
-        obs_text = self._preview(envelope, maxlen=500)  # U-006: aim-watch 不截断
-        self.logger.info(f" DM收到: from={from_id} id={mid}")
+        msg_id = envelope.get("id", "")
         if from_id == self.agent_id:
             return
-        detail = f"from={from_id}" + (f" text={obs_text}" if obs_text else "")
-        await self.transport.emit_obs("received", mid, detail)
-        await self._handle_message(envelope, is_dm=True)
+        # U-006: 锁保护防 NATS 重复回调竞态（不与 _processed_ids 冲突）
+        async with self._recv_lock:
+            if msg_id and msg_id in self._recv_in_progress:
+                return
+            if msg_id:
+                self._recv_in_progress.add(msg_id)
+        try:
+            preview = self._preview(envelope, maxlen=50)
+            obs_text = self._preview(envelope, maxlen=500)
+            self.logger.info(f" DM收到: from={from_id} id={mid}")
+            detail = f"from={from_id}" + (f" text={obs_text}" if obs_text else "")
+            await self.transport.emit_obs("received", mid, detail)
+            await self._handle_message(envelope, is_dm=True)
+        finally:
+            async with self._recv_lock:
+                self._recv_in_progress.discard(msg_id)
 
     async def _on_grp(self, envelope: dict, raw_msg):
         from_id = envelope.get("from", envelope.get("from_id", ""))
         mid = str(envelope.get('id','?'))[:8]
-        preview = self._preview(envelope, maxlen=50)
-        obs_text = self._preview(envelope, maxlen=500)  # U-006: aim-watch 不截断
-        self.logger.info(f" GRP收到: from={from_id}")
+        msg_id = envelope.get("id", "")
         if from_id == self.agent_id:
             return
-        detail = f"from={from_id}" + (f" text={obs_text}" if obs_text else "")
-        await self.transport.emit_obs("received", mid, detail)
-        await self._handle_message(envelope, is_dm=False)
+        # U-006: 锁保护防 NATS 重复回调竞态（不与 _processed_ids 冲突）
+        async with self._recv_lock:
+            if msg_id and msg_id in self._recv_in_progress:
+                return
+            if msg_id:
+                self._recv_in_progress.add(msg_id)
+        try:
+            preview = self._preview(envelope, maxlen=50)
+            obs_text = self._preview(envelope, maxlen=500)
+            self.logger.info(f" GRP收到: from={from_id}")
+            detail = f"from={from_id}" + (f" text={obs_text}" if obs_text else "")
+            await self.transport.emit_obs("received", mid, detail)
+            await self._handle_message(envelope, is_dm=False)
+        finally:
+            async with self._recv_lock:
+                self._recv_in_progress.discard(msg_id)
 
     async def _handle_message(self, envelope: dict, *, is_dm: bool):
         # ── 620: envelope 准入校验 (三方共识: 吉量SDK + 呱呱handler + 火鸡儿E2E) ──

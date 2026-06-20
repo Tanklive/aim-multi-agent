@@ -158,10 +158,26 @@ fi
 # ═══════════════════════════════════════
 # MODE: trim — 清理 dispatch conversation（620 L3）
 # ═══════════════════════════════════════
-# v1.8.2: Letta CLI 常不可达导致 trim 超时 → 降级为 no-op，
-#         由 StallWatchdog 的 reset_to_idle + 丢消息机制兜底
+# v2.1: trim 清空 dispatch conv 消息历史 (= truncate messages.jsonl)
+#       不删除目录（保留 conversation.json / manifest.json 结构）
+#       避免 "👂 收到" 模式污染 future 回复质量
 if [ "$MODE" = "trim" ]; then
-    echo '{"status":"trimmed","detail":"letta runtime no-op — StallWatchdog acknowledged"}'
+    _detect_letta || exit 2
+
+    TRIM_CONV="${LETTA_DISPATCH_CONV:-local-conv-1422}"
+    CONV_BASE="${HOME}/.letta/lc-local-backend/conversations"
+    ENCODED_NAME=$(echo -n "conversation:${TRIM_CONV}" | base64)
+    CONV_DIR="${CONV_BASE}/${ENCODED_NAME}"
+    MSG_FILE="${CONV_DIR}/messages.jsonl"
+
+    if [ -f "$MSG_FILE" ]; then
+        BEFORE=$(wc -l < "$MSG_FILE" | tr -d ' ')
+        : > "$MSG_FILE"   # truncate to 0 bytes
+        AFTER=$(wc -l < "$MSG_FILE" | tr -d ' ')
+        echo "{\"status\":\"trimmed\",\"conv\":\"$TRIM_CONV\",\"lines_before\":$BEFORE,\"lines_after\":$AFTER}"
+    else
+        echo "{\"status\":\"skipped\",\"conv\":\"$TRIM_CONV\",\"reason\":\"no messages.jsonl\"}"
+    fi
     exit 0
 fi
 

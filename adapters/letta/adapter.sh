@@ -234,24 +234,83 @@ fi
 _detect_letta || exit 3
 _verify_agent_id || exit 4
 
-# ═══ 并发会话策略 ═══
-# v1.5: 使用固定 dispatch conversation 复用，替代 v1.4 的 --new
-#   - --conversation <固定ID>: 复用同一会话，TUI 开着也能并发，零磁盘增长
-#   - --new 问题: 每条消息 +1 会话 (80KB)，50条/天=4MB/天
-#   - 固定会话: 消息历史积累在同一会话，debug 可追溯，不膨胀
-#   - 15s 超时兜底（正常 3-8s 返回）
+# ══════════════════════════════════════════════════════════════
+# 双会话隔离机制 — Letta 架构的 AIM Client 适配方案
+# ══════════════════════════════════════════════════════════════
+#
+# 设计理由:
+#   Letta 是 deferred 模型 (max_concurrency=1)，主会话被 TUI 占用时
+#   adapter process 不能抢主会话。必须用独立 dispatch 会话处理 AIM 消息。
+#
+# 机制:
+#   1. DISPATCH_CONV 从环境变量 LETTA_DISPATCH_CONV 读取（可动态配置）
+#      默认值 ref: [[reference/aim/adapter-dispatch-session.md]]
+#   2. process 模式自动检测并初始化 dispatch conv:
+#      a) 检查磁盘目录 (conversation.json + manifest.json + messages.jsonl)
+#      b) 目录缺失 → 用 ensure_dispatch_conv() 通过 letta 创建
+#      c) 目录存在 → 直接 --conversation 复用
+#   3. health 模式也验证 dispatch conv 存活（目录存在 = healthy）
+#   4. cleanup-conversations.sh 永久排除 dispatch conv（不清理）
+#   5. 存活监控: adapter health 探针检测 dispatch conv 目录存在性
+#
+# @see [[reference/aim/adapter-dispatch-session.md]]  完整说明
+# @see [[reference/aim/gotchas.md]]                   相关陷阱
+# ══════════════════════════════════════════════════════════════
+
 PROBE_TIMEOUT=15
 DISPATCH_CONV="${LETTA_DISPATCH_CONV:-local-conv-1422}"
-
-# v1.5.1: prompt 加约束前缀，防止 conversation 历史导致多次回复
-#   问题: --conversation 复用带入历史上下文，Letta 看到之前的 "收到" 也会跟着回
-#   修复: 前缀明确指令「只回一次，不回历史」
 PROMPT="[AIM dispatch - 仅回复本条消息，不要回复历史] ${MESSAGE}"
 
-# v1.6.1: 去掉 --conversation（conversation 漂移/清理会导致永久降级）
-# letta v0.27.11 默认行为复用最后活跃会话，无需显式指定
+# ── 确保 dispatch conv 存在 ──────────────────
+ensure_dispatch_conv() {
+    local conv_id="$1"
+    local base_dir="${HOME}/.letta/lc-local-backend/conversations"
+    local encoded_name
+    encoded_name=$(echo -n "conversation:${conv_id}" | base64)
+    local conv_dir="${base_dir}/${encoded_name}"
+
+    # 检查磁盘目录是否完整
+    if [ -d "$conv_dir" ] && [ -f "$conv_dir/conversation.json" ] && [ -f "$conv_dir/manifest.json" ]; then
+        return 0
+    fi
+
+    # 目录不存在或不完整 → 通过 letta 创建
+    echo "[letta-adapter] 初始化 dispatch 会话: $conv_id" >&2
+    mkdir -p "$conv_dir" 2>/dev/null || true
+
+    # 写 conversation.json（Letta 通过此文件识别 conv）
+    python3 -c "
+import json, os
+from datetime import datetime, timezone
+now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+conv = {
+    'id': '$conv_id',
+    'agent_id': '$LETTA_AGENT_ID',
+    'archived': False, 'archived_at': None,
+    'created_at': now, 'updated_at': now, 'last_message_at': now,
+    'summary': None, 'in_context_message_ids': []
+}
+manifest = {
+    'schema_version': 2,
+    'message_format': 'pi-session-entry-jsonl',
+    'provider_stack': 'pi-ai',
+    'created_at': now
+}
+with open(os.path.join('$conv_dir', 'conversation.json'), 'w') as f: json.dump(conv, f)
+with open(os.path.join('$conv_dir', 'manifest.json'), 'w') as f: json.dump(manifest, f)
+# 确保 messages.jsonl 存在（空文件）
+open(os.path.join('$conv_dir', 'messages.jsonl'), 'a').close()
+" 2>/dev/null
+
+    return 0
+}
+
+# ── 初始化 + 调用 dispatch ────────────────
+ensure_dispatch_conv "$DISPATCH_CONV"
+
 set +e
 RAW_OUTPUT=$(timeout "$PROBE_TIMEOUT" "$LETTA_BIN" \
+    --conversation "$DISPATCH_CONV" \
     -p "$PROMPT" 2>/dev/null)
 RC=$?
 set -e

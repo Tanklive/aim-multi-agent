@@ -99,15 +99,25 @@ for conv_dir in "$CONV_BASE"/*/; do
 
     # 跳过当前活跃的 dispatch conversation（通过检查是否有 letta 进程引用它）
     # 安全策略：
-    #   保留当前 agent (agent-local-f763730a) 的 conv（目录名含 f763730a）
+    #   保留:
+    #     - 当前 agent (agent-local-f763730a) 的 conv（目录名含 f763730a）
+    #     - AIM dispatch 固定会话 (local-conv-1422)
     #   删除所有其他旧 conv
 
-    case "$conv_name" in
-        *f763730a*)
-            # 保留当前 agent 的 conv
-            ;;
-        *)
-            rm -rf "$conv_dir" 2>/dev/null && DELETED=$((DELETED + 1)) || FAILED=$((FAILED + 1))
+    # 解码目录名确认不应删的
+    DECODED=$(echo "$conv_name" | base64 -d 2>/dev/null || echo "")
+    
+    # 保留 dispatch 会话 — 双会话隔离的核心
+    if echo "$DECODED" | grep -q 'conversation:local-conv-1422$'; then
+        continue
+    fi
+
+    # 保留当前 agent 的 conv
+    if echo "$DECODED" | grep -q 'agent-local-f763730a'; then
+        continue
+    fi
+
+    rm -rf "$conv_dir" 2>/dev/null && DELETED=$((DELETED + 1)) || FAILED=$((FAILED + 1))
             ;;
     esac
 done

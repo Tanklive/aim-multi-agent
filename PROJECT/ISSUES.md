@@ -112,3 +112,6 @@
 | 2026-06-20 22:43 | ZS0003 | 🟡 P1 | POST-02: dispatch conv 冷启动首次超时 | 首次 --conversation 需要加载 agent (15-20s) > 15s PROBE_TIMEOUT 修复: RC≠0 & RC≠124 时自动重试一次, 第二次 agent 已缓存秒级 已修: adapter.sh v2.0.1 |
 | 2026-06-20 22:43 | ZS0003 | 🟡 P1 | POST-06: adapter trim 调用卡住/被降级为 no-op | 根因: trim 调 letta messages list 在主 session 占用时超时, 被迫降级为 no-op, 导致 dispatch conv 消息历史不断累积 修复: trim 改为直接 truncate messages.jsonl (不调 letta CLI) 已修: adapter.sh v2.1 |
 | 2026-06-20 22:43 | ZS0003 | 🔴 P0 | recover 模式走 LLM 消耗 token | 每次 recover 调 letta -p "ping" → 12K+ tokens, 违反 AIM 运维零 Token 铁律 修复: recover 改为 pgrep + memfs 磁盘探活, 零 token 秒级返回 已修: adapter.sh v2.1 |
+| 2026-06-20 22:43 | ZS0003 | 🟡 P1 | _on_grp/dispatch 幻听串扰 — 消息历史污染回复质量 | dispatch conv messages.jsonl 中 "👂 收到" 成为高频模式, 污染 Letta 后续回复 → 形成回应循环 修复: trim truncate messages.jsonl + 首刀手动清空历史 已修: adapter.sh v2.1 + 22:20 手动清理 |
+| 2026-06-20 22:43 | ZS0003 | 🟡 P1 | 双会话隔离从未实际部署 (v1.5→v1.8 注释骗了自己) | v1.5 注释写了 --conversation 方案但代码从未传参, 4个版本都在裸 letta -p → 新增 conv 目录 修复: v2.0 ensure_dispatch_conv() + --conversation 真正隔离 已修: adapter.sh v2.0 |
+| 2026-06-20 22:43 | ZS0003 | 🟢 P2 | conv 清理 cron 未排除 dispatch conv | cleanup cron 每天 4 点可能误删 dispatch conv (local-conv-1422) 修复: cleanup-conversations.sh 解码目录名匹配 conversation:local-conv-1422 跳过不删 已修: cleanup-conversations.sh v1.0 |

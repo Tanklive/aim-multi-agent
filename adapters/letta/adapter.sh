@@ -131,51 +131,27 @@ if [ "$MODE" = "recover" ]; then
     _detect_letta || exit 2
     _verify_agent_id || exit 4
 
-    RECOVER_TIMEOUT=10
-    MAX_RETRIES=2
-    RETRY=0
-    RECOVER_OK=0
+    # v2.1: recover 不再走 LLM (letta -p "ping" → 12K+ tokens)
+    #       改为纯进程/磁盘探活 — 零 token 消耗
+    #       AIM 自身运行监控走服务/模块/代码，不走 token
 
-    while [ "$RETRY" -lt "$MAX_RETRIES" ]; do
-        RETRY=$((RETRY + 1))
+    LETTA_PID=$(pgrep -f "node.*letta" 2>/dev/null | head -1 || echo "")
+    DISK_OK=0
 
-        # Step 1: ping 唤醒 agent（v1.6.1: 不加 --conversation，复用最后活跃会话）
-        set +e
-        PING_OUTPUT=$(timeout "$RECOVER_TIMEOUT" "$LETTA_BIN" -p "ping" 2>/dev/null)
-        PING_RC=$?
-        set -e
-
-        if [ $PING_RC -eq 0 ]; then
-            # Step 2: 验证恢复——再发一条 ping 确认不是侥幸
-            set +e
-            VERIFY_OUTPUT=$(timeout 5 "$LETTA_BIN" -p "ping" 2>/dev/null)
-            VERIFY_RC=$?
-            set -e
-
-            if [ $VERIFY_RC -eq 0 ]; then
-                echo "{\"status\":\"recovered\",\"retries\":$RETRY,\"detail\":\"agent responsive after recovery\"}"
-                RECOVER_OK=1
-                break
-            fi
+    if [ -n "$LETTA_PID" ] && kill -0 "$LETTA_PID" 2>/dev/null; then
+        # Letta 进程活着 → 验证磁盘数据
+        if [ -d "${HOME}/.letta/lc-local-backend/memfs/${LETTA_AGENT_ID}/memory" ]; then
+            DISK_OK=1
         fi
+    fi
 
-        if [ $PING_RC -eq 124 ]; then
-            echo "[letta-adapter] recover ping 超时 (attempt $RETRY/$MAX_RETRIES)" >&2
-        else
-            echo "[letta-adapter] recover ping 失败 rc=$PING_RC (attempt $RETRY/$MAX_RETRIES)" >&2
-        fi
-
-        # 退避：2s / 4s / 8s
-        DELAY=$([ "$RETRY" -eq 1 ] && echo 2 || ([ "$RETRY" -eq 2 ] && echo 4 || echo 8))
-        sleep "$DELAY"
-    done
-
-    if [ "$RECOVER_OK" -eq 1 ]; then
+    if [ "$DISK_OK" -eq 1 ]; then
+        echo "{\"status\":\"recovered\",\"detail\":\"letta process alive (PID=$LETTA_PID) + memfs intact\"}"
         exit 0
     fi
 
     # 恢复失败 → 可重试（Scheduler 护栏 N=3 控制重试次数）
-    echo "{\"status\":\"failed\",\"retries\":$MAX_RETRIES,\"detail\":\"agent unresponsive after $MAX_RETRIES recovery attempts\"}"
+    echo "{\"status\":\"failed\",\"detail\":\"letta process not found or memfs missing\"}"
     exit 1
 fi
 

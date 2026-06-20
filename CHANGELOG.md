@@ -39,3 +39,14 @@
 
 ### 责任人
 - 呱呱 (ZS0001)
+
+### handler 容错清理 — 2026-06-20 09:25
+
+- 新增 `_validate_envelope()`: veritas v1.0 信封准入校验
+  - hard: ver缺失 / from缺失 / payload非dict
+  - soft: content在顶层 / from_id旧字段
+- 移除 `envelope.get("content")` 和 `envelope.get("from_id")` 容错回退
+- 新增 `envelope_strict_mode` 配置 (默认 "warn", Phase 2 切 "reject")
+- Phase 1 (warn): 记录 observer 告警 + 继续处理
+- Phase 2 (reject): 硬伤直接拒绝，不交 handler
+- 三方共识: 吉量SDK校验 + 呱呱handler清容错 + 火鸡儿E2E验证

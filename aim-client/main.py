@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.13
 """AIM Client — 统一通信终端
 
 OAS 基础设施核心组件。
@@ -624,6 +624,20 @@ class AIMClient:
 
         self.running = True
         self.logger.info(f" {self.agent_id} AIM Client v{_AIM_VERSION} 启动完成")
+
+        # NOTICE 1.3.0: 运行时版本检查（拒绝低于最低要求的 SDK）
+        _MIN_SDK = "1.3.0"
+        def _ver_tuple(v: str):
+            return tuple(int(x) for x in v.strip().split("."))
+        try:
+            from packaging.version import Version
+            _ver_ok = Version(_AIM_VERSION) >= Version(_MIN_SDK)
+        except ImportError:
+            _ver_ok = _ver_tuple(_AIM_VERSION) >= _ver_tuple(_MIN_SDK)
+        if not _ver_ok:
+            self.logger.error(f"SDK version {_AIM_VERSION} < {_MIN_SDK}，启动中止")
+            self.running = False
+            return
 
         # 初始化持久化队列（恢复未 ack 消息）
         # 按 agent_id 分文件，避免三方 Agent 互踩（v1.3.0 bug 修复 2026-06-19）

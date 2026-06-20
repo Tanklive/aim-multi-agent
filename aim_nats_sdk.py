@@ -1714,13 +1714,11 @@ class AIMNATSClient:
         return js_ok
 
     def _emit_validation_alert(self, envelope: dict, hard: list[str], soft: list[str]):
-        """Emit observer alert for envelope validation failures."""
+        """Log envelope validation failures (log-only, no observer emit)."""
         try:
             from_id = envelope.get("from", "unknown") if isinstance(envelope, dict) else "unknown"
             detail = "; ".join(hard + soft)
-            asyncio.ensure_future(
-                self.emit_obs("envelope_invalid", "", f"from={from_id} {detail}")
-            )
+            log.warning(f"[{self.agent_id}] envelope_invalid from={from_id}: {detail}")
         except Exception:
             pass
 
@@ -1780,7 +1778,7 @@ class AIMNATSClient:
             while self._running:
                 await asyncio.sleep(interval)
                 try:
-                    await self.emit_obs("heartbeat", detail="alive")
+                    log.debug(f"[{self.agent_id}] heartbeat ok")
                 except Exception as e:
                     log.debug(f"[{self.agent_id}] heartbeat failed: {e}")
         self._heartbeat_task = asyncio.create_task(_heartbeat_loop())

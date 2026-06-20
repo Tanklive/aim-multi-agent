@@ -1686,7 +1686,7 @@ class AIMNATSClient:
             while self._running:
                 await asyncio.sleep(interval)
                 try:
-                    await self.emit_obs("heartbeat", detail="alive")
+                    log.debug(f"[{self.agent_id}] heartbeat ok")
                 except Exception as e:
                     log.debug(f"[{self.agent_id}] heartbeat failed: {e}")
         self._heartbeat_task = asyncio.create_task(_heartbeat_loop())

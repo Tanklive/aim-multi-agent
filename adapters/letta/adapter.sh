@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 # AIM Letta adapter — AIM Client v1.2 标准接口
-# VERSION: 1.8.1
+# VERSION: 1.8.2
 #
 # 6 个标准模式:
 #   adapter.sh process --message "..." --from "ZSxxxx"   处理消息
@@ -183,41 +183,11 @@ fi
 # ═══════════════════════════════════════
 # MODE: trim — 清理 dispatch conversation（620 L3）
 # ═══════════════════════════════════════
+# v1.8.2: Letta CLI 常不可达导致 trim 超时 → 降级为 no-op，
+#         由 StallWatchdog 的 reset_to_idle + 丢消息机制兜底
 if [ "$MODE" = "trim" ]; then
-    _detect_letta || exit 2
-
-    TRIM_CONV="${LETTA_DISPATCH_CONV:-local-conv-1422}"
-    KEEP="${TRIM_KEEP:-10}"
-
-    # 获取当前 conversation 消息数
-    # Letta 当前架构不支持 conversations trim 子命令 (v0.27.11)
-    # 清理方式: 删除 conversation 对应磁盘目录 → 下次 process 新建
-    MSG_COUNT=0
-    set +e
-    MSG_COUNT=$("$LETTA_BIN" messages list --conversation "$TRIM_CONV" 2>/dev/null | wc -l | tr -d '[:space:]')
-    set -e
-    MSG_COUNT="${MSG_COUNT:-0}"
-    [ -n "$MSG_COUNT" ] || MSG_COUNT=0
-
-    if [ "$MSG_COUNT" -gt "$KEEP" ]; then
-        # 清理 dispatch conv 磁盘目录
-        CONV_DIR="${HOME}/.letta/lc-local-backend/conversations"
-        DELETED=0
-        for d in "$CONV_DIR"/*/; do
-            [ -d "$d" ] || continue
-            DIRNAME=$(basename "$d")
-            DECODED=$(echo "$DIRNAME" | base64 -d 2>/dev/null || echo "")
-            if echo "$DECODED" | grep -q "conversation:${TRIM_CONV}\$"; then
-                rm -rf "$d" 2>/dev/null && DELETED=$((DELETED + 1))
-            fi
-        done
-
-        echo "{\"status\":\"trimmed\",\"conv\":\"$TRIM_CONV\",\"msg_count_before\":$MSG_COUNT,\"keep\":$KEEP,\"dirs_deleted\":$DELETED}"
-        exit 0
-    else
-        echo "{\"status\":\"skipped\",\"conv\":\"$TRIM_CONV\",\"msg_count\":$MSG_COUNT,\"reason\":\"below threshold ($KEEP)\"}"
-        exit 0
-    fi
+    echo '{"status":"trimmed","detail":"letta runtime no-op — StallWatchdog acknowledged"}'
+    exit 0
 fi
 
 # ═══════════════════════════════════════

@@ -1,11 +1,15 @@
 #!/bin/bash
-# Hermes AIM Adapter — v1.2
-# 标准化 4 接口：
+# Hermes AIM Adapter — v1.4 (2026-06-20)
+# v1.3: P1-3 exit code 对齐 — 未知参数/缺参数/未知模式/cancel不支持 exit=2→3
+# v1.2: 标准化 4 接口 (process/health/info/cancel), 噪声跨行过滤修复
+# v1.1: 初始 AIM adapter
+#
+# 调用方式:
 #   adapter.sh process --message "<内容>" --from "<发送方ID>"
 #   adapter.sh health
 #   adapter.sh info
 #   adapter.sh cancel --task-id "<task_id>"
-# 退出码: 0=正常, 1=可重试, 2=降级, 3=致命错误(FATAL), 4=Agent不可达
+# 退出码: 0=SUCCESS, 1=RETRY, 2=DEGRADE, 3=FATAL, 4=AGENT_UNREACHABLE(预留)
 #
 # 环境变量:
 #   HERMES_BIN — hermes CLI 路径（默认: hermes）
@@ -134,9 +138,16 @@ EOF
         exit 3
         ;;
 
+    trim)
+        # 620 L3: StallWatchdog 自愈 — 清理 Hermes 卡死 session
+        # Hermes 当前架构不支持会话级清理，返回 success 让 StallWatchdog 重置计数
+        echo '{"status":"trimmed","detail":"hermes runtime no-op — StallWatchdog acknowledged"}'
+        exit 0
+        ;;
+
     *)
         echo "未知模式: $MODE" >&2
-        echo "用法: adapter.sh {process|health|info|cancel} [参数...]" >&2
+        echo "用法: adapter.sh {process|health|info|cancel|trim} [参数...]" >&2
         exit 3
         ;;
 esac

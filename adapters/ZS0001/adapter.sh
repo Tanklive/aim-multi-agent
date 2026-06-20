@@ -1,5 +1,5 @@
 #!/bin/bash
-# OpenClaw AIM Adapter — v1.4 (2026-06-19)
+# OpenClaw AIM Adapter — v1.5 (2026-06-20)
 # process: 直接调用 OpenClaw CLI，调用方阻塞等回复（≤30s）
 # 退出码: 0=正常, 1=可重试, 2=挂了, 3=需人工介入
 
@@ -31,6 +31,11 @@ if [ "$MODE" = "cancel" ]; then
     printf '{"status":"cancelled"}\n'; exit 0
 fi
 
+# ── trim ── (620 L3: StallWatchdog 自愈，清理卡死 session)
+if [ "$MODE" = "trim" ]; then
+    printf '{"status":"trimmed","detail":"openclaw runtime no-op — StallWatchdog acknowledged"}\n'; exit 0
+fi
+
 # ── process ──
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -43,6 +48,29 @@ done
 
 [ -z "$MESSAGE" ] && { echo "缺少 --message" >&2; exit 2; }
 FROM_ID="${FROM_ID:-unknown}"
+
+# ── 纯确认过滤（防 ping-pong 循环）──
+# 这些消息不需要回复：收到、1、👍、👌、✅ 等短确认
+_filter_ack() {
+    local msg="$1"
+    # 去掉 emoji/空白后的纯文本
+    local stripped
+    stripped=$(echo "$msg" | sed 's/[✨🐴🐸👂👍👌✅⏸️🟢🔌🤝💪👀🧠]/ /g' | sed 's/  */ /g' | xargs)
+    # 纯数字/单字
+    [[ "$stripped" =~ ^[0-9]+$ ]] && return 0
+    # 纯收到
+    [[ "$stripped" =~ ^收到 ]] && return 0
+    # 纯好/OK/行/知道了
+    [[ "$stripped" =~ ^(好的|知道了|OK|行|好|嗯|哦) ]] && return 0
+    # 纯表情回复
+    [[ -z "$stripped" ]] && return 0
+    return 1
+}
+
+if _filter_ack "$MESSAGE"; then
+    echo "[纯确认，跳过]" >&2
+    exit 1  # exit 1 = 可重试(但实际上不会重试因为queue会ack)
+fi
 
 # 直接调 OpenClaw agent 生成回复
 REPLY=$("$OPENCLAW_BIN" agent \

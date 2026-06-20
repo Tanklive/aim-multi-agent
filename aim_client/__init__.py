@@ -4,7 +4,7 @@ Phase 0：嵌入 V3 验证 Queue + Scheduler
 v1.2：独立 aim-client 进程 + 三级降级模型
 """
 
-VERSION = "1.3.1"
+VERSION = "1.3.3"
 from .types import (
     AgentState, DegradeLevel, StateReport, Message,
     AgentCard, AdapterInfo, DeliveryMode,

@@ -410,7 +410,8 @@ class AIMClient:
         # 619-18: 群聊回路防护冷却（从 config 读取，默认30s）
         self._grp_cooldown_sec = self.config.get("grp_reply_cooldown_sec", 30.0)
         self._last_grp_reply: dict[str, float] = {}
-        self._seen_msg_keys: dict[str, float] = {}  # NATS at-least-once 内容去重 (key→timestamp)
+        self._seen_msg_keys: dict[str, float] = {}  # 内容去重 (from_id:content[:200]→timestamp)
+        self._processed_ids: set = set()  # U-005: msg_id 级去重，防止 StallWatchdog 重复投递
         # 619-20: StallWatchdog — 检测 dispatch_loop 假死
         self._last_dispatch_time: float = 0.0
         self._stall_timeout_sec = self.config.get("stall_watchdog_sec", 30.0)
@@ -1051,19 +1052,31 @@ class AIMClient:
         if not await self.security.authenticate(from_id, token=payload.get("token", ""), msg_id=msg_id, envelope=envelope):
             return
 
-        # 去重：NATS at-least-once 可能导致同一条消息重复投递（不同 msg_id 相同内容）
-        dedup_key = f"{from_id}:{content[:200]}"
+        # ── U-005 双层去重 ──
+        # L1: msg_id 级去重（精确，覆盖同一消息的重复投递）
+        msg_id = envelope.get("id", "")
+        if msg_id and msg_id in self._processed_ids:
+            self.logger.debug(f" [DEDUP L1] msg_id={msg_id[:8]} 已处理, 跳过")
+            return
         now_ts = time.time()
+        # L2: 内容去重（StallWatchdog 重投会换 msg_id，内容查重兜底）
+        dedup_key = f"{from_id}:{content[:200]}"
         if dedup_key in self._seen_msg_keys:
-            if now_ts - self._seen_msg_keys[dedup_key] < 5.0:
+            age = now_ts - self._seen_msg_keys[dedup_key]
+            if age < 120.0:  # U-005: 5s→120s，覆盖 StallWatchdog 30s 重试周期
+                self.logger.info(f" [DEDUP L2] from={from_id} content_dup age={age:.0f}s, 跳过")
                 return
+        # 记录
+        if msg_id:
+            self._processed_ids.add(msg_id)
         self._seen_msg_keys[dedup_key] = now_ts
         # 限制去重集合大小
+        if len(self._processed_ids) > 2000:
+            self._processed_ids = set(list(self._processed_ids)[-500:])
         if len(self._seen_msg_keys) > 500:
             old_keys = sorted(self._seen_msg_keys, key=lambda k: self._seen_msg_keys[k])[:250]
             for k in old_keys:
                 del self._seen_msg_keys[k]
-        msg_id = envelope.get("id", str(uuid.uuid4()))
 
         # Phase 1: 识别 Task
         is_task = payload.get("task") is not None or content.startswith("/task ")

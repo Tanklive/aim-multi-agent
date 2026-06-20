@@ -1,75 +1,41 @@
-# AIM 项目变更日志
+# AIM Client Changelog
 
-> 格式：[MAJOR.MINOR.PATCH] — YYYY-MM-DD（分组：新增 / 变更 / 修复）
-> 排序：倒序（最新在最上方）
+## v1.3.2 (2026-06-20 03:22 +8)
+### Changes
+- **fix**: adapter_ok 恒为 false → AgentState 无 "OK" 态，改为 `!= OFFLINE`
+- **fix**: NATS drain() timeout 无限制 → SDK 加 5s 超时 + SIGALRM 10s 安全网
+- **feat**: NATS launchd KeepAlive 守卫 (`launchctl load` + `KeepAlive=true`)
+- **feat**: P2 Registry 查询 API — `aim.registry.health_query` + `aim.registry.event_query`
+- **feat**: P2 recover 非阻塞化 — `asyncio.create_task` + `_recover_task` 防并发
 
----
+### Files
+- `main.py`: _shutdown alarm, adapter_ok fix, query methods, non-blocking recover
+- `registry.py`: health_query + event_query handlers
+- `aim_nats_sdk.py`: drain timeout (5s)
+- `nats-guard.sh`: launchd-friendly wrapper (no `exec`, log output)
 
-## [1.3.0] — 2026-06-18
+### Previous
+- v1.3.1: Queue 持久化路径按 agent_id 分文件；launchd plist KeepAlive SuccessfulExit=false
+- v1.3.0: Queue+Scheduler+HealthProbe 三层解耦；trim/recover 事件日志
+- v1.2.0: adapter 4 接口标准化 + 三级降级模型
+- v1.1.0: Registry KV 健康快照 + 事件日志
+- v1.0.0: AIM Client 独立进程，直连 NATS
 
-### 新增
-- **Queue 持久化**：JSONL 异步追加写入 + 启动恢复 + 自动压缩（呱呱）
-  - `aim_client/queue_persist.py`：独立持久化层
-  - enqueue/ack/nack 异步写入 JSONL
-  - 文件 > 50KB 自动压缩，压缩后仅保留 pending 消息
+## v1.3.3 — 2026-06-20 09:02
 
-- **认证链 v1.1**：AuthStep 链式认证 + 来源身份验证（呱呱）
-  - `aim-client/security.py`：重构为 AuthStep 链式架构
-  - Step 1: SourceIdentityCheck — from_id 必须在注册 Agent 列表中
-  - Step 2: RateLimitCheck — 令牌桶每 Agent 独立限流
-  - Step 3 (可选): AllowlistCheck — sender 白名单
-  - main.py：集成 authenticate() 到消息处理器
-  - 支持动态注册（Registry 回调 register_agent）
-  - 配置：config.json security.auth.chain 可显式指定链步骤
+### Registry v1.3 (L1 KV + stalled 阈值)
+- `AgentRecord._offline_count`: 累积离线次数，永不清零
+- `AgentRecord.stalled_since`: stalled 状态开始时间
+- `AgentRecord.last_queue_size/at`: 最近健康快照中的 queue 信息
+- stalled 检测: heartbeat 正常但 queue>=5 持续 >90s → status="stalled"
+- stalled 自动恢复: queue 清空 → status="online"
+- `_handle_list` 响应新增: `offline_count`, `offline_since`, `stalled_since`, `last_queue_size`
+- 配置项: `STALLED_QUEUE_THRESHOLD=5`, `STALLED_TIME_THRESHOLD=90`
 
-- **Registry 独立运行**：作为 NATS 微服务 + launchd 持久化（呱呱）
-  - 创建 `com.aim.registry.plist` launchd 配置
-  - 三方 Agent 启动时自动向 Registry 注册
-  - KeepAlive Crashed+NetworkState
+### 保活
+- plist launchctl bootstrap 在 OpenClaw sandbox 下不可用 (error 5)
+- 改用 nohup + cron watchdog (60s) 替代 launchd 自动保活
+- Registry 服务恢复运行 (python3.13 PID 60081)
 
-- **adapter 版本注释标准化**（呱呱）
-  - letta adapter 头部加 `VERSION = "1.3.0"` + `# adapter version: v1.7`
-
-### 变更
-- VERSION-STANDARD v1.1：路径修正（SDK / aim-watch 实际位于 src/）+ 下发三方
-- 项目级 / SDK / aim_client 统一升级 1.2.1 → 1.3.0
-
-### 修复
-- **A1 — queue nack 超时计算**：改用 `dequeued_at` 替代 `received_at`，避免队列积压误判 dead（呱呱）
-  - Message 新增 dequeued_at 字段
-  - dequeue() 时打时间戳，nack() 用 dequeued_at
-  - queue_persist 序列化同步更新
-
-- **launchd zombie**：三方 plist KeepAlive SuccessfulExit→Crashed+NetworkState（呱呱）
-  - ZS0001/ZS0002/ZS0003 plist 全部统一
-  - ThrottleInterval 10s→30s
-
----
-
-## [1.2.1] — 2026-06-17
-
-### 新增
-- gotchas 冷热分层（21 条活跃 + 废弃归档）
-- aim_client/__init__.py：去 Phase 标记，改用 v1.2（呱呱）
-
-### 变更
-- aim-watch 临时独立版本（2.1.0），下次项目 MAJOR→2.0 时纳入统一版本管理（大哥决策）
-
-### 修复
-- NATS Server 恢复（重启后挂掉）
-- 禁止裸连 NATS publish，统一走标准接口
-- aim-watch：修复 agent_name_map 引用问题（呱呱）
-- aim_nats_sdk.py：修复 send_grp 缺少 meta.group 字段（呱呱）
-- Observer 事件通道无数据问题排查（呱呱）
-- 架构 review 文档修正代码示例（呱呱）
-
----
-
-## [1.0.0] — 2026-06-17
-
-### 新增
-- 版本管理规范正式建立（简化 SemVer：MAJOR.MINOR.PATCH）
-- SDK (`src/aim_nats_sdk.py`) 添加 VERSION="1.0.0"、PROTOCOL_VERSION="1.0"、MIN_PROTOCOL_VERSION="1.0"
-- aim-watch 独立版本号 2.1.0
-- 创建项目级 VERSION 文件
-- 创建本 CHANGELOG.md
+### 责任人
+- 呱呱 (ZS0001)

@@ -1656,8 +1656,10 @@ class AIMNATSClient:
         data = json.dumps(event, ensure_ascii=False).encode()
 
         # 双发策略：JS 持久化（历史回放） + raw 实时（observer/aim-watch 订阅）
+        # U-006: "received" 是瞬时状态事件，不需要 JS 持久化，只发 raw
+        is_transient = status in ("received", "heartbeat", "delivered")
         js_ok = False
-        if use_jetstream and self.js:
+        if use_jetstream and self.js and not is_transient:
             try:
                 headers = {"Nats-Msg-Id": f"obs-{self.agent_id}-{status}-{int(time.time()*1000)}"}
                 ack = await self.js.publish(subject, data, headers=headers)

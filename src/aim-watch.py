@@ -197,7 +197,8 @@ class WatchDisplay:
         # compact 模式追踪每个 msg_id 的 ai 事件链
         self._ai_chains: dict = {}  # msg_id → [events...]
         # 去重：SDK emit_obs 双发(JS+raw)导致重复
-        self._seen_events: set = set()  # (agent_id, msg_id, status, ts_int)
+        # 使用 nonce（唯一值，JS+raw 相同）替代 ts_int 做精确去重
+        self._seen_events: set = set()  # (agent_id, nonce)
         # 频道追踪：msg_id → "dm"|"grp"，配合 channel_filter 过滤 observer 事件
         self._msg_channel: dict = {}
 
@@ -236,10 +237,9 @@ class WatchDisplay:
         agent_id = event.get("agent_id", "???")
         framework = event.get("framework", "")
 
-        # 去重：SDK emit_obs 双发(JS+raw)导致重复
-        msg_id = event.get("msg_id", "")
-        ts_int = int(event.get("ts", 0) * 10)  # 0.1s 精度
-        dedup_key = (agent_id, msg_id, status, ts_int)
+        # 去重：SDK emit_obs 双发(JS+raw)导致重复 — 用 nonce 精确去重
+        nonce = event.get("nonce", "")
+        dedup_key = (agent_id, nonce) if nonce else (agent_id, msg_id, status, int(event.get("ts", 0) * 10))
         if dedup_key in self._seen_events:
             return
         self._seen_events.add(dedup_key)
@@ -306,6 +306,26 @@ class WatchDisplay:
         time_str = fmt_time(ts)
         icon = STATUS_ICONS.get(status, "📢")
 
+        # ── received 事件：聊天风格 ──
+        if status == "received" and detail:
+            import re
+            from_id = ""
+            text = ""
+            m = re.match(r'from=(\S+)\s+text=(.*)', detail, re.DOTALL)
+            if m:
+                from_id, text = m.group(1), m.group(2)
+            if not from_id:
+                from_id = meta.get("from_id", "")
+                text = detail
+            display_name = self.agent_name_map.get(from_id, from_id)
+            emoji = AGENT_EMOJI.get(from_id, "")
+            line = f"{time_str} 📥 {emoji} {display_name}: {text[:120]}"
+            print(line, flush=True)
+            if self.save_fp:
+                self.save_fp.write(line + "\n")
+                self.save_fp.flush()
+            return
+
         # 框架标签（有过滤时显示，或 agent_online 时显示）
         fw_label = ""
         if framework and (self.framework_filter or status == "agent_online"):
@@ -317,20 +337,9 @@ class WatchDisplay:
 
         if status:
             parts.append(status)
-        if msg_id:
-            short_id = msg_id[:8]
-            parts.append(f"[{short_id}]")
         if detail:
             # 显示的 detail 截断到 120 字符
             parts.append(f"— {detail[:120]}")
-
-        # 消息事件（收到消息的 detail 通常包含发件人信息）
-        if meta:
-            if isinstance(meta, dict):
-                from_id = meta.get("from_id", "")
-                if from_id:
-                    display_fid = self.agent_name_map.get(from_id, from_id)
-                    parts.append(f"(from {display_fid})")
 
         line = " ".join(parts)
         print(line, flush=True)

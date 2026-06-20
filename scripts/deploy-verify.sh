@@ -127,6 +127,50 @@ if [ "$QUICK" != "--quick" ]; then
     done
 fi
 
+
+# ── 6. E2E 烟雾测试（U-104, 2026-06-20） ──
+echo -e "\n🔥 E2E Smoke Test"
+SEND_SCRIPT=~/shared/aim/aim_send_nats.py
+TARGET=ZS0003
+TEST_MSG="E2E-DEPLOY-VERIFY-$(date +%s)"
+
+echo "  📤 发送测试 DM → $TARGET ..."
+result=$(python3.13 "$SEND_SCRIPT" "$TARGET" "$TEST_MSG" 2>&1)
+msg_id=$(echo "$result" | grep -o 'msg_id: [a-f0-9]\{12\}' | awk '{print $2}')
+
+if [ -n "$msg_id" ]; then
+    echo -e "  ${GREEN}✅${NC} NATS publish 成功 (msg_id=$msg_id)"
+    ((pass++))
+
+    # 等 1 秒让消息入队
+    sleep 1
+
+    # 查对方 queue 是否有这条消息
+    queue=~/.aim/agents/$TARGET/queue.jsonl
+    if [ -f "$queue" ]; then
+        if grep -q "$msg_id" "$queue" 2>/dev/null; then
+            echo -e "  ${GREEN}✅${NC} 消息已入 $TARGET 队列"
+            ((pass++))
+        elif grep -q "$TEST_MSG" "$queue" 2>/dev/null; then
+            echo -e "  ${GREEN}✅${NC} 消息已入 $TARGET 队列（内容匹配）"
+            ((pass++))
+        else
+            echo -e "  ${YELLOW}⚠️${NC}  队列未找到 msg_id=$msg_id（可能已 dispatch）"
+        fi
+    fi
+else
+    echo -e "  ${RED}❌${NC} NATS publish 失败: $result"
+    ((fail++))
+fi
+
+# ── 6b. Observer 送达确认 ──
+OBS_FILE=~/.aim/system/observer.jsonl
+if [ -f "$OBS_FILE" ] && [ -n "$msg_id" ]; then
+    if grep -q "$msg_id" "$OBS_FILE" 2>/dev/null; then
+        echo -e "  ${GREEN}✅${NC} Observer 已记录送达"
+        ((pass++))
+    fi
+fi
 # ── 总结 ──
 echo -e "\n========================================"
 total=$((pass + fail))
@@ -136,3 +180,17 @@ else
     echo -e "${RED}❌ $fail/$total 失败${NC}"
     exit 1
 fi
+
+# ── 6. E2E 烟雾测试（U-104, 2026-06-20） ──
+echo -e "\n🔥 E2E Smoke Test"
+SEND_SCRIPT=~/shared/aim/aim_send_nats.py
+TARGET=ZS0003
+TEST_MSG="E2E-DEPLOY-VERIFY-$(date +%s)"
+
+echo "  📤 发送测试 DM → $TARGET ..."
+result=$(python3.13 "$SEND_SCRIPT" "$TARGET" "$TEST_MSG" 2>&1)
+msg_id=$(echo "$result" | grep -o 'msg_id: [a-f0-9]\{12\}' | awk '{print $2}')
+
+if [ -n "$msg_id" ]; then
+    echo -e "  ${GREEN}✅${NC} NATS publish 成功 (msg_id=$msg_id)"
+    ((pass++))

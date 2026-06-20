@@ -627,10 +627,15 @@ class AIMClient:
                     self._zero_ack_streak = 0
                 if self._zero_ack_streak >= 3 and qsize > 0:
                     self.logger.warning(f"⚠️ 0-ack: queue={qsize} pending, {self._zero_ack_streak} 周期未消化")
-                    await self.transport.emit_obs(
-                        "0-ack", "",
-                        f"queue={qsize} pending, streak={self._zero_ack_streak}"
-                    )
+                    # 0-ack observer 事件加 300s 退避：避免每周期 emit 刷屏耗 token
+                    now = time.time()
+                    last_emit = getattr(self, '_last_0ack_emit', 0)
+                    if now - last_emit > 300:
+                        self._last_0ack_emit = now
+                        await self.transport.emit_obs(
+                            "0-ack", "",
+                            f"queue={qsize} pending, streak={self._zero_ack_streak}"
+                        )
 
                 # Observer 事件推送：心跳
                 await self.transport.emit_obs("heartbeat", "", "alive")

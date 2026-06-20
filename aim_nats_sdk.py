@@ -24,9 +24,9 @@ VERSION = "1.3.3"
 """SDK 版本号——代码发布标识"""
 
 # 协议版本——Agent 握手时兼容性检查用
-PROTOCOL_VERSION = "1.0"
+PROTOCOL_VERSION = "1.2"
 """当前协议版本，Agent 之间握手协商用"""
-MIN_PROTOCOL_VERSION = "1.0"
+MIN_PROTOCOL_VERSION = "1.2"
 """最低兼容的协议版本"""
 
 import asyncio

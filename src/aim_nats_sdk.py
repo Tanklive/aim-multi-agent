@@ -20,7 +20,7 @@ Usage:
 # AIM SDK 版本（SemVer 2.0.0）
 # 核心模块变更时所有模块同步升级
 # ============================================================
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 """SDK 版本号——代码发布标识"""
 
 # 协议版本——Agent 握手时兼容性检查用
@@ -946,8 +946,8 @@ class AIMNATSClient:
     统一使用 aim. 命名空间。
     """
 
-    # Protocol Version（协议版本）
-    __protocol_version__ = "1.0"
+    # Protocol Version（协议版本，619-07：从 VERSION 文件动态读取）
+    __protocol_version__ = "1.0"  # 默认值，启动时从 VERSION 覆盖
 
     def __init__(
         self,
@@ -1086,6 +1086,7 @@ class AIMNATSClient:
             "reconnect_time_wait": 2,
             "ping_interval": 30,
             "max_outstanding_pings": 5,
+            "drain_timeout": 5,
             "name": f"AIM-{self.agent_id}",
             "error_cb": self._on_nats_error,
             "disconnected_cb": self._on_nats_disconnected,
@@ -1108,9 +1109,19 @@ class AIMNATSClient:
         self._running = True
         log.info(f"✅ [{self.agent_id}] NATS connected: {self.server}")
 
-        # Protocol Version 检查（轻量级）
-        # TODO: Phase 2+ 实现 AgentCard 查询和版本比对
-        log.warning(f"⚠️  [{self.agent_id}] Protocol Version 检查未实现（当前: {self.__protocol_version__}）")
+        # Protocol Version（619-07：动态读 VERSION，记录到实例属性）
+        try:
+            import os as _os_ver
+            ver_path = _os_ver.path.join(_os_ver.path.dirname(_os_ver.path.dirname(_os_ver.path.abspath(__file__))), "VERSION")
+            if _os_ver.path.exists(ver_path):
+                with open(ver_path) as _vf:
+                    ver_val = _vf.read().strip()
+                if ver_val:
+                    self.__protocol_version__ = ver_val
+            log.info(f"🔌 [{self.agent_id}] AIM Protocol v{self.__protocol_version__} (MIN=1.0)")
+        except Exception as _e:
+            log.info(f"🔌 [{self.agent_id}] AIM Protocol v{self.__protocol_version__} (MIN=1.0)")
+        # TODO Phase 2+: AgentCard+PING 版本比对 + MIN_PROTOCOL 拒绝机制
 
         # 启动定时 flush
         self._flush_task = asyncio.create_task(self._periodic_flush())
@@ -1390,13 +1401,16 @@ class AIMNATSClient:
     async def subscribe_dm(self, handler: Callable):
         subject = Subjects.dm(self.agent_id)
         async def _cb(msg):
-            parsed = parse_message(msg.data)
-            msg_id = parsed.get("id", "")
-            if msg_id and await self.pin.is_duplicate(msg_id):
-                return
-            await handler(parsed, msg)
-            if msg_id:
-                await self.pin.mark(msg_id)
+            try:
+                parsed = parse_message(msg.data)
+                msg_id = parsed.get("id", "")
+                if msg_id and await self.pin.is_duplicate(msg_id):
+                    return
+                await handler(parsed, msg)
+                if msg_id:
+                    await self.pin.mark(msg_id)
+            except Exception as e:
+                log.error(f"[{self.agent_id}] DM handler error: {e}")
         sub = await self.nc.subscribe(subject, cb=_cb)
         self._subscriptions[subject] = sub
         self._dm_handler = handler
@@ -1405,13 +1419,16 @@ class AIMNATSClient:
     async def subscribe_grp(self, group_id: str, handler: Callable):
         subject = Subjects.grp(group_id)
         async def _cb(msg):
-            parsed = parse_message(msg.data)
-            msg_id = parsed.get("id", "")
-            if msg_id and await self.pin.is_duplicate(msg_id):
-                return
-            await handler(parsed, msg)
-            if msg_id:
-                await self.pin.mark(msg_id)
+            try:
+                parsed = parse_message(msg.data)
+                msg_id = parsed.get("id", "")
+                if msg_id and await self.pin.is_duplicate(msg_id):
+                    return
+                await handler(parsed, msg)
+                if msg_id:
+                    await self.pin.mark(msg_id)
+            except Exception as e:
+                log.error(f"[{self.agent_id}] GRP handler error: {e}")
         sub = await self.nc.subscribe(subject, cb=_cb)
         self._subscriptions[subject] = sub
         self._grp_handlers[group_id] = handler
@@ -2100,6 +2117,7 @@ class AIMObserverClient:
             "reconnect_time_wait": 2,
             "ping_interval": 30,
             "max_outstanding_pings": 5,
+            "drain_timeout": 5,
             "name": f"OBS-{self.observer_id}",
         }
         if self.credentials:

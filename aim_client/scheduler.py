@@ -174,11 +174,12 @@ class Scheduler:
         self._transition(AgentState.IDLE)
 
     def on_retry(self):
-        """可重试（exit=1）：session 忙等。
+        """可重试（exit=1):session 忙等。
 
         Phase 1: 连续超时计数 → evaluate_degrade_level() 判定 L1。
         """
         self._retry_count += 1
+        self._transition(AgentState.IDLE)  # 619-19: 重试失败回 IDLE，否则 BUSY 卡死 should_dispatch
         logger.info("Scheduler: adapter exit=1，可重试 (连续第 %d 次)", self._retry_count)
 
         new_level, reason = evaluate_degrade_level(
@@ -207,6 +208,12 @@ class Scheduler:
         """处理超时"""
         logger.warning("Scheduler: 处理超时，强制切 IDLE")
         self._transition(AgentState.IDLE)
+
+    def reset_to_idle(self):
+        """619-20: StallWatchdog 调用 — 无条件回 IDLE（防假死）"""
+        if self._current_state != AgentState.IDLE:
+            logger.warning(f" Scheduler: 强制复位 {self._current_state.value} → IDLE (StallWatchdog)")
+            self._transition(AgentState.IDLE)
 
     # -- 内部：状态转换 --
 

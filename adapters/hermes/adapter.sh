@@ -5,7 +5,7 @@
 #   adapter.sh health
 #   adapter.sh info
 #   adapter.sh cancel --task-id "<task_id>"
-# 退出码: 0=正常, 1=可重试, 2=降级, 3=需人工介入
+# 退出码: 0=正常, 1=可重试, 2=降级, 3=致命错误(FATAL), 4=Agent不可达
 #
 # 环境变量:
 #   HERMES_BIN — hermes CLI 路径（默认: hermes）
@@ -27,13 +27,13 @@ case "$MODE" in
             case $1 in
                 --message) MESSAGE="$2"; shift 2 ;;
                 --from) FROM_ID="$2"; shift 2 ;;
-                *) echo "未知参数: $1" >&2; exit 2 ;;
+                *) echo "未知参数: $1" >&2; exit 3 ;;
             esac
         done
 
         if [ -z "$MESSAGE" ]; then
             echo "缺少 --message 参数" >&2
-            exit 2
+            exit 3
         fi
 
         # 检查 Hermes CLI
@@ -42,9 +42,9 @@ case "$MODE" in
             exit 3
         fi
 
-        # 调用 Hermes
+        # 调用 Hermes（--source aim-adapter 防止跨会话污染）
         AIM_PROMPT="回复以下内容，仅输出你对该消息的回复文本，不要加任何前缀后缀说明或操作描述："
-        output=$($TIMEOUT_BIN "$ADAPTER_TIMEOUT" "$HERMES_BIN" chat -q "${AIM_PROMPT}${MESSAGE}" -Q 2>/dev/null)
+        output=$($TIMEOUT_BIN "$ADAPTER_TIMEOUT" "$HERMES_BIN" chat -q "${AIM_PROMPT}${MESSAGE}" -Q --source aim-adapter 2>/dev/null)
         exit_code=$?
 
         if [ $exit_code -eq 124 ]; then
@@ -55,8 +55,12 @@ case "$MODE" in
             exit 1
         fi
 
-        # 过滤噪声行
-        filtered=$(echo "$output" | grep -v '^⚠️' | grep -v '^session_id:' | grep -v '^$')
+        # 综合噪声过滤（hermes chat -Q 输出的会话管理信息）：
+        #   1. sed: 删除 Normalized model 警告行 + 紧随的续行（如 "deepseek."）
+        #   2. grep: 过滤 session_id:、Restored session:、Saving session、... 开头行、空行
+        # 只取第一条有效行作为 AI 回复
+        cleaned=$(echo "$output" | sed '/Normalized model/{N;d;}')
+        filtered=$(echo "$cleaned" | LC_ALL=en_US.UTF-8 grep -v '^session_id:' | grep -v '^Restored session:' | grep -v '^Saving session' | grep -v '^\.\.\.' | grep -v '^$')
         first_line=$(echo "$filtered" | head -1)
 
         if [ -z "$first_line" ]; then
@@ -116,7 +120,7 @@ EOF
         while [[ $# -gt 0 ]]; do
             case $1 in
                 --task-id) TASK_ID="$2"; shift 2 ;;
-                *) echo "未知参数: $1" >&2; exit 2 ;;
+                *) echo "未知参数: $1" >&2; exit 3 ;;
             esac
         done
 
@@ -127,12 +131,12 @@ EOF
 
         # Hermes 是 realtime 模式，任务即时处理无法取消
         echo '{"status":"not_supported","detail":"Hermes execution_model=realtime，任务即时处理无法取消"}'
-        exit 2
+        exit 3
         ;;
 
     *)
         echo "未知模式: $MODE" >&2
         echo "用法: adapter.sh {process|health|info|cancel} [参数...]" >&2
-        exit 2
+        exit 3
         ;;
 esac

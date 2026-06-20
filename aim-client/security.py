@@ -62,14 +62,18 @@ class AuthStep(ABC):
         ...
 
 
+# 系统级发送者：不注册为 Agent 但需要发群消息的基础设施服务
+SYSTEM_SENDERS = {"alertd", "registry", "aim-watch", "observer"}
+
 class SourceIdentityCheck(AuthStep):
     """来源身份验证：from_id 必须在注册 Agent 列表中
 
     从 NATS Operator users 目录读取注册 Agent 列表。
     回退：配置文件中的 registered_agents 列表。
+    系统发送者（alertd/registry/aim-watch/observer）始终放行。
     """
     def __init__(self, registered_agents: List[str]):
-        self._registered = set(registered_agents)
+        self._registered = set(registered_agents) | SYSTEM_SENDERS
 
     async def check(self, from_id: str, token: str = "", msg_id: str = "", envelope: dict | None = None) -> bool:
         if not self._registered:

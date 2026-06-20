@@ -37,7 +37,6 @@ import os
 import signal
 import sys
 import time
-from collections import deque
 import uuid
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -255,27 +254,6 @@ class Transport:
         except Exception as e:
             self._logger.debug(f"emit_obs 失败: {e}")
 
-    async def send_registry_health_report(self, health: dict):
-        return await self.request("aim.registry.health_report", {
-            "agent_id": self.agent_id, "health": health,
-        }, timeout=3)
-
-    async def send_registry_event(self, event_type: str, detail: dict = None):
-        return await self.request("aim.registry.event", {
-            "agent_id": self.agent_id, "event_type": event_type, "detail": detail or {},
-        }, timeout=3)
-
-    async def query_registry_health(self, agent_id: str) -> dict:
-        return await self.request("aim.registry.health_query", {
-            "agent_id": agent_id,
-        }, timeout=3)
-
-    async def query_registry_events(self, agent_id: str = "", event_type: str = "",
-                                     limit: int = 20) -> dict:
-        return await self.request("aim.registry.event_query", {
-            "agent_id": agent_id, "event_type": event_type, "limit": limit,
-        }, timeout=3)
-
     async def send_registry_heartbeat(self):
         """向 Registry 发送心跳，更新 last_seen"""
         try:
@@ -293,24 +271,6 @@ class Transport:
         cfg = load_global_config()
         peers = cfg.get("trusted_peers", ["ZS0001"])
         return peer_id in peers
-
-    async def request(self, subject: str, payload: dict, timeout: float = 5.0) -> dict:
-        """Transport.request() — NATS request-reply 统一入口
-
-        Phase 1 协议要求 7 方法之一。封装 SDK 的 request-reply，
-        所有 Registry 交互 (register/health/event/query) 通过此方法。
-        失败时返回 {"status": "error", "detail": str(e)}，调用方不需 try/except。
-        """
-        import json as _json
-        try:
-            if not self._sdk.nc or not self._sdk.nc.is_connected:
-                return {"status": "error", "detail": "NATS not connected"}
-            data = _json.dumps(payload).encode()
-            resp = await self._sdk.nc.request(subject, data, timeout=timeout)
-            return _json.loads(resp.data)
-        except Exception as e:
-            self._logger.debug(f"request({subject}) failed: {e}")
-            return {"status": "error", "detail": str(e)}
 
 
 # -- AIMClient 主类 --
@@ -352,22 +312,9 @@ class AIMClient:
         if adapter_cmd:
             adapter_cmd = str(Path(adapter_cmd).expanduser())
         self.adapter_cmd = adapter_cmd
-
-        # 619-20: 将 config 中 adapter 需要的变量注入子进程环境
-        #   adapter.sh 优先级: env → config.json → 硬编码
-        #   注入后 adapter 不再依赖 config.json fallback
-        # 以父进程环境打底（必须！空 dict 会清空 PATH/HOME 等）
-        self.adapter_env: dict[str, str] = dict(os.environ)
-        self._degrade_history = deque(maxlen=100)  # P1-2: (ts, exit_code) 窗口
-        for config_key in ("letta_bin", "letta_agent_id"):
-            val = self.config.get(config_key)
-            if val:
-                self.adapter_env[config_key.upper()] = str(val)
-
         self.health_probe = HealthProbe(
             health_cmd=f"bash {self.adapter_cmd} health",
             timeout=self.config.get("health_probe_timeout", 25.0),
-            env=self.adapter_env,
         )
 
         self.running = False
@@ -380,13 +327,6 @@ class AIMClient:
         self._last_dispatch_time: float = 0.0
         self._stall_timeout_sec = self.config.get("stall_watchdog_sec", 30.0)
         self._stall_recovery_count: int = 0  # 619-20: 连续自愈计数（>3 次则丢弃卡死消息）
-        self._retry_tracker: dict[str, int] = {}  # P0: exit=1 退避, msg_id → retry_count
-        self._last_recover_at: float = 0.0  # P0-L3: recover cooldown (60s)
-        self._last_trim_at: float = 0.0  # P0-L3: trim cooldown (30s)
-        self._recover_task: Optional[asyncio.Task] = None  # P2: non-blocking recover handle
-        # L3 护栏: N=3 次自修复失败 → 永久停止 + 告警
-        self._repair_failures: int = 0
-        self._repair_disabled: bool = False
         self.logger.info(f"Framework: {self.config.get('framework', 'unknown')}")
         self.logger.info(f"Adapter: {self.adapter_cmd}")
         self.logger.info(f"Queue+Scheduler 已嵌入 (capacity={self.queue.capacity})")
@@ -430,6 +370,7 @@ class AIMClient:
                     if not msg:
                         break
                     self._last_dispatch_time = _t619_wd.time()  # 记录最近投递时间
+                    self._stall_recovery_count = 0  # 619-20: 成功投递 → 清零自愈计数
                     self.scheduler.on_dispatch_started()
                     self.logger.info(f"投递: {msg.msg_id[:8]} from={msg.from_id}")
                     try:
@@ -453,8 +394,6 @@ class AIMClient:
                                 await self.transport.send_dm(msg.from_id, reply)
                         self.scheduler.on_processing_done()
                         self.queue.ack(msg.msg_id)
-                        self._stall_recovery_count = 0  # 620-01: 成功投递才清零
-                        self._retry_tracker.pop(msg.msg_id, None)  # 退避跟踪清除
                     except DegradeError:
                         self.scheduler.on_degrade()
                         self.queue.nack(msg.msg_id, "degrade")
@@ -464,47 +403,13 @@ class AIMClient:
                         # FIX(2026-06-19): break 后必须重置事件，否则永久阻塞（火鸡儿发现）
                         self._dispatch_event.set()
                         break
-
                     except RetryableError:
                         self.scheduler.on_retry()
-                        rt = self._retry_tracker.get(msg.msg_id, 0) + 1
-                        self._retry_tracker[msg.msg_id] = rt
-                        if rt >= 3:
-                            self.logger.warning(f" [{msg.msg_id[:8]}] 退避耗尽 ({rt}次)，入死信")
-                            self.queue.ack(msg.msg_id)  # ack 移除，不 requeue
-                            self._retry_tracker.pop(msg.msg_id, None)
-                            self.scheduler.reset_to_idle()
-                            self._dispatch_event.set()  # 立即触发下一轮
-                            self._stall_recovery_count = 0  # 成功 discard 后重置计数
-                            # P0-L3: backoff exhausted -> trim stuck session
-                            await self._call_adapter_trim()
-                        else:
-                            delay = [2, 4, 8][rt - 1]
-                            self.logger.info(f" [{msg.msg_id[:8]}] 退避 {rt}/3, delay={delay}s")
-                            self.queue.nack(msg.msg_id, "retry")
-                            await asyncio.sleep(delay)
-
-                    except Exception as e:
-                        if "agent_unreachable" in str(e):
-                            self.scheduler.on_degrade()
-                            self.queue.nack(msg.msg_id, "agent_unreachable")
-                            self.logger.warning(f"🔌 [{self.agent_id}] Agent 不可达（exit=4），暂停投递")
-                            await self.transport.emit_obs("agent_unreachable", msg.msg_id[:8], f"adapter={self.agent_id}")
-                            self._dispatch_event.set()
-                            # P2: non-blocking recover
-                            if self._recover_task and not self._recover_task.done():
-                                self.logger.debug(f"[{self.agent_id}] recover already in progress, skipping")
-                            else:
-                                self._recover_task = asyncio.create_task(self._call_adapter_recover())
-                            break
-                        raise
+                        self.queue.nack(msg.msg_id, "retry")
+                        await asyncio.sleep(2)
                     except HumanInterventionError:
                         self.scheduler.on_human_intervention()
                         self.queue.nack(msg.msg_id, "human_intervention")
-                        self.logger.error(f"💀 [{self.agent_id}] FATAL exit=3, 永久停止 dispatch")
-                        await self.transport.emit_obs("fatal", msg.msg_id[:8], "dispatch stopped")
-                        self._dispatch_event.set()
-                        break
                     except Exception as e:
                         self.logger.error(f"投递异常 [{msg.msg_id[:8]}]: {e}")
             except Exception as e:
@@ -522,7 +427,6 @@ class AIMClient:
 
         atexit.register(self.lock.release)
         signal.signal(signal.SIGTERM, lambda *_: self._shutdown())
-        signal.signal(signal.SIGALRM, lambda *_: os._exit(0))  # P2: drain timeout 兜底
         self._reload_flag = False
         signal.signal(signal.SIGHUP, lambda *_: setattr(self, '_reload_flag', True))  # 619-09
 
@@ -593,153 +497,10 @@ class AIMClient:
                 await self.transport.emit_obs("heartbeat", "", "alive")
                 # Registry 心跳：更新 last_seen
                 await self.transport.send_registry_heartbeat()
-                # P1: 上报健康快照到 Registry KV
-                h = {
-                    'adapter_ok': report.status.name != 'OFFLINE',
-                    'status': report.status.name,
-                }
-                if hasattr(self, 'queue'):
-                    h['queue_size'] = self.queue.size()
-                await self.transport.send_registry_health_report(h)
             except Exception as e:
                 self.logger.error(f"健康探针异常: {e}")
             interval = self.scheduler.get_probe_interval()
             await asyncio.sleep(interval)
-
-
-    # P1-2: 滑动窗口 DEGRADE 检查
-    def _should_degrade(self, exit_code: int) -> bool:
-        """30s 内 >=2 次 exit=2 → True，否则只记录不触发"""
-        now = time.time()
-        self._degrade_history.append((now, exit_code))
-        while self._degrade_history and self._degrade_history[0][0] < now - DEGRADE_WINDOW_S:
-            self._degrade_history.popleft()
-        count = sum(1 for _, ec in self._degrade_history if ec == 2)
-        return count >= DEGRADE_WINDOW_COUNT
-
-    async def _call_adapter_recover(self) -> bool:
-        """Call adapter.sh recover, returns True if backend recovered.
-
-        exit=0 + JSON -> success
-        exit!=0 -> failure, log stderr
-        60s cooldown to prevent recover storms
-        L3 护栏: >=3 次连续失败 → agent_stalled 告警 + 永久停止自修复
-        """
-        if self._repair_disabled:
-            return False
-
-        _now = __import__("time").time()
-        if _now - self._last_recover_at < 60:
-            self.logger.debug(f"recover cooldown ({_now - self._last_recover_at:.0f}s/60s)")
-            return False
-        self._last_recover_at = _now
-
-        self.logger.info("[recover] Calling adapter recover ...")
-        cmd = f"bash {self.adapter_cmd} recover"
-        try:
-            proc = await asyncio.create_subprocess_shell(
-                cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                env=self.adapter_env,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=60.0  # L3: adapter recover 多轮重试（匹配降配后的≈68s）
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            self.logger.warning("[recover] Timeout (30s)")
-            self._record_repair_failure("recover_timeout")
-            return False
-        except Exception as exc:
-            self.logger.warning(f"[recover] Exception: {exc}")
-            self._record_repair_failure(f"recover_exception:{exc}")
-            return False
-
-        rc = proc.returncode or 0
-        stderr_text = stderr.decode().strip() if stderr else ""
-        stdout_text = stdout.decode().strip() if stdout else ""
-
-        if rc == 0:
-            try:
-                info = __import__("json").loads(stdout_text)
-            except Exception:
-                info = {"raw": stdout_text[:200]}
-            self.logger.info(f"[recover] Success: {info}")
-            self._repair_failures = 0  # L3: 成功后重置
-            # P1: report recover event
-            await self.transport.send_registry_event("recover", {"exit_code": rc, "result": info})
-            return True
-        else:
-            self.logger.warning(f"[recover] Failed (exit={rc}): {stderr_text[:120]}")
-            self._record_repair_failure(f"recover_exit={rc}")
-            # P1: report recover failure
-            await self.transport.send_registry_event("recover", {"exit_code": rc, "error": stderr_text[:200]})
-            return False
-
-    async def _call_adapter_trim(self) -> None:
-        """Call adapter.sh trim, clear stuck session/messages.
-
-        30s cooldown.
-        L3 护栏: repair_disabled 时跳过
-        """
-        if self._repair_disabled:
-            return
-        _now = __import__("time").time()
-        if _now - self._last_trim_at < 30:
-            self.logger.debug(f"trim cooldown ({_now - self._last_trim_at:.0f}s/30s)")
-            return
-        self._last_trim_at = _now
-
-        self.logger.info("[trim] Calling adapter trim ...")
-        cmd = f"bash {self.adapter_cmd} trim"
-        try:
-            proc = await asyncio.create_subprocess_shell(
-                cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                env=self.adapter_env,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=15.0
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            self.logger.warning("[trim] Timeout (15s)")
-            return
-        except Exception as exc:
-            self.logger.warning(f"[trim] Exception: {exc}")
-            return
-
-        rc = proc.returncode or 0
-        stdout_text = stdout.decode().strip() if stdout else ""
-        if rc == 0:
-            self.logger.info(f"[trim] Done: {stdout_text[:200]}")
-            self._repair_failures = 0  # L3: 成功后重置
-        else:
-            stderr_text = stderr.decode().strip() if stderr else ""
-            self.logger.warning(f"[trim] Failed (exit={rc}): {(stdout_text + stderr_text)[:120]}")
-            self._record_repair_failure(f"trim_exit={rc}")
-        # P1: report trim event
-        import json as _pj1
-        try: info = _pj1.loads(stdout_text) if stdout_text else {}
-        except Exception: info = {"raw": stdout_text[:200] if stdout_text else ""}
-        await self.transport.send_registry_event("trim", {"exit_code": rc, "result": info})
-
-    def _record_repair_failure(self, reason: str = ""):
-        """L3 护栏: 记录自修复失败，N=3 触发 agent_stalled 告警并永久停止"""
-        self._repair_failures += 1
-        n = self._repair_failures
-        self.logger.warning(f"[L3] 自修复失败 #{n}/3: {reason}")
-        if n >= 3:
-            self._repair_disabled = True
-            self.logger.error(
-                f"💀 [L3] {self.agent_id} 自修复连续 {n} 次失败，永久停止自修复"
-            )
-            # 通过 observer 发布 stalled 告警，alertd 将升级为 CRITICAL
-            asyncio.ensure_future(
-                self.transport.emit_obs(
-                    "stalled",
-                    "",
-                    f"自修复连续{n}次失败，已停止。最后原因: {reason}"
-                )
-            )
 
     async def _call_adapter(self, msg: Message) -> Optional[str]:
         """调用 adapter.sh process，返回回复文本
@@ -757,7 +518,6 @@ class AIMClient:
         cmd = f"bash {self.adapter_cmd} process --from '{msg.from_id}' --message '{safe_content}'"
         proc = await asyncio.create_subprocess_shell(
             cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env=self.adapter_env,
         )
         try:
             stdout, stderr = await asyncio.wait_for(
@@ -788,21 +548,15 @@ class AIMClient:
             raise RetryableError(stderr_text or f"adapter exit=1")
 
         elif rc == 2:
-            # P1-2: 滑动窗口检查，30s内>=2次exit=2才DEGRADE
-            if self._should_degrade(2):
-                raise DegradeError(stderr_text or f"adapter exit=2")
-            # 窗口未达标 → nack 重试
-            self.logger.info(f"exit=2 滑动窗口未达标，nack 重试")
-            raise RetryableError(stderr_text or "adapter exit=2, under window")
+            # 降级（exit=2）：Runtime 不可用
+            raise DegradeError(stderr_text or f"adapter exit=2")
+
         elif rc == 3:
-            # FATAL（exit=3）：配置错误、CLI不存在、环境问题 → 永久停止
+            # 人工介入（exit=3）：权限不足、框架崩溃等
             raise HumanInterventionError(stderr_text or f"adapter exit=3")
-        elif rc == 4:
-            # AGENT_UNREACHABLE（exit=4）：agent数据不在磁盘/框架崩溃 → DEGRADE+可恢复
-            raise DegradeError(f"[agent_unreachable] {stderr_text}" if stderr_text else "agent unreachable")
+
         else:
-            # 5+ UNKNOWN → 按 FATAL 处理（未知即不安全）
-            raise HumanInterventionError(f"unknown exit={rc}: {stderr_text[:100]}")
+            raise RuntimeError(f"adapter exit={rc}: {stderr_text[:100]}")
 
     # -- NATS 回调 (SDK 签名: handler(envelope_dict, raw_msg)) --
 
@@ -896,8 +650,6 @@ class AIMClient:
     def _shutdown(self):
         self.logger.info("收到终止信号，正在退出...")
         self.running = False
-        # P2: 5s 安全网，防止 drain hang 导致僵尸
-        signal.alarm(10)
 
     async def close(self):
         self.running = False
@@ -913,10 +665,6 @@ class RetryableError(Exception):
     pass
 
 
-
-# P1-2: DEGRADE 滑动窗口（30s 内 2 次 exit=2 才触发）
-DEGRADE_WINDOW_S = 30
-DEGRADE_WINDOW_COUNT = 2
 class DegradeError(Exception):
     """降级错误 (exit=2): Runtime 不可用"""
     pass

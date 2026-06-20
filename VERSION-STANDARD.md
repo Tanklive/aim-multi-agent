@@ -1,11 +1,13 @@
 # AIM 项目版本管理标准
 
 
-> 版本：1.1
+> 版本：1.2
 
-> 更新：2026-06-18 16:20
+> 更新：2026-06-19 20:15
 
 > 负责人：呱呱（基建/开发/安全/底层逻辑）
+
+> 变更：新增第五节「adapter/config 同步机制」
 
 
 ---
@@ -1017,3 +1019,40 @@ ZS0003: PROTOCOL_VERSION=1.0 ✅
 
 
 **注意**：本标准是简化版，等三方都稳定了、真要发 release 了再考虑 SemVer 和版本管理工具。
+
+---
+
+## 五、adapter / config 同步机制（v1.2 新增）
+
+> 问题来源：619+ 自查发现 SDK 版本分叉、adapter.sh 三版不一致、config 字段不对称
+
+### 5.1 同步原则
+
+| 类型 | 源（权威） | 目标 | 同步方式 |
+|------|-----------|------|----------|
+| SDK | `shared/aim/src/aim_nats_sdk.py` | `~/.aim/bin/` | `deploy.sh` 或 `deploy_sdk.sh` |
+| aim-client | `shared/aim/aim-client/` | `~/.aim/agents/ZS00X/aim-client/` | `deploy.sh` (rsync) |
+| adapter.sh | 各 Agent 本地 `adapter.sh` | shared `adapters/{id}/adapter.sh` | 手动同步，改前公告 |
+| config.json | 各 Agent 本地 `config.json` | 不自动同步 | 手动对齐，schema 校验 |
+
+### 5.2 adapter.sh 版本策略
+
+- 各 Agent 维护各自的 `adapter.sh`（框架异构，无法统一）
+- `shared/aim/adapters/{agent_id}/adapter.sh` 保存各 Agent 的参考副本
+- adapter 变更 → 群公告 → 同步到 shared 参考副本
+- adapter 版本号在文件头注释（格式：`# adapter.sh v{version} (framework: {hermes|letta|openclaw})`）
+
+### 5.3 config.json 对齐检查
+
+- **A 层**（协议契约）：`config_schema_check.py` 启动时强制校验，缺/错→exit 1
+- **B 层**（默认值）：缺字段时用 B 层默认值，warning 警告
+- **C 层**：忽略，不校验
+- 三方 config 字段差异 → 群内讨论对齐 → 更新 schema v0.3/v0.4...
+- 当前 B 层默认值：`queue.max_age_ms=3600000`, `heartbeat.interval_ms=30000`, `heartbeat.timeout_ms=120000`, `adapter.timeout=120`, `log.level=info`
+
+### 5.4 部署后检查
+
+每次 deploy 或 config 变更后：
+1. 确认 VERSION 文件 = shared VERSION
+2. 重启 Agent 进程
+3. 群内通知「已部署」

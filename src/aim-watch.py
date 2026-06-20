@@ -48,11 +48,35 @@ if str(SDK_DIR) not in sys.path:
 from aim_nats_sdk import AIMObserverClient
 
 
+# ── 持久化旋转 ────────────────────────────────────
+
+def _rotate_if_needed(filepath: str, max_lines: int = 50000):
+    """Keep the last `max_lines` lines of a file to prevent unbounded growth."""
+    path = Path(filepath).expanduser()
+    if not path.exists():
+        return
+    try:
+        # Quick estimate: if file is small, skip rotation
+        if path.stat().st_size < 10 * 1024 * 1024:  # < 10MB, rough
+            with open(path) as f:
+                line_count = sum(1 for _ in f)
+            if line_count <= max_lines:
+                return
+        # Trim to last max_lines
+        with open(path) as f:
+            lines = f.readlines()
+        if len(lines) > max_lines:
+            with open(path, "w") as f:
+                f.writelines(lines[-max_lines:])
+    except Exception:
+        pass  # rotation is best-effort
+
+
 # ══════════════════════════════════════════════════════════════
 #  配置
 # ══════════════════════════════════════════════════════════════
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 # Agent ID → 框架映射（从 aim.json 自动加载，也支持 fallback）
 AGENT_FRAMEWORK_CACHE: dict = {}  # agent_id → framework
@@ -78,6 +102,13 @@ STATUS_ICONS = {
     # 消息类型（备用）
     "dm": "📨",
     "grp": "📢",
+}
+
+# Agent 头像映射
+AGENT_EMOJI = {
+    "ZS0001": "🐸",
+    "ZS0002": "✨🐴✨",
+    "ZS0003": "🐤",
 }
 
 # Observer 事件不显示心跳（默认隐藏）
@@ -142,7 +173,7 @@ class WatchDisplay:
     def __init__(self, json_mode=False, compact=False, show_heartbeat=False,
                  save_path="", agent_filter=">", framework_filter="",
                  framework_map: dict = None, agent_name_map: dict = None,
-                 max_text=300):
+                 max_text=0, channel_filter=None):  # channel_filter: None=all, "dm", "grp"
         self.json_mode = json_mode
         self.compact = compact
         self.show_heartbeat = show_heartbeat
@@ -153,6 +184,7 @@ class WatchDisplay:
         self.agent_name_map = agent_name_map or {}  # agent_id → 显示名称
         self.save_fp = None
         self.max_text = max_text  # 消息预览最大字符数（0=不截断）
+        self.channel_filter = channel_filter  # "dm" / "grp" / None
 
         # 统计
         self.total_events = 0
@@ -181,9 +213,14 @@ class WatchDisplay:
             return
         agent_label = target if target != ">" else "All Agents"
         fw_label = f"  🔧 {self.framework_filter}" if self.framework_filter else ""
+        ch_label = ""
+        if self.channel_filter == "dm":
+            ch_label = "  📨 DM only"
+        elif self.channel_filter == "grp":
+            ch_label = "  📢 群聊 only"
         print(f"┌─ AIM Watch v{VERSION} ────────────────────────────────── {datetime.now().strftime('%H:%M:%S')} ─┐")
         print(f"│ 📡 {server}")
-        print(f"│ 🎯 {agent_label}{fw_label}")
+        print(f"│ 🎯 {agent_label}{fw_label}{ch_label}")
         print("├────────────────────────────────────────────────────────────────────────┤")
         self._banner_shown = True
 
@@ -402,30 +439,37 @@ class EventSource:
         return self
 
     async def _subscribe_messages(self, target: str, handler):
-        """订阅消息事件（简化为通过原始 NATS 订阅）"""
-        # 直接通过 nc 原始订阅（observer 不订阅消息 subject）
+        """订阅消息事件（支持 --dm-only / --grp-only 过滤）"""
         if not self._nc or not self._nc.is_connected:
             return
 
-        async def _on_dm(msg):
-            try:
-                env = json.loads(msg.data.decode())
-                await handler(env)
-            except Exception:
-                pass
+        ch = self.display.channel_filter  # None=all, "dm", "grp"
 
-        async def _on_grp(msg):
-            try:
-                env = json.loads(msg.data.decode())
-                await handler(env)
-            except Exception:
-                pass
+        if ch is None or ch == "dm":
+            async def _on_dm(msg):
+                try:
+                    env = json.loads(msg.data.decode())
+                    await handler(env)
+                except Exception:
+                    pass
+            await self._nc.subscribe("aim.dm.>", cb=_on_dm)
 
-        await self._nc.subscribe("aim.dm.>", cb=_on_dm)
-        await self._nc.subscribe("aim.grp.>", cb=_on_grp)
+        if ch is None or ch == "grp":
+            async def _on_grp(msg):
+                try:
+                    env = json.loads(msg.data.decode())
+                    await handler(env)
+                except Exception:
+                    pass
+            await self._nc.subscribe("aim.grp.>", cb=_on_grp)
 
     def _show_message(self, envelope: dict):
-        """格式化并显示一条消息事件"""
+        """格式化并显示一条消息事件
+
+        格式:
+          群聊: HH:MM:SS 昵称 头像: @提及 消息内容 头像
+          私聊: HH:MM:SS 昵称 头像 → 对方: 消息内容 头像
+        """
         msg_type = envelope.get("type", "?")
         from_id = envelope.get("from", "?")
         to_id = envelope.get("to", "")
@@ -434,27 +478,55 @@ class EventSource:
         ts = envelope.get("ts", 0)
         meta = envelope.get("meta", {})
 
-        # 显示名称映射（ZS0001→呱呱, ZS0003→小火鸡儿...）
+        # 显示名称映射
         display_from = self.display.agent_name_map.get(from_id, from_id)
+        display_to = self.display.agent_name_map.get(to_id, to_id) if to_id else ""
 
-        # 群聊
-        if msg_type == "grp":
-            group = meta.get("group", to_id) if isinstance(meta, dict) else to_id
-            target_str = f"→ {group}"
-        else:
-            target_str = f"→ {to_id}"
+        # 头像
+        emoji = AGENT_EMOJI.get(from_id, "")
+        emoji_to = AGENT_EMOJI.get(to_id, "") if to_id else ""
 
-        # 显示为带图标的行
-        icon = STATUS_ICONS.get(msg_type, "📢")
         time_str = fmt_time(ts)
         text_preview = text if self.display.max_text == 0 else text[:self.display.max_text]
-        text_preview = text_preview.replace("\n", " ")
+        text_preview = text_preview.replace("\\n", "\n")
 
-        line = f"{time_str} {icon} {display_from} {target_str} | {text_preview}"
-        print(line, flush=True)
-        if self.display.save_fp:
-            self.display.save_fp.write(line + "\n")
-            self.display.save_fp.flush()
+        # 提取 @提及（从消息中找 @呱呱 @吉量 @小火鸡儿 模式）
+        import re
+        at_pattern = r'@(?:呱呱|吉量|小火鸡儿|ZS000[1-3])'
+        at_mentions = re.findall(at_pattern, text_preview)
+
+        # 构建前缀
+        if msg_type == "grp":
+            # 群聊: 时间 昵称 头像: (@提及) 消息
+            if at_mentions:
+                at_str = " ".join(at_mentions) + " "
+            else:
+                at_str = ""
+            prefix = f"{time_str} {display_from} {emoji}: {at_str}"
+        else:
+            # 私聊: 时间 昵称 头像 → 对方: 消息
+            arrow = f" → {display_to} {emoji_to}" if display_to else ""
+            prefix = f"{time_str} {display_from} {emoji}{arrow}: "
+
+        # 后置头像
+        suffix = f" {emoji}"
+
+        # 计算缩进（用于续行，不含后置头像）
+        indent = " " * (len(time_str) + len(display_from) + 3)
+
+        paragraphs = text_preview.split("\n")
+        for i, para in enumerate(paragraphs):
+            para = para.strip()
+            if not para:
+                continue
+            if i == 0:
+                line = f"{prefix}{para}"
+            else:
+                line = f"{indent}{para}"
+            print(line, flush=True)
+            if self.display.save_fp:
+                self.display.save_fp.write(line + "\n")
+                self.display.save_fp.flush()
 
     async def replay_history(self, count: int, target: str = ">"):
         """回放历史 Observer 事件（支持 --since 时间过滤）"""
@@ -536,9 +608,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 示例:
-  aim-watch                           # 所有 Agent
+  aim-watch                           # 所有 Agent + 全部消息
   aim-watch --agent ZS0001            # 只看呱呱
-  aim-watch --agent ZS0003            # 只看小火鸡儿
+  aim-watch --dm-only                 # 只看私聊
+  aim-watch --grp-only                # 只看群聊
+  aim-watch --all --grp-only          # 全 Agent 群聊
+  aim-watch --all --dm-only           # 全 Agent 私聊
   aim-watch --history 10              # 启动时回放最近 10 条
   aim-watch --compact                 # 紧凑模式（合并 AI 过程）
   aim-watch --json                    # JSON 行输出
@@ -575,14 +650,20 @@ def main():
                         help="显示心跳事件（默认隐藏）")
     parser.add_argument("--save", default="",
                         help="事件同时写入文件路径")
+    parser.add_argument("--persist", action="store_true",
+                        help="持久化模式: 自动保存到 ~/.aim/system/observer.jsonl (旋转 50000 行)")
     parser.add_argument("--file", default="",
                         help="[experimental] 从 JSONL 文件回放（离线模式，不连 NATS）")
     parser.add_argument("--since", type=int, default=0,
                         help="只看过去 N 秒的事件（配合 --history 或 --file 过滤）")
     parser.add_argument("--full-text", action="store_true",
                         help="显示完整消息内容（不截断）")
-    parser.add_argument("--max-text", type=int, default=300,
-                        help="消息预览最大字符数（默认 300，0=不截断）")
+    parser.add_argument("--dm-only", action="store_true",
+                        help="只显示私聊消息（aim.dm.>）")
+    parser.add_argument("--grp-only", action="store_true",
+                        help="只显示群聊消息（aim.grp.>）")
+    parser.add_argument("--max-text", type=int, default=0,
+                        help="消息预览最大字符数（0=不截断）")
     parser.add_argument("--nats-url", default="",
                         help="NATS Server URL（默认从配置读取）")
     parser.add_argument("--version", action="store_true",
@@ -601,6 +682,16 @@ def main():
     # compact 模式隐含隐藏心跳
     if args.compact:
         args.show_heartbeat = False
+
+    # 通道过滤：--dm-only / --grp-only 互斥
+    channel_filter = None
+    if args.dm_only and args.grp_only:
+        print("❌ --dm-only 和 --grp-only 不能同时使用", file=sys.stderr)
+        sys.exit(1)
+    elif args.dm_only:
+        channel_filter = "dm"
+    elif args.grp_only:
+        channel_filter = "grp"
 
     config = load_config()
     server = args.nats_url or config.get("nats_server", "nats://127.0.0.1:4222")
@@ -635,6 +726,7 @@ def main():
             framework_map=fw_map,
             agent_name_map=name_map,
             max_text=args.max_text,
+            channel_filter=channel_filter,
         )
         since_ts = time.time() - args.since if args.since else 0
         source = EventSource(None, display, since=since_ts)
@@ -643,6 +735,12 @@ def main():
         display.show_footer()
         display.close()
         return
+
+    # ── Persist: 持久化模式 ──
+    if args.persist:
+        persist_path = os.path.expanduser("~/.aim/system/observer.jsonl")
+        _rotate_if_needed(persist_path, max_lines=50000)
+        args.save = persist_path
 
     if not token:
         print("❌ 未找到 NATS 认证凭据，请检查 ~/.aim/config/aim.json")
@@ -659,6 +757,7 @@ def main():
         framework_map=fw_map,
         agent_name_map=name_map,
         max_text=args.max_text,
+        channel_filter=channel_filter,
     )
 
     observer = AIMObserverClient(

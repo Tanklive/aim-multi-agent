@@ -130,6 +130,9 @@ class QueuePersist:
         # 找每个 msg_id 的最后一条 op
         last_ops: Dict[str, dict] = {}
         for entry in ops:
+            if not isinstance(entry, dict):
+                logger.warning(f"QueuePersist 跳过非 dict entry: {type(entry).__name__}")
+                continue
             mid = entry.get("msg_id", "")
             if mid:
                 last_ops[mid] = entry

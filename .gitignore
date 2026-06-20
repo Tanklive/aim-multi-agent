@@ -15,3 +15,19 @@ events/
 run/
 configs/
 data/
+
+# 619-15 密钥双保险：防意外将 creds/secret 提交到 git
+*.creds
+*.key
+*.pem
+secret*
+*secret*
+*.token
+
+aim-client/tests/
+archive/
+backups/
+guagua_inbox.md
+huojier_inbox.md
+huoji_inbox.md
+deploy_sdk.sh

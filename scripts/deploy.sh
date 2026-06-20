@@ -1,88 +1,52 @@
 #!/bin/bash
 # AIM Deploy — 从开发仓库同步到运行目录
-# 版本：v2.0
-# 日期：2026-06-09
-# 负责人：呱呱 🐸
+# 版本：v2.1 | 日期：2026-06-19 | 维护：ZS0001 (呱呱)
+# 619+ 修复：5 条路径 3 条已废弃，重写为 3 步同步
 set -e
 
 SHARED_DIR="$HOME/shared/aim"
-SERVER_DIR="$HOME/aim-server"
 AIM_DIR="$HOME/.aim"
+SERVER_DIR="$HOME/aim-server"
+VERSION=$(cat "$SHARED_DIR/VERSION" 2>/dev/null || echo "unknown")
 
-echo "=== AIM Deploy v2.0 ==="
+echo "=== AIM Deploy v2.1 ==="
 echo "Source: $SHARED_DIR"
-echo "Server: $SERVER_DIR"
-echo "Agent:  $AIM_DIR"
+echo "Version: $VERSION"
 echo ""
 
-# 1. 同步 Server 代码
-echo "[1/5] Syncing Server..."
-if [ -d "$SHARED_DIR/src/server" ]; then
-    for f in registry.py aim_server.py aim_observer.py; do
-        if [ -f "$SHARED_DIR/src/server/$f" ]; then
-            cp "$SHARED_DIR/src/server/$f" "$SERVER_DIR/"
-            echo "  ✅ $f"
-        fi
-    done
-else
-    echo "  ⚠️  src/server/ not found, skipping"
-fi
+# 1. SDK 同步 → ~/.aim/bin/（P0-4 修复，原 src/bin/ 已废弃）
+echo "[1/3] SDK → ~/.aim/bin/"
+mkdir -p "$AIM_DIR/bin"
+cp "$SHARED_DIR/src/aim_nats_sdk.py" "$AIM_DIR/bin/aim_nats_sdk.py"
+chmod +x "$AIM_DIR/bin/aim_nats_sdk.py"
+echo "  ✅ aim_nats_sdk.py → $AIM_DIR/bin/ (v$VERSION)"
 
-# 2. 同步共享工具
-echo "[2/5] Syncing shared tools..."
-if [ -d "$SHARED_DIR/src/bin" ]; then
-    for f in aim_nats_sdk.py aim_send.py aim-watch.py aim-observe.py; do
-        if [ -f "$SHARED_DIR/src/bin/$f" ]; then
-            cp "$SHARED_DIR/src/bin/$f" "$AIM_DIR/bin/"
-            echo "  ✅ $f"
-        fi
-    done
-else
-    echo "  ⚠️  src/bin/ not found, skipping"
-fi
+# 2. aim-client → 各 Agent 目录（原 src/agents/nats-agent.py 已退役）
+echo "[2/3] aim-client → agents/"
+for agent in ZS0001 ZS0002 ZS0003; do
+    agent_dir="$AIM_DIR/agents/$agent"
+    if [ -d "$agent_dir" ]; then
+        mkdir -p "$agent_dir/aim-client"
+        rsync -a --delete "$SHARED_DIR/aim-client/" "$agent_dir/aim-client/"
+        echo "  ✅ $agent/aim-client/"
+    else
+        echo "  ⚠️  $agent 目录不存在，跳过"
+    fi
+done
 
-# 3. 同步通用模块
-echo "[3/5] Syncing common modules..."
-if [ -d "$SHARED_DIR/src/common" ]; then
-    mkdir -p "$AIM_DIR/common"
-    for f in aim_pin.py aim_retry.py; do
-        if [ -f "$SHARED_DIR/src/common/$f" ]; then
-            cp "$SHARED_DIR/src/common/$f" "$AIM_DIR/common/"
-            echo "  ✅ $f"
-        fi
-    done
-else
-    echo "  ⚠️  src/common/ not found, skipping"
+# 3. Server 组件（如存在）
+echo "[3/3] Server 组件"
+if [ -f "$SHARED_DIR/aim-server/registry.py" ]; then
+    cp "$SHARED_DIR/aim-server/registry.py" "$SERVER_DIR/"
+    echo "  ✅ registry.py"
 fi
-
-# 4. 同步 Agent 模板
-echo "[4/5] Syncing agent templates..."
-if [ -d "$SHARED_DIR/src/agents" ]; then
-    for agent in ZS0001 ZS0002 ZS0003; do
-        if [ -d "$AIM_DIR/agents/$agent" ]; then
-            if [ -f "$SHARED_DIR/src/agents/nats-agent.py" ]; then
-                cp "$SHARED_DIR/src/agents/nats-agent.py" "$AIM_DIR/agents/$agent/"
-                echo "  ✅ $agent/nats-agent.py"
-            fi
-        fi
-    done
-else
-    echo "  ⚠️  src/agents/ not found, skipping"
-fi
-
-# 5. 同步配置模板
-echo "[5/5] Syncing config templates..."
-if [ -d "$SHARED_DIR/config" ]; then
-    for f in nats.conf.template aim-config.template.json; do
-        if [ -f "$SHARED_DIR/config/$f" ]; then
-            cp "$SHARED_DIR/config/$f" "$AIM_DIR/config/"
-            echo "  ✅ $f"
-        fi
-    done
-else
-    echo "  ⚠️  config/ not found, skipping"
+if [ -f "$SHARED_DIR/aim-server/aim_server.py" ]; then
+    cp "$SHARED_DIR/aim-server/aim_server.py" "$SERVER_DIR/"
+    echo "  ✅ aim_server.py"
 fi
 
 echo ""
 echo "=== Deploy complete ==="
-echo "Next: restart services to pick up changes"
+echo "⚠️  必须重启所有 Agent 加载新代码"
+echo "   ZS0001: launchctl stop com.aim.agent.zs0001 && launchctl start com.aim.agent.zs0001"
+echo "   ZS0002/ZS0003: 各自重启"

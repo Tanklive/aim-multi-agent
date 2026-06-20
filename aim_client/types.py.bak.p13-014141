@@ -33,8 +33,7 @@ class AdapterStatus(Enum):
     SUCCESS = 0
     RETRY = 1
     DEGRADE = 2
-    FATAL = 3
-    AGENT_UNREACHABLE = 4  # 619-20 P1-3: agent消失/框架崩溃, DEGRADE+可恢复
+    HUMAN = 3
 
 class TaskStatus(Enum):
     """Task Contract — 任务生命周期状态"""

@@ -411,7 +411,8 @@ class AIMClient:
         self._grp_cooldown_sec = self.config.get("grp_reply_cooldown_sec", 30.0)
         self._last_grp_reply: dict[str, float] = {}
         self._seen_msg_keys: dict[str, float] = {}  # 内容去重 (from_id:content[:200]→timestamp)
-        self._processed_ids: set = set()  # U-005: msg_id 级去重，防止 StallWatchdog 重复投递
+        self._processed_ids: set = set()  # U-005: msg_id L1 去重（接收时）
+        self._dispatched_ids: set = set()  # U-006: 已 dispatch 去重（发送 adapter 后）
         # 619-20: StallWatchdog — 检测 dispatch_loop 假死
         self._last_dispatch_time: float = 0.0
         self._stall_timeout_sec = self.config.get("stall_watchdog_sec", 30.0)
@@ -486,14 +487,11 @@ class AIMClient:
                     msg = self.queue.dequeue()
                     if not msg:
                         break
-                    # P0-005: 出队时联动 L1 去重 — 已处理过的消息直接 ack 跳过（清理旧积压）
-                    if msg.msg_id and msg.msg_id in self._processed_ids:
-                        self.logger.debug(f" [DEDUP DEQUEUE] msg_id={msg.msg_id[:8]} 已处理, ack跳过")
+                    # U-006: 出队去重用独立 _dispatched_ids，不与接收时 L1 _processed_ids 冲突
+                    if msg.msg_id and msg.msg_id in self._dispatched_ids:
+                        self.logger.debug(f" [DEDUP DEQUEUE] msg_id={msg.msg_id[:8]} 已 dispatch, ack跳过")
                         self.queue.ack(msg.msg_id)
                         continue
-                    # 标记为已处理，防止 StallWatchdog 重投后再次入队
-                    if msg.msg_id:
-                        self._processed_ids.add(msg.msg_id)
                     self._last_dispatch_time = _t619_wd.time()  # 记录最近投递时间
                     self.scheduler.on_dispatch_started()
                     self.logger.info(f"投递: {msg.msg_id[:8]} from={msg.from_id}")
@@ -524,6 +522,9 @@ class AIMClient:
                             else:
                                 await self.transport.send_dm(msg.from_id, reply)
                         self.scheduler.on_processing_done()
+                        # U-006: 标记已 dispatch，防止回队重复处理
+                        if msg.msg_id:
+                            self._dispatched_ids.add(msg.msg_id)
                         self.queue.ack(msg.msg_id)
                         self._stall_recovery_count = 0  # 620-01: 成功投递才清零
                         self._retry_tracker.pop(msg.msg_id, None)  # 退避跟踪清除
@@ -544,6 +545,8 @@ class AIMClient:
                         if rt >= 3:
                             self.logger.warning(f" [{msg.msg_id[:8]}] 退避耗尽 ({rt}次)，入死信")
                             self.queue.ack(msg.msg_id)  # ack 移除，不 requeue
+                            if msg.msg_id:
+                                self._dispatched_ids.add(msg.msg_id)
                             self._retry_tracker.pop(msg.msg_id, None)
                             self.scheduler.reset_to_idle()
                             self._dispatch_event.set()  # 立即触发下一轮
@@ -1096,6 +1099,8 @@ class AIMClient:
         # 限制去重集合大小
         if len(self._processed_ids) > 2000:
             self._processed_ids = set(list(self._processed_ids)[-500:])
+        if len(self._dispatched_ids) > 2000:
+            self._dispatched_ids = set(list(self._dispatched_ids)[-500:])
         if len(self._seen_msg_keys) > 500:
             old_keys = sorted(self._seen_msg_keys, key=lambda k: self._seen_msg_keys[k])[:250]
             for k in old_keys:

@@ -1028,10 +1028,13 @@ class AIMClient:
         # 传输层 NATS publish ack 已保证送达，应用层 ACK 是冗余
         import re
         stripped = content.strip()
-        # 去除 emoji/符号/表情（非文字非标点部分），判断剩余文本是否为纯 ACK
-        _text_only = re.sub(r'[^\w\s\u4e00-\u9fff\u3000-\u303f\uff00-\uffef,.!?;:。，！？；：]', '', stripped).strip()
+        # 去除 emoji/符号后提取纯文本
+        _text_only = re.sub(r'[^\w\s\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]', '', stripped).strip()
+        # 压缩空白后判断
+        _compact = re.sub(r'\s+', '', _text_only)
         _ACK_PATTERNS = {"收到", "ok", "OK", "Ok", "done", "Done", "ack", "ACK", "Ack"}
-        if _text_only in _ACK_PATTERNS:
+        _ACK_REPEATS = {"收到收到", "okok", "donedone", "ackack"}
+        if _text_only in _ACK_PATTERNS or (len(_compact) <= 10 and _compact in _ACK_REPEATS):
             eid = (envelope.get("id", "?"))[:8]
             self.logger.info(f" [{eid}] ACK skip: '{stripped[:20]}' (送达已由传输层确认)")
             return

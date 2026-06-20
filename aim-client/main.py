@@ -386,6 +386,9 @@ class AIMClient:
         self._retry_tracker: dict[str, int] = {}  # P0: exit=1 退避, msg_id → retry_count
         self._last_recover_at: float = 0.0  # P0-L3: recover cooldown (60s)
         self._last_trim_at: float = 0.0  # P0-L3: trim cooldown (30s)
+        # 620: 自适应 stalled 阈值 (基于 queue depth)
+        self._stall_base_sec = self.config.get("stall_watchdog_sec", 30.0)
+        self._stall_min_sec = self.config.get("stall_watchdog_min_sec", 10.0)
         self._recover_task: Optional[asyncio.Task] = None  # P2: non-blocking recover handle
         # L3 护栏: N=3 次自修复失败 → 永久停止 + 告警
         self._repair_failures: int = 0
@@ -398,13 +401,23 @@ class AIMClient:
         self.logger.info(f"Adapter: {self.adapter_cmd}")
         self.logger.info(f"Queue+Scheduler 已嵌入 (capacity={self.queue.capacity})")
 
+    def _calc_stall_timeout(self) -> float:
+        """620: 自适应 stalled 阈值 — queue 越大超时越短"""
+        qsize = self.queue.size()
+        qcap = max(self.queue.capacity, 1)
+        ratio = min(qsize / qcap, 1.0)
+        # 线性缩放: 空队列→base, 满队列→max(base*0.5, min)
+        dynamic = max(self._stall_min_sec, self._stall_base_sec * (1.0 - ratio * 0.5))
+        return dynamic
+
     async def _dispatch_loop(self):
         """独立消息投递：Event驱动 + scheduler控制 + StallWatchdog 自愈"""
         while self.running:
             try:
-                # 619-20: StallWatchdog — 超时自检替代永久等待
+                # 619-20/620: StallWatchdog — 自适应超时替代永久等待
+                stall_timeout = self._calc_stall_timeout()
                 try:
-                    await asyncio.wait_for(self._dispatch_event.wait(), timeout=self._stall_timeout_sec)
+                    await asyncio.wait_for(self._dispatch_event.wait(), timeout=stall_timeout)
                 except asyncio.TimeoutError:
                     pass
                 self._dispatch_event.clear()
@@ -412,7 +425,9 @@ class AIMClient:
                 # 619-20: 假死自检 — queue 有货但超时无投递 → 强制解锁 scheduler
                 import time as _t619_wd
                 now_wd = _t619_wd.time()
-                if self._last_dispatch_time > 0 and now_wd - self._last_dispatch_time > self._stall_timeout_sec:
+                # 620: 使用计算后的自适应阈值
+                stall_timeout_check = max(self._stall_timeout_sec, stall_timeout)
+                if self._last_dispatch_time > 0 and now_wd - self._last_dispatch_time > stall_timeout_check:
                     if self.queue.size() > 0:
                         self._stall_recovery_count += 1
                         self.logger.warning(
@@ -427,9 +442,10 @@ class AIMClient:
                                     f"❌ StallWatchdog: 连续 {self._stall_recovery_count} 次自愈失败，丢弃消息 {stuck.msg_id[:8]} from={stuck.from_id}"
                                 )
                             self._stall_recovery_count = 0
-                            self._dispatch_event.set()  # 立即触发下一轮
                         else:
                             self.scheduler.reset_to_idle()
+                        # 620: 修复 StallWatchdog 触发后 _dispatch_event 未 set 致 dispatch 永久阻塞
+                        self._dispatch_event.set()
                         self._last_dispatch_time = now_wd  # 只触发一次
 
                 while self.scheduler.should_dispatch() and self.queue.size() > 0:
@@ -453,6 +469,8 @@ class AIMClient:
                                 last = self._last_grp_reply.get(msg.grp_id, 0)
                                 if now - last < self._grp_cooldown_sec:
                                     self.logger.debug(f" [{msg.msg_id[:8]}] 群聊回复跳过（冷却 {now-last:.0f}s/{self._grp_cooldown_sec}s）")
+                                elif self._is_confirm_loop(msg, reply):
+                                    self.logger.info(f" [{msg.msg_id[:8]}] 群聊确认循环跳过: in={msg.text[:20]} out={reply[:20]}")
                                 else:
                                     self._last_grp_reply[msg.grp_id] = now
                                     await self.transport.send_grp(msg.grp_id, reply)
@@ -623,6 +641,23 @@ class AIMClient:
             self._degrade_history.popleft()
         count = sum(1 for _, ec in self._degrade_history if ec == 2)
         return count >= DEGRADE_WINDOW_COUNT
+
+    # ── 确认循环检测 ───────────────────────────────
+    CONFIRM_WORDS = {"收到", "1", "✅", "👍", "👂", "收到 ✅", "收到 👍", "ok", "OK"}
+    CONFIRM_MAX_LEN = 15  # 确认回复一般很短
+
+    def _is_confirm_loop(self, msg, reply: str) -> bool:
+        """检测群聊确认死锁：入站是简短确认 + 出站也是简短确认 → 跳过回复"""
+        in_text = (msg.content or "").strip()
+        out_text = reply.strip()
+        # 入站和出站都是确认
+        in_confirm = len(in_text) <= self.CONFIRM_MAX_LEN and (
+            in_text in self.CONFIRM_WORDS or any(w in in_text for w in self.CONFIRM_WORDS if len(w) > 1)
+        )
+        out_confirm = len(out_text) <= self.CONFIRM_MAX_LEN and (
+            out_text in self.CONFIRM_WORDS or any(w in out_text for w in self.CONFIRM_WORDS if len(w) > 1)
+        )
+        return in_confirm and out_confirm
 
     async def _call_adapter_recover(self) -> bool:
         """Call adapter.sh recover, returns True if backend recovered.
@@ -813,20 +848,34 @@ class AIMClient:
 
     # -- NATS 回调 (SDK 签名: handler(envelope_dict, raw_msg)) --
 
+    @staticmethod
+    def _preview(envelope: dict, maxlen: int = 50) -> str:
+        """提取消息内容截断预览"""
+        text = envelope.get("payload", {}).get("text", "")
+        if not text:
+            return ""
+        return text[:maxlen] + ("…" if len(text) > maxlen else "")
+
     async def _on_dm(self, envelope: dict, raw_msg):
         from_id = envelope.get("from", envelope.get("from_id", ""))
-        self.logger.info(f" DM收到: from={from_id} id={str(envelope.get('id','?'))[:8]}")
+        mid = str(envelope.get('id','?'))[:8]
+        preview = self._preview(envelope)
+        self.logger.info(f" DM收到: from={from_id} id={mid}")
         if from_id == self.agent_id:
             return
-        # Observer 事件推送：收到消息
-        await self.transport.emit_obs("received", str(envelope.get('id','?'))[:8], f"from={from_id}")
+        detail = f"from={from_id}" + (f" text={preview}" if preview else "")
+        await self.transport.emit_obs("received", mid, detail)
         await self._handle_message(envelope, is_dm=True)
 
     async def _on_grp(self, envelope: dict, raw_msg):
         from_id = envelope.get("from", envelope.get("from_id", ""))
+        mid = str(envelope.get('id','?'))[:8]
+        preview = self._preview(envelope)
         self.logger.info(f" GRP收到: from={from_id}")
         if from_id == self.agent_id:
             return
+        detail = f"from={from_id}" + (f" text={preview}" if preview else "")
+        await self.transport.emit_obs("received", mid, detail)
         await self._handle_message(envelope, is_dm=False)
 
     async def _handle_message(self, envelope: dict, *, is_dm: bool):

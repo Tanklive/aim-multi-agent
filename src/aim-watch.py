@@ -111,8 +111,8 @@ AGENT_EMOJI = {
     "ZS0003": "🐤",
 }
 
-# Observer 事件不显示心跳（默认隐藏）
-SILENT_STATUSES = {"heartbeat"}
+# Observer 事件默认隐藏（纯噪音）
+SILENT_STATUSES = {"heartbeat", "delivered"}
 
 # AI 过程事件（compact 模式合并）
 AI_PROCESS_EVENTS = {"ai_start", "ai_thinking", "ai_tool_call", "ai_tool_result", "ai_done", "ai_empty"}

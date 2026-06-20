@@ -282,17 +282,12 @@ class Transport:
             self._logger.debug(f"emit_health 失败: {e}")
 
     async def emit_delivery(self, to_id: str, envelope_id: str, via: str = "dm"):
-        """推送送达确认事件（observer 可见但不进 dispatch）"""
-        import json, time
-        event = {
-            "status": "delivered",
-            "from": self.agent_id,
-            "to": to_id,
-            "msg_id": envelope_id,
-            "via": via,
-            "ts": time.time(),
-        }
-        await self._sdk.emit_obs("delivered", envelope_id[:8], json.dumps(event))
+        """推送送达确认事件（observer 可见但不进 dispatch）
+        U-006 fix: detail 人可读不丢 JSON，observer 格式干净
+        """
+        import time
+        mid = envelope_id[:8] if len(envelope_id) >= 8 else envelope_id
+        await self._sdk.emit_obs("delivered", mid, f"→ {to_id} via {via}")
 
     async def send_registry_health_report(self, health: dict):
         return await self.request("aim.registry.health_report", {

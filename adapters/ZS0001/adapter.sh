@@ -69,7 +69,7 @@ _filter_ack() {
 
 if _filter_ack "$MESSAGE"; then
     echo "[纯确认，跳过]" >&2
-    exit 1  # exit 1 = 可重试(但实际上不会重试因为queue会ack)
+    exit 0  # 空回复 = 静默ack，不发消息，不触发重试
 fi
 
 # 直接调 OpenClaw agent 生成回复

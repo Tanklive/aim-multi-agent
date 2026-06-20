@@ -461,6 +461,11 @@ class AIMClient:
                     except Exception:
                         pass
                     try:
+                        # ── 免 LLM 消息：系统通知和确认消息不烧 token ──
+                        if self._skip_adapter_for_operational(msg):
+                            self.logger.debug(f" [{msg.msg_id[:8]}] 免LLM跳过: from={msg.from_id}")
+                            self.queue.ack(msg.msg_id)
+                            continue
                         reply = await self._call_adapter(msg)
                         if reply:
                             if msg.grp_id:
@@ -486,7 +491,6 @@ class AIMClient:
                         self.queue.nack(msg.msg_id, "degrade")
                         # 619-11: 降级告警
                         self.logger.warning(f"⚠️  [{self.agent_id}] adapter 降级，停止投递")
-                        await self.transport.emit_obs("degrade", msg.msg_id[:8], f"adapter={self.agent_id}")
                         # FIX(2026-06-19): break 后必须重置事件，否则永久阻塞（火鸡儿发现）
                         self._dispatch_event.set()
                         break
@@ -515,7 +519,6 @@ class AIMClient:
                             self.scheduler.on_degrade()
                             self.queue.nack(msg.msg_id, "agent_unreachable")
                             self.logger.warning(f"🔌 [{self.agent_id}] Agent 不可达（exit=4），暂停投递")
-                            await self.transport.emit_obs("agent_unreachable", msg.msg_id[:8], f"adapter={self.agent_id}")
                             self._dispatch_event.set()
                             # P2: non-blocking recover
                             if self._recover_task and not self._recover_task.done():
@@ -528,7 +531,6 @@ class AIMClient:
                         self.scheduler.on_human_intervention()
                         self.queue.nack(msg.msg_id, "human_intervention")
                         self.logger.error(f"💀 [{self.agent_id}] FATAL exit=3, 永久停止 dispatch")
-                        await self.transport.emit_obs("fatal", msg.msg_id[:8], "dispatch stopped")
                         self._dispatch_event.set()
                         break
                     except Exception as e:
@@ -611,7 +613,7 @@ class AIMClient:
                 new_state = report.status.name if hasattr(report, 'status') else str(report.status)
                 if new_state != _last_state and new_state in ("BUSY", "DEGRADE", "OFFLINE"):
                     self.logger.warning(f"⚠️  [{self.agent_id}] adapter {_last_state}→{new_state}")
-                    await self.transport.emit_obs("state_change", "", f"{_last_state}→{new_state}")
+
                 _last_state = new_state
                 if not prev_can and self.scheduler.should_dispatch():
                     self._dispatch_event.set()
@@ -627,18 +629,9 @@ class AIMClient:
                     self._zero_ack_streak = 0
                 if self._zero_ack_streak >= 3 and qsize > 0:
                     self.logger.warning(f"⚠️ 0-ack: queue={qsize} pending, {self._zero_ack_streak} 周期未消化")
-                    # 0-ack observer 事件加 300s 退避：避免每周期 emit 刷屏耗 token
-                    now = time.time()
-                    last_emit = getattr(self, '_last_0ack_emit', 0)
-                    if now - last_emit > 300:
-                        self._last_0ack_emit = now
-                        await self.transport.emit_obs(
-                            "0-ack", "",
-                            f"queue={qsize} pending, streak={self._zero_ack_streak}"
-                        )
 
                 # Observer 事件推送：心跳
-                await self.transport.emit_obs("heartbeat", "", "alive")
+
                 # Registry 心跳：更新 last_seen
                 await self.transport.send_registry_heartbeat()
                 # P1: 上报健康快照到 Registry KV
@@ -667,7 +660,22 @@ class AIMClient:
 
     # ── 确认循环检测 ───────────────────────────────
     CONFIRM_WORDS = {"收到", "1", "✅", "👍", "👂", "收到 ✅", "收到 👍", "ok", "OK"}
-    CONFIRM_MAX_LEN = 15  # 确认回复一般很短
+    CONFIRM_MAX_LEN = 15
+    # 系统发送者：消息不应经过 LLM
+    SYSTEM_SENDERS_SET = {"alertd", "registry", "aim-watch", "observer"}
+
+    def _skip_adapter_for_operational(self, msg) -> bool:
+        """免 LLM：系统通知/确认消息不调 adapter，零 token 消耗"""
+        # 系统发送者
+        if msg.from_id in self.SYSTEM_SENDERS_SET:
+            return True
+        # 纯确认消息
+        text = (msg.content or "").strip()
+        if len(text) <= self.CONFIRM_MAX_LEN and (
+            text in self.CONFIRM_WORDS or any(w in text for w in self.CONFIRM_WORDS if len(w) > 1)
+        ):
+            return True
+        return False
 
     def _is_confirm_loop(self, msg, reply: str) -> bool:
         """检测群聊确认死锁：入站是简短确认 + 出站也是简短确认 → 跳过回复"""
@@ -798,13 +806,7 @@ class AIMClient:
                 f"💀 [L3] {self.agent_id} 自修复连续 {n} 次失败，永久停止自修复"
             )
             # 通过 observer 发布 stalled 告警，alertd 将升级为 CRITICAL
-            asyncio.ensure_future(
-                self.transport.emit_obs(
-                    "stalled",
-                    "",
-                    f"自修复连续{n}次失败，已停止。最后原因: {reason}"
-                )
-            )
+            self.logger.error(f"💀 [L3] stalled: 自修复连续{n}次失败，已停止。最后原因: {reason}")
 
     # ── 循环检测（行为模式，非关键词）──
     _LOOP_WINDOW_SEC = 60
@@ -961,11 +963,9 @@ class AIMClient:
             detail = f"{sev} envelope from={envelope.get('from','?')} id={(envelope.get('id','?') or '?')[:8]}: {reason}"
             if sev == "hard" and self._reject_hard_errors:
                 self.logger.warning(f"🚫 [envelope] REJECT {detail}")
-                asyncio.ensure_future(self.transport.emit_obs("envelope_reject", "", detail))
                 return
             else:
                 self.logger.warning(f"⚠️ [envelope] WARN {detail} (violations={self._envelope_violations})")
-                asyncio.ensure_future(self.transport.emit_obs("envelope_warn", "", detail))
 
         payload = envelope.get("payload", {})
         content = payload.get("text", "")

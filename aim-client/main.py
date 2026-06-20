@@ -416,8 +416,6 @@ class AIMClient:
         self._seen_msg_keys: dict[str, float] = {}  # 内容去重 (from_id:content[:200]→timestamp)
         self._processed_ids: set = set()  # U-005: msg_id L1 去重（接收时）
         self._dispatched_ids: set = set()  # U-006: 已 dispatch 去重（发送 adapter 后）
-        self._recv_lock = asyncio.Lock()   # U-006: _on_dm/_on_grp 去重竞态防护
-        self._recv_in_progress: set = set()  # U-006: 正在处理的 msg_id（锁保护）
         # 619-20: StallWatchdog — 检测 dispatch_loop 假死
         self._last_dispatch_time: float = 0.0
         self._stall_timeout_sec = self.config.get("stall_watchdog_sec", 30.0)
@@ -731,24 +729,35 @@ class AIMClient:
         return count >= DEGRADE_WINDOW_COUNT
 
     # ── 确认循环检测 ───────────────────────────────
-    CONFIRM_WORDS = {"收到", "1", "✅", "👍", "👂", "收到 ✅", "收到 👍", "ok", "OK"}
-    CONFIRM_MAX_LEN = 15
+    CONFIRM_WORDS = {"收到", "1", "✅", "👍", "👂", "收到 ✅", "收到 👍", "ok", "OK", "Ok", "done", "Done", "好", "嗯", "哦", "✓", "✔"}
+    CONFIRM_MAX_LEN = 20
+    # U-006: 信号/测试消息关键词 — 不调 adapter，零 token 消耗
+    SIGNAL_PATTERNS = {"TEST-", "TEST_", "LOG-FIX-", "INVOKE-", "STACKTRACE-", "LOCK-TEST", "DEDUP-", "PING", "通信正常", "通道打通", "回执确认", "通道确认"}
     # 系统发送者：消息不应经过 LLM
     SYSTEM_SENDERS_SET = {"alertd", "registry", "aim-watch", "observer"}
     # 社交结束语：纯礼貌用语，不需 LLM 处理
     SOCIAL_CLOSE = {"晚安", "再见", "拜拜", "明天见", "辛苦", "好梦", "早点休息", "养足精神"}
 
     def _skip_adapter_for_operational(self, msg) -> bool:
-        """免 LLM：系统通知/确认消息/社交结束语不调 adapter，零 token 消耗"""
+        """免 LLM：系统通知/确认消息/测试信号/群聊 ACK 不调 adapter，零 token 消耗"""
         # 系统发送者
         if msg.from_id in self.SYSTEM_SENDERS_SET:
             return True
         text = (msg.content or "").strip()
-        # 纯确认消息
+        # 纯确认消息（扩宽到 20 字）
         if len(text) <= self.CONFIRM_MAX_LEN and (
             text in self.CONFIRM_WORDS or any(w in text for w in self.CONFIRM_WORDS if len(w) > 1)
         ):
             return True
+        # 信号/测试消息（零 token）
+        if any(p in text for p in self.SIGNAL_PATTERNS):
+            return True
+        # 群聊特殊: 以 🐤 或 ✨🐴✨ 开头的短消息 = Agent ACK
+        if msg.grp_id and len(text) <= 60:
+            if text.startswith("🐤") or text.startswith("✨🐴✨") or text.startswith("🐸"):
+                # 检查是否是纯 ACK（不含实质请求）
+                if text in self.CONFIRM_WORDS or any(w in text for w in ("收到", "ok", "OK", "Ok", "1")):
+                    return True
         # 社交结束语（短 + 含结束词）
         if len(text) <= 50 and any(w in text for w in self.SOCIAL_CLOSE):
             return True
@@ -1018,48 +1027,26 @@ class AIMClient:
     async def _on_dm(self, envelope: dict, raw_msg):
         from_id = envelope.get("from", envelope.get("from_id", ""))
         mid = str(envelope.get('id','?'))[:8]
-        msg_id = envelope.get("id", "")
+        preview = self._preview(envelope, maxlen=50)
+        obs_text = self._preview(envelope, maxlen=500)
+        self.logger.info(f" DM收到: from={from_id} id={mid}")
         if from_id == self.agent_id:
             return
-        # U-006: 锁保护防 NATS 重复回调竞态（不与 _processed_ids 冲突）
-        async with self._recv_lock:
-            if msg_id and msg_id in self._recv_in_progress:
-                return
-            if msg_id:
-                self._recv_in_progress.add(msg_id)
-        try:
-            preview = self._preview(envelope, maxlen=50)
-            obs_text = self._preview(envelope, maxlen=500)
-            self.logger.info(f" DM收到: from={from_id} id={mid}")
-            detail = f"from={from_id}" + (f" text={obs_text}" if obs_text else "")
-            await self.transport.emit_obs("received", mid, detail)
-            await self._handle_message(envelope, is_dm=True)
-        finally:
-            async with self._recv_lock:
-                self._recv_in_progress.discard(msg_id)
+        detail = f"from={from_id}" + (f" text={obs_text}" if obs_text else "")
+        await self.transport.emit_obs("received", mid, detail)
+        await self._handle_message(envelope, is_dm=True)
 
     async def _on_grp(self, envelope: dict, raw_msg):
         from_id = envelope.get("from", envelope.get("from_id", ""))
         mid = str(envelope.get('id','?'))[:8]
-        msg_id = envelope.get("id", "")
+        preview = self._preview(envelope, maxlen=50)
+        obs_text = self._preview(envelope, maxlen=500)
+        self.logger.info(f" GRP收到: from={from_id}")
         if from_id == self.agent_id:
             return
-        # U-006: 锁保护防 NATS 重复回调竞态（不与 _processed_ids 冲突）
-        async with self._recv_lock:
-            if msg_id and msg_id in self._recv_in_progress:
-                return
-            if msg_id:
-                self._recv_in_progress.add(msg_id)
-        try:
-            preview = self._preview(envelope, maxlen=50)
-            obs_text = self._preview(envelope, maxlen=500)
-            self.logger.info(f" GRP收到: from={from_id}")
-            detail = f"from={from_id}" + (f" text={obs_text}" if obs_text else "")
-            await self.transport.emit_obs("received", mid, detail)
-            await self._handle_message(envelope, is_dm=False)
-        finally:
-            async with self._recv_lock:
-                self._recv_in_progress.discard(msg_id)
+        detail = f"from={from_id}" + (f" text={obs_text}" if obs_text else "")
+        await self.transport.emit_obs("received", mid, detail)
+        await self._handle_message(envelope, is_dm=False)
 
     async def _handle_message(self, envelope: dict, *, is_dm: bool):
         # ── 620: envelope 准入校验 (三方共识: 吉量SDK + 呱呱handler + 火鸡儿E2E) ──

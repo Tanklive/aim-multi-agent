@@ -708,17 +708,22 @@ class AIMClient:
     CONFIRM_MAX_LEN = 15
     # 系统发送者：消息不应经过 LLM
     SYSTEM_SENDERS_SET = {"alertd", "registry", "aim-watch", "observer"}
+    # 社交结束语：纯礼貌用语，不需 LLM 处理
+    SOCIAL_CLOSE = {"晚安", "再见", "拜拜", "明天见", "辛苦", "好梦", "早点休息", "养足精神"}
 
     def _skip_adapter_for_operational(self, msg) -> bool:
-        """免 LLM：系统通知/确认消息不调 adapter，零 token 消耗"""
+        """免 LLM：系统通知/确认消息/社交结束语不调 adapter，零 token 消耗"""
         # 系统发送者
         if msg.from_id in self.SYSTEM_SENDERS_SET:
             return True
-        # 纯确认消息
         text = (msg.content or "").strip()
+        # 纯确认消息
         if len(text) <= self.CONFIRM_MAX_LEN and (
             text in self.CONFIRM_WORDS or any(w in text for w in self.CONFIRM_WORDS if len(w) > 1)
         ):
+            return True
+        # 社交结束语（短 + 含结束词）
+        if len(text) <= 50 and any(w in text for w in self.SOCIAL_CLOSE):
             return True
         return False
 
@@ -986,22 +991,24 @@ class AIMClient:
     async def _on_dm(self, envelope: dict, raw_msg):
         from_id = envelope.get("from", envelope.get("from_id", ""))
         mid = str(envelope.get('id','?'))[:8]
-        preview = self._preview(envelope)
+        preview = self._preview(envelope, maxlen=50)
+        obs_text = self._preview(envelope, maxlen=500)  # U-006: aim-watch 不截断
         self.logger.info(f" DM收到: from={from_id} id={mid}")
         if from_id == self.agent_id:
             return
-        detail = f"from={from_id}" + (f" text={preview}" if preview else "")
+        detail = f"from={from_id}" + (f" text={obs_text}" if obs_text else "")
         await self.transport.emit_obs("received", mid, detail)
         await self._handle_message(envelope, is_dm=True)
 
     async def _on_grp(self, envelope: dict, raw_msg):
         from_id = envelope.get("from", envelope.get("from_id", ""))
         mid = str(envelope.get('id','?'))[:8]
-        preview = self._preview(envelope)
+        preview = self._preview(envelope, maxlen=50)
+        obs_text = self._preview(envelope, maxlen=500)  # U-006: aim-watch 不截断
         self.logger.info(f" GRP收到: from={from_id}")
         if from_id == self.agent_id:
             return
-        detail = f"from={from_id}" + (f" text={preview}" if preview else "")
+        detail = f"from={from_id}" + (f" text={obs_text}" if obs_text else "")
         await self.transport.emit_obs("received", mid, detail)
         await self._handle_message(envelope, is_dm=False)
 

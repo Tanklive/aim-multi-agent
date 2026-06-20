@@ -460,7 +460,8 @@ class AIMClient:
                 now_wd = _t619_wd.time()
                 # 620: 使用计算后的自适应阈值
                 stall_timeout_check = max(self._stall_timeout_sec, stall_timeout)
-                if self._last_dispatch_time > 0 and now_wd - self._last_dispatch_time > stall_timeout_check:
+                if (self.queue.size() > 0 and
+                    (self._last_dispatch_time == 0 or now_wd - self._last_dispatch_time > stall_timeout_check)):
                     if self.queue.size() > 0:
                         self._stall_recovery_count += 1
                         self.logger.warning(

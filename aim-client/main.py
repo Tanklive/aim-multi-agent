@@ -227,7 +227,10 @@ class Transport:
             return False
 
     async def disconnect(self):
-        await self._sdk.close()
+        try:
+            await asyncio.wait_for(self._sdk.close(), timeout=5.0)
+        except asyncio.TimeoutError:
+            self._logger.warning("NATS disconnect timeout, forcing close")
 
     async def subscribe_dm(self, handler):
         await self._sdk.subscribe_dm(handler)

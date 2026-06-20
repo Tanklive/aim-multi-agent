@@ -102,11 +102,13 @@ class QueuePersist:
         """记录 ack"""
         entry = {"op": "ack", "msg_id": msg_id, "ts": time.time()}
         await self._write_queue.put(entry)
+        await self._maybe_compact()
 
     async def write_nack(self, msg_id: str, reason: str = ""):
         """记录 nack"""
         entry = {"op": "nack", "msg_id": msg_id, "ts": time.time(), "reason": reason}
         await self._write_queue.put(entry)
+        await self._maybe_compact()
 
     # ── 恢复 ──────────────────────────────────────────────
 

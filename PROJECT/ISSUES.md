@@ -115,3 +115,4 @@
 | 2026-06-20 22:43 | ZS0003 | 🟡 P1 | _on_grp/dispatch 幻听串扰 — 消息历史污染回复质量 | dispatch conv messages.jsonl 中 "👂 收到" 成为高频模式, 污染 Letta 后续回复 → 形成回应循环 修复: trim truncate messages.jsonl + 首刀手动清空历史 已修: adapter.sh v2.1 + 22:20 手动清理 |
 | 2026-06-20 22:43 | ZS0003 | 🟡 P1 | 双会话隔离从未实际部署 (v1.5→v1.8 注释骗了自己) | v1.5 注释写了 --conversation 方案但代码从未传参, 4个版本都在裸 letta -p → 新增 conv 目录 修复: v2.0 ensure_dispatch_conv() + --conversation 真正隔离 已修: adapter.sh v2.0 |
 | 2026-06-20 22:43 | ZS0003 | 🟢 P2 | conv 清理 cron 未排除 dispatch conv | cleanup cron 每天 4 点可能误删 dispatch conv (local-conv-1422) 修复: cleanup-conversations.sh 解码目录名匹配 conversation:local-conv-1422 跳过不删 已修: cleanup-conversations.sh v1.0 |
+| 2026-06-20 23:18 | ZS0002 | 🔴 P0 | dispatch 无幂等去重 → adapter 幻觉 | StallWatchdog重复投递+dispatch无PROCESSED_IDS→同消息多次进adapter→基于过期上下文编造回复。业界方案:NATS/Kafka/AWS/OpenAI全在传输层做message ID去重。修复:dispatch入口加PROCESSED_IDS set(~7行)。详细分析见PROJECT/adapter-hallucination-analysis.md |

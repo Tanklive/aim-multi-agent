@@ -196,8 +196,10 @@ class WatchDisplay:
 
         # compact 模式追踪每个 msg_id 的 ai 事件链
         self._ai_chains: dict = {}  # msg_id → [events...]
-        # 去重：SDK emit_obs 双发(JS+raw)导致同一事件出现两次
+        # 去重：SDK emit_obs 双发(JS+raw)导致重复
         self._seen_events: set = set()  # (agent_id, msg_id, status, ts_int)
+        # 频道追踪：msg_id → "dm"|"grp"，配合 channel_filter 过滤 observer 事件
+        self._msg_channel: dict = {}
 
         # 打开保存文件
         if save_path:
@@ -255,6 +257,11 @@ class WatchDisplay:
         if self.framework_filter and framework != self.framework_filter:
             return
         if not self.show_heartbeat and status in SILENT_STATUSES:
+            return
+
+        # 频道过滤：observer received 事件在 dm-only/grp-only 模式不显示
+        # 正文由 _show_message 正确按频道过滤显示
+        if self.channel_filter and status == "received":
             return
 
         self.displayed_events += 1
@@ -485,6 +492,10 @@ class EventSource:
         """
         msg_type = envelope.get("type", "?")
         from_id = envelope.get("from", "?")
+        msg_id = envelope.get("id", "")
+        # 频道追踪：让 observer 事件也能按 channel_filter 过滤
+        if msg_id and msg_type in ("dm", "grp"):
+            self.display._msg_channel[msg_id] = msg_type
         to_id = envelope.get("to", "")
         payload = envelope.get("payload", {})
         text = payload.get("text", "") if isinstance(payload, dict) else str(payload)

@@ -258,6 +258,22 @@ class Transport:
         except Exception as e:
             self._logger.debug(f"emit_obs 失败: {e}")
 
+    async def emit_health(self, status: str, msg_id: str = "", detail: str = ""):
+        """发布健康监控事件到 aim.health.>（healthd 消费，不耗 token）"""
+        try:
+            import json, time, uuid
+            event = {
+                "agent_id": self.agent_id,
+                "status": status,
+                "msg_id": msg_id,
+                "detail": detail,
+                "ts": time.time(),
+                "nonce": uuid.uuid4().hex[:8],
+            }
+            await self._sdk.nc.publish(f"aim.health.{self.agent_id}", json.dumps(event).encode())
+        except Exception as e:
+            self._logger.debug(f"emit_health 失败: {e}")
+
     async def send_registry_health_report(self, health: dict):
         return await self.request("aim.registry.health_report", {
             "agent_id": self.agent_id, "health": health,
@@ -491,6 +507,7 @@ class AIMClient:
                         self.queue.nack(msg.msg_id, "degrade")
                         # 619-11: 降级告警
                         self.logger.warning(f"⚠️  [{self.agent_id}] adapter 降级，停止投递")
+                        await self.transport.emit_health("degrade", msg.msg_id[:8], "adapter DEGRADE")
                         # FIX(2026-06-19): break 后必须重置事件，否则永久阻塞（火鸡儿发现）
                         self._dispatch_event.set()
                         break
@@ -519,6 +536,7 @@ class AIMClient:
                             self.scheduler.on_degrade()
                             self.queue.nack(msg.msg_id, "agent_unreachable")
                             self.logger.warning(f"🔌 [{self.agent_id}] Agent 不可达（exit=4），暂停投递")
+                            await self.transport.emit_health("agent_unreachable", msg.msg_id[:8], "exit=4")
                             self._dispatch_event.set()
                             # P2: non-blocking recover
                             if self._recover_task and not self._recover_task.done():
@@ -531,6 +549,7 @@ class AIMClient:
                         self.scheduler.on_human_intervention()
                         self.queue.nack(msg.msg_id, "human_intervention")
                         self.logger.error(f"💀 [{self.agent_id}] FATAL exit=3, 永久停止 dispatch")
+                        await self.transport.emit_health("fatal", msg.msg_id[:8], "exit=3")
                         self._dispatch_event.set()
                         break
                     except Exception as e:
@@ -613,6 +632,7 @@ class AIMClient:
                 new_state = report.status.name if hasattr(report, 'status') else str(report.status)
                 if new_state != _last_state and new_state in ("BUSY", "DEGRADE", "OFFLINE"):
                     self.logger.warning(f"⚠️  [{self.agent_id}] adapter {_last_state}→{new_state}")
+                    await self.transport.emit_health("state_change", "", f"{_last_state}→{new_state}")
 
                 _last_state = new_state
                 if not prev_can and self.scheduler.should_dispatch():
@@ -629,11 +649,16 @@ class AIMClient:
                     self._zero_ack_streak = 0
                 if self._zero_ack_streak >= 3 and qsize > 0:
                     self.logger.warning(f"⚠️ 0-ack: queue={qsize} pending, {self._zero_ack_streak} 周期未消化")
-
-                # Observer 事件推送：心跳
+                    now = time.time()
+                    last_emit = getattr(self, '_last_0ack_emit', 0)
+                    if now - last_emit > 300:
+                        self._last_0ack_emit = now
+                        await self.transport.emit_health("0-ack", "", f"queue={qsize} streak={self._zero_ack_streak}")
 
                 # Registry 心跳：更新 last_seen
                 await self.transport.send_registry_heartbeat()
+                # 健康心跳（推送到 healthd，不耗 token）
+                await self.transport.emit_health("heartbeat", "", "alive")
                 # P1: 上报健康快照到 Registry KV
                 h = {
                     'adapter_ok': report.status.name != 'OFFLINE',
@@ -805,8 +830,14 @@ class AIMClient:
             self.logger.error(
                 f"💀 [L3] {self.agent_id} 自修复连续 {n} 次失败，永久停止自修复"
             )
-            # 通过 observer 发布 stalled 告警，alertd 将升级为 CRITICAL
-            self.logger.error(f"💀 [L3] stalled: 自修复连续{n}次失败，已停止。最后原因: {reason}")
+            # 通过 health 通道发布 stalled 告警
+            asyncio.ensure_future(
+                self.transport.emit_health(
+                    "stalled",
+                    "",
+                    f"自修复连续{n}次失败，已停止。最后原因: {reason}"
+                )
+            )
 
     # ── 循环检测（行为模式，非关键词）──
     _LOOP_WINDOW_SEC = 60

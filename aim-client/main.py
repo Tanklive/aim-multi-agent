@@ -241,12 +241,19 @@ class Transport:
         self._logger.info(f" 已订阅群聊: aim.grp.{group_id}")
 
     async def send_dm(self, to_id: str, text: str):
-        """发送私聊消息"""
-        await self._sdk.send_dm(to_id, text)
+        """发送私聊消息 + 送达确认"""
+        envelope = await self._sdk.send_dm(to_id, text)
+        # 发送后立即推送送达事件（不触发对方 handler）
+        if isinstance(envelope, dict) and "id" in envelope:
+            await self.emit_delivery(to_id, envelope["id"], via="dm")
+        return envelope
 
     async def send_grp(self, group_id: str, text: str):
-        """发送群聊消息"""
-        await self._sdk.send_grp(group_id, text)
+        """发送群聊消息 + 送达确认"""
+        result = await self._sdk.send_grp(group_id, text)
+        if isinstance(result, dict) and "id" in result:
+            await self.emit_delivery(group_id, result["id"], via="grp")
+        return result
 
     async def authenticate(self) -> bool:
         return True
@@ -273,6 +280,19 @@ class Transport:
             await self._sdk.nc.publish(f"aim.health.{self.agent_id}", json.dumps(event).encode())
         except Exception as e:
             self._logger.debug(f"emit_health 失败: {e}")
+
+    async def emit_delivery(self, to_id: str, envelope_id: str, via: str = "dm"):
+        """推送送达确认事件（observer 可见但不进 dispatch）"""
+        import json, time
+        event = {
+            "status": "delivered",
+            "from": self.agent_id,
+            "to": to_id,
+            "msg_id": envelope_id,
+            "via": via,
+            "ts": time.time(),
+        }
+        await self._sdk.emit_obs("delivered", envelope_id[:8], json.dumps(event))
 
     async def send_registry_health_report(self, health: dict):
         return await self.request("aim.registry.health_report", {
@@ -1002,6 +1022,16 @@ class AIMClient:
         content = payload.get("text", "")
         # 620: 移除 envelope.get("content") 容错回退，不合规格式已在上面告警
         if not content:
+            return
+
+        # ── 送达确认替代 ACK：短 ACK 不进 dispatch ──
+        # "收到"/"ok"/"✅" 等 ≤3 字纯 ACK 不触发 adapter 处理
+        # 传输层 NATS publish ack 已保证送达，应用层 ACK 是冗余
+        stripped = content.strip()
+        _ACK_PATTERNS = {"收到", "ok", "OK", "Ok", "✅", "👌", "👍", "🤝", "done", "Done", "ack", "ACK", "Ack"}
+        if len(stripped) <= 3 and stripped in _ACK_PATTERNS:
+            eid = (envelope.get("id", "?"))[:8]
+            self.logger.info(f" [{eid}] ACK skip: '{stripped}' (送达已由传输层确认)")
             return
 
         from_id = envelope.get("from", "")

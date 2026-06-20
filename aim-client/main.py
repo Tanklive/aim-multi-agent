@@ -485,6 +485,14 @@ class AIMClient:
                     msg = self.queue.dequeue()
                     if not msg:
                         break
+                    # P0-005: 出队时联动 L1 去重 — 已处理过的消息直接 ack 跳过（清理旧积压）
+                    if msg.msg_id and msg.msg_id in self._processed_ids:
+                        self.logger.debug(f" [DEDUP DEQUEUE] msg_id={msg.msg_id[:8]} 已处理, ack跳过")
+                        self.queue.ack(msg.msg_id)
+                        continue
+                    # 标记为已处理，防止 StallWatchdog 重投后再次入队
+                    if msg.msg_id:
+                        self._processed_ids.add(msg.msg_id)
                     self._last_dispatch_time = _t619_wd.time()  # 记录最近投递时间
                     self.scheduler.on_dispatch_started()
                     self.logger.info(f"投递: {msg.msg_id[:8]} from={msg.from_id}")

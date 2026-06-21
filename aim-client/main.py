@@ -246,8 +246,8 @@ class Transport:
     async def send_dm(self, to_id: str, text: str):
         """发送私聊消息 + 送达确认"""
         envelope = await self._sdk.send_dm(to_id, text)
-        # 发送后立即推送送达事件（不触发对方 handler）
         if isinstance(envelope, dict) and "id" in envelope:
+            self._my_msg_ids.add(envelope["id"])  # U-007: 追踪发出的消息
             await self.emit_delivery(to_id, envelope["id"], via="dm")
         return envelope
 
@@ -255,6 +255,7 @@ class Transport:
         """发送群聊消息 + 送达确认"""
         result = await self._sdk.send_grp(group_id, text)
         if isinstance(result, dict) and "id" in result:
+            self._my_msg_ids.add(result["id"])  # U-007: 追踪发出的消息
             await self.emit_delivery(group_id, result["id"], via="grp")
         return result
 
@@ -290,7 +291,7 @@ class Transport:
         """
         import time
         mid = envelope_id[:8] if len(envelope_id) >= 8 else envelope_id
-        await self._sdk.emit_obs("delivered", mid, f"→ {to_id} via {via}")
+        # await self._sdk.emit_obs("delivered", mid, f"→ {to_id} via {via}")  # 2026-06-21 禁用以省带宽
 
     async def send_registry_health_report(self, health: dict):
         return await self.request("aim.registry.health_report", {
@@ -397,6 +398,7 @@ class AIMClient:
         self.adapter_env: dict[str, str] = dict(os.environ)
         self._degrade_history = deque(maxlen=100)  # P1-2: (ts, exit_code) 窗口
         self._init_loop_state()  # 循环检测追踪
+        self._init_fatigue_state()  # U-107: 群聊疲劳检测
         for config_key in ("letta_bin", "letta_agent_id"):
             val = self.config.get(config_key)
             if val:
@@ -416,6 +418,7 @@ class AIMClient:
         self._seen_msg_keys: dict[str, float] = {}  # 内容去重 (from_id:content[:200]→timestamp)
         self._processed_ids: set = set()  # U-005: msg_id L1 去重（接收时）
         self._dispatched_ids: set = set()  # U-006: 已 dispatch 去重（发送 adapter 后）
+        self._my_msg_ids: set = set()  # U-007: 本 Agent 发出的消息 ID，用于群聊 reply_to 过滤
         # 619-20: StallWatchdog — 检测 dispatch_loop 假死
         self._last_dispatch_time: float = 0.0
         self._stall_timeout_sec = self.config.get("stall_watchdog_sec", 30.0)
@@ -506,6 +509,13 @@ class AIMClient:
                         # ── 免 LLM 消息：系统通知和确认消息不烧 token ──
                         if self._skip_adapter_for_operational(msg):
                             self.logger.debug(f" [{msg.msg_id[:8]}] 免LLM跳过: from={msg.from_id}")
+                            self.queue.ack(msg.msg_id)
+                            continue
+                        # U-107: 群聊 mute 检测 — 疲劳期不发 adapter
+                        if msg.grp_id and self._is_group_muted(msg.grp_id):
+                            self.logger.debug(f" [{msg.msg_id[:8]}] 🔇 群聊 mute 跳过: {msg.grp_id}")
+                            self._dispatch_event.set()  # 不阻塞后续消息
+                            self.scheduler.on_processing_done()
                             self.queue.ack(msg.msg_id)
                             continue
                         reply = await self._call_adapter(msg)
@@ -728,53 +738,289 @@ class AIMClient:
         count = sum(1 for _, ec in self._degrade_history if ec == 2)
         return count >= DEGRADE_WINDOW_COUNT
 
-    # ── 确认循环检测 ───────────────────────────────
-    CONFIRM_WORDS = {"收到", "1", "✅", "👍", "👂", "收到 ✅", "收到 👍", "ok", "OK", "Ok", "done", "Done", "好", "嗯", "哦", "✓", "✔"}
-    CONFIRM_MAX_LEN = 20
+    # ── 群聊无效沟通检测 ──────────────────────────
+    # 原则：不看字数/关键词，看信息增量。
+    # 无效沟通 = 无新信息 + 无决策/行动 + 无状态变化
+    # 三层判定：L0 礼貌剥离 → L1 内容新意 → L2 连续计数器
+    GRP_FATIGUE_WINDOW = 300      # 追踪窗口（秒），窗口外自动复位
+    GRP_FATIGUE_MAX_EMPTY = 3     # 连续 N 轮无效 → 触发 mute
+    GRP_FATIGUE_MUTE = 60         # mute 时长（秒）
+
+    # L0 礼貌用语剥离表
+    _POLITENESS_STRIP = [
+        # 前缀：确认/收到类
+        r'^(收到|收到了|好的|明白|明白了|了解|了解了|知道|知道了|确认|已收到|已确认|已了解|已阅|收到|OK|ok|Ok)\s*',
+        r'^(收到|看到了)\s*[\u4e00-\u9fff]{1,6}的\s*(反馈|消息|回复|通知|建议|方案|分析|总结|意见|进度|报告|代码)\s*',
+        # 前缀：赞同类
+        r'^[\u4e00-\u9fff]{1,6}的\s*(方案|思路|方向|做法|设计|代码|修复)\s*(很好|不错|可以|没问题)\s*',
+        # 后缀：客气话
+        r'\s*(辛苦了|谢谢|感谢|多谢|没问题|继续保持|随时联系|随时沟通|一起加油|共同努力|我们继续|继续保持|有进展再同步)\s*$',
+        r'\s*[，,][，,\s]*(看起来没问题|感觉没问题|应该没问题|没毛病|可以|行的|👌|✅|👍)\s*$',
+        # 后缀：展望类废话
+        r'\s*[，,]\s*(我们继续|继续保持|再接再厉|稳步推进|有序推进|按计划推进|照计划执行|后续跟进|有问题再沟通)\s*$',
+    ]
+
+    # 技术/行动关键词：出现这些词的消息必定有效
+    # 注意：不含常见于客套语中的词（adapter/修复/方案/设计/架构/Queue/L1/P0等）
+    # 这些词让信息密度检查 + 连续计数器处理
+    _SUBSTANCE_MARKERS = [
+        "http", "P0-", "U-", "T0", "msg_id", "pid", "exit=",
+        "代码", "config", ".py", ".sh", ".md", "shared/", "~/", "NATS",
+        "修改", "部署", "测试", "重启", "联调", "上线", "发布", "推送",
+        "BUG", "bug", "报错", "日志", "log", "错误", "error",
+        "通知", "提交", "commit", "git", "commit:",
+        "版本", "version", "VERSION", "CHANGELOG",
+        "`", "→", "⚠", "🔴", "🟡", "🟢",
+    ]
+
+    # 问题/请求标记：带问号或请求语气的消息有效
+    _REQUEST_MARKERS = ["？", "?", "请", "帮我", "需要", "麻烦", "能否"]
+
+    # 确认类关键词集
+    _ACK_CORE_WORDS = {"收到", "ok", "OK", "Ok", "好的", "明白", "了解", "知道", "1", "确认"}
+
     # U-006: 信号/测试消息关键词 — 不调 adapter，零 token 消耗
-    SIGNAL_PATTERNS = {"TEST-", "TEST_", "LOG-FIX-", "INVOKE-", "STACKTRACE-", "LOCK-TEST", "DEDUP-", "PING", "通信正常", "通道打通", "回执确认", "通道确认"}
+    SIGNAL_PATTERNS = {"TEST-", "TEST_", "LOG-FIX-", "INVOKE-", "STACKTRACE-", "LOCK-TEST", "DEDUP-", "PING", "通信正常", "通道打通", "回执确认", "通道确认", "PONG"}
     # 系统发送者：消息不应经过 LLM
     SYSTEM_SENDERS_SET = {"alertd", "registry", "aim-watch", "observer"}
     # 社交结束语：纯礼貌用语，不需 LLM 处理
     SOCIAL_CLOSE = {"晚安", "再见", "拜拜", "明天见", "辛苦", "好梦", "早点休息", "养足精神"}
 
     def _skip_adapter_for_operational(self, msg) -> bool:
-        """免 LLM：系统通知/确认消息/测试信号/群聊 ACK 不调 adapter，零 token 消耗"""
-        # 系统发送者
+        """免 LLM：系统通知/确认消息/测试信号不调 adapter，零 token 消耗"""
         if msg.from_id in self.SYSTEM_SENDERS_SET:
             return True
         text = (msg.content or "").strip()
-        # 纯确认消息（扩宽到 20 字）
-        if len(text) <= self.CONFIRM_MAX_LEN and (
-            text in self.CONFIRM_WORDS or any(w in text for w in self.CONFIRM_WORDS if len(w) > 1)
-        ):
+        if not text:
             return True
         # 信号/测试消息（零 token）
         if any(p in text for p in self.SIGNAL_PATTERNS):
             return True
-        # 群聊特殊: 以 🐤 或 ✨🐴✨ 开头的短消息 = Agent ACK
-        if msg.grp_id and len(text) <= 60:
-            if text.startswith("🐤") or text.startswith("✨🐴✨") or text.startswith("🐸"):
-                # 检查是否是纯 ACK（不含实质请求）
-                if text in self.CONFIRM_WORDS or any(w in text for w in ("收到", "ok", "OK", "Ok", "1")):
-                    return True
         # 社交结束语（短 + 含结束词）
         if len(text) <= 50 and any(w in text for w in self.SOCIAL_CLOSE):
             return True
+        # 短消息 + 纯确认 → 免 LLM（≤8字，交给 _has_substance 判定）
+        if len(text) <= 8 and not self._has_substance(text):
+            return True
+        return False
+
+    def _init_fatigue_state(self):
+        """U-107: 初始化群聊疲劳检测状态"""
+        import collections
+        self._grp_fatigue: dict = collections.defaultdict(list)  # grp_id → [(ts, is_effective), ...]
+        self._group_muted_until: dict[str, float] = {}  # grp_id → mute_expiry_ts
+        self._ineffective_rounds: dict[str, int] = collections.defaultdict(int)  # grp_id → 连续无效轮数
+        self._grp_recent_texts: dict[str, collections.deque] = collections.defaultdict(
+            lambda: collections.deque(maxlen=5)  # 最近 5 条群聊消息（用于内容新意检查）
+        )
+
+    def _strip_politeness(self, text: str) -> tuple[str, float]:
+        """L0: 剥离礼貌用语，返回 (核心内容, 剥离率)
+        
+        剥离率 = 被移除字符数 / 原始长度。>0.5 表示大部分是客套。
+        """
+        import re as _re
+        t = text.strip()
+        orig_len = len(t)
+        if orig_len == 0:
+            return "", 1.0
+        # 移除 emoji 前缀装饰
+        t = _re.sub(r'^[🐸🐴🐤✨👂🤝🦊🤖📋📊📡🛡️🔧⚙️🎯💡\s]+', '', t)
+        # 逐条应用剥离规则
+        for pat in self._POLITENESS_STRIP:
+            t = _re.sub(pat, '', t).strip()
+        stripped_len = len(t)
+        ratio = (orig_len - stripped_len) / orig_len if orig_len > 0 else 1.0
+        return t, ratio
+
+    def _has_substance(self, text: str) -> bool:
+        """判定消息是否有实质内容。
+        
+        原则（大哥 2026-06-21）：不看字数，看信息增量。
+        默认无效 — 只有包含具体信息的才算有效。
+        30字 "收到你的反馈，我们继续推进" = 无效。
+        15字 "P0-005 死锁，exit=2" = 有效。
+        """
+        import re as _re
+        t = text.strip()
+        if not t:
+            return False
+
+        # ── 正向信号：包含任一则有效 ──
+        # 1) 具体技术标记（ID/路径/代码/版本）
+        for marker in self._SUBSTANCE_MARKERS:
+            if marker in t:
+                return True
+        # 2) 含数字（15项、3轮、v1.3）
+        if _re.search(r'\d+', t):
+            return True
+        # 3) 含问句/请求
+        for marker in self._REQUEST_MARKERS:
+            if marker in t:
+                return True
+        if _re.search(r'[？?]', t):
+            return True
+        # 4) 含决策/行动动词（在具体语境中）
+        if _re.search(r'(采用|确定|选择|改为|按照|决定|分配|认领|负责|指派|修改|部署|重启|提交|推送|联调|上线|发布)', t):
+            return True
+        # 5) 含完成/状态变化
+        if _re.search(r'(完成|✅|通过|交付|验证|修了|修好|改好|调通|OK|OK了|好了|搞定了)', t):
+            return True
+        # 6) 含错误/异常
+        if _re.search(r'(BUG|bug|error|Error|报错|错误|异常|失败|超时|死锁|卡住|挂了)', t):
+            return True
+
+        # ── 负向信号：明确无效的模式 ──
+        # 短确认词
+        if len(t) <= 4:
+            stripped = t.rstrip('，,。.!！?？✅👍👌✨，。')
+            if stripped in self._ACK_CORE_WORDS:
+                return False
+
+        # 剥离礼貌用语
+        core, ratio = self._strip_politeness(t)
+
+        # 剥离率很高的 → 几乎全是客套
+        if ratio > 0.5 and len(core) < 20:
+            return False
+
+        # 剥离后是纯确认词
+        if core in self._ACK_CORE_WORDS:
+            return False
+        if len(core) <= 6 and any(w in core for w in self._ACK_CORE_WORDS if len(w) > 1):
+            return False
+
+        # 剥离后纯标点/空白 → 无效
+        core_no_punct = _re.sub(r'[\s，,。.!！?？、：:；;…\.\-－—─~～·•]', '', core)
+        if len(core_no_punct) < 4:
+            return False
+
+        # 长消息但无上述任何具体信息 → 很可能是客套（AI 之间的礼貌循环）
+        # 默认无效：AI 之间没有具体信息的交流就是无效沟通
+        return False
+
+    def _content_novelty(self, grp_id: str, text: str) -> float:
+        """L1: 内容新意检查。返回 0.0~1.0，值越高越有新意。
+        
+        与群聊最近消息做 trigram 相似度对比。
+        < 0.3 = 高度重复（回声/鹦鹉），>0.6 = 有新意。
+        """
+        import re as _re
+        t = _re.sub(r'[🐸🐴🐤✨👂🤝\s]', '', text.strip())
+        if len(t) < 6:
+            return 0.5  # 太短无法判断，中性
+        recent = list(self._grp_recent_texts.get(grp_id, []))
+        if not recent:
+            return 1.0  # 没有历史，视为新
+        # trigram 集合
+        def _trigrams(s):
+            return {s[i:i+3] for i in range(len(s)-2)}
+        t_tri = _trigrams(t)
+        if not t_tri:
+            return 1.0
+        max_sim = 0.0
+        for past in recent:
+            p_tri = _trigrams(_re.sub(r'[🐸🐴🐤✨👂🤝\s]', '', past.strip()))
+            if not p_tri:
+                continue
+            overlap = len(t_tri & p_tri)
+            union = len(t_tri | p_tri)
+            sim = overlap / union if union > 0 else 0.0
+            if sim > max_sim:
+                max_sim = sim
+        return 1.0 - max_sim  # 新意 = 1 - 最大相似度
+
+    def _is_ineffective(self, grp_id: str, text: str) -> bool:
+        """群聊消息无效判定
+        
+        原则：不看字数/关键词，看信息增量。
+        _has_substance 是唯一权威判定。新意检查仅用于确认回声。
+        """
+        if not text or not text.strip():
+            return True
+        # 主判定：_has_substance
+        if self._has_substance(text):
+            return False  # 有实质 → 有效
+        # 无实质 → 无效（新意检查仅用于日志，不覆盖判定）
+        # 例外：极短确认（≤4字）不计数 — 这些走 _skip_adapter_for_operational
+        if len(text.strip()) <= 4:
+            return False  # 太短不计数，避免 "收到" 触发疲劳
+        self.logger.debug(f" [INEFFECTIVE] 无实质内容: {text[:60]}")
+        return True
+
+    def _record_grp_msg(self, grp_id: str, text: str):
+        """记录群聊消息（用于内容新意对比）"""
+        self._grp_recent_texts[grp_id].append(text.strip())
+
+    def _record_grp_reply(self, group_id: str, reply: str, is_effective: bool):
+        """U-107: 记录群聊回复，追踪连续无效轮数"""
+        now = time.time()
+        self._grp_fatigue[group_id].append((now, is_effective))
+        # 清理过期记录
+        cutoff = now - self.GRP_FATIGUE_WINDOW
+        self._grp_fatigue[group_id] = [
+            (ts, eff) for ts, eff in self._grp_fatigue[group_id] if ts > cutoff
+        ]
+        if len(self._grp_fatigue[group_id]) > 50:
+            self._grp_fatigue[group_id] = self._grp_fatigue[group_id][-30:]
+        # 更新连续无效计数
+        if not is_effective:
+            self._ineffective_rounds[group_id] = self._ineffective_rounds.get(group_id, 0) + 1
+        else:
+            self._ineffective_rounds[group_id] = 0  # 有效回复 → 归零
+
+    def _grp_is_fatigued(self, group_id: str) -> bool:
+        """U-107: 群聊是否已进入无效沟通循环 → 应 mute"""
+        rounds = self._ineffective_rounds.get(group_id, 0)
+        if rounds < self.GRP_FATIGUE_MAX_EMPTY:
+            return False
+        # 检查 mute 冷却
+        now = time.time()
+        muted_until = self._group_muted_until.get(group_id, 0)
+        if now < muted_until:
+            return True  # 仍在 mute
+        # 触发 mute
+        self._group_muted_until[group_id] = now + self.GRP_FATIGUE_MUTE
+        self._ineffective_rounds[group_id] = 0
+        self.logger.warning(
+            f"⛔ 群聊无效沟通 mute: {group_id} "
+            f"(连续 {rounds} 轮无效 → mute {self.GRP_FATIGUE_MUTE}s, 到 {now + self.GRP_FATIGUE_MUTE:.0f})"
+        )
+        return True
+
+    def _is_group_muted(self, group_id: str) -> bool:
+        """检查群聊是否在 mute 中"""
+        muted_until = self._group_muted_until.get(group_id, 0)
+        if time.time() < muted_until:
+            return True
+        # mute 过期自动清理
+        if muted_until > 0:
+            del self._group_muted_until[group_id]
+            self.logger.info(f"🔇 群聊 mute 到期: {group_id}")
         return False
 
     def _is_confirm_loop(self, msg, reply: str) -> bool:
-        """检测群聊确认死锁：入站是简短确认 + 出站也是简短确认 → 跳过回复"""
+        """检测群聊确认死锁：疲劳检测 → mute 60s
+        
+        新原则（2026-06-21 大哥）：不看字数/关键词，看信息增量。
+        30-100字的「收到+客气话」同样判定为无效。
+        """
+        if not msg.grp_id:
+            return False
         in_text = (msg.content or "").strip()
         out_text = reply.strip()
-        # 入站和出站都是确认
-        in_confirm = len(in_text) <= self.CONFIRM_MAX_LEN and (
-            in_text in self.CONFIRM_WORDS or any(w in in_text for w in self.CONFIRM_WORDS if len(w) > 1)
-        )
-        out_confirm = len(out_text) <= self.CONFIRM_MAX_LEN and (
-            out_text in self.CONFIRM_WORDS or any(w in out_text for w in self.CONFIRM_WORDS if len(w) > 1)
-        )
-        return in_confirm and out_confirm
+        # 入站消息记录到内容历史
+        self._record_grp_msg(msg.grp_id, in_text)
+        # 出站回复判定
+        is_effective = not self._is_ineffective(msg.grp_id, out_text)
+        self._record_grp_reply(msg.grp_id, out_text, is_effective)
+        if self._grp_is_fatigued(msg.grp_id):
+            self.logger.info(
+                f" [{msg.msg_id[:8]}] ⛔ 群聊疲劳 mute: {msg.grp_id} "
+                f"(连续 {self.GRP_FATIGUE_MAX_EMPTY} 轮无效, mute {self.GRP_FATIGUE_MUTE}s)"
+            )
+            return True
+        return False
 
     async def _call_adapter_recover(self) -> bool:
         """Call adapter.sh recover, returns True if backend recovered.
@@ -1033,7 +1279,7 @@ class AIMClient:
         if from_id == self.agent_id:
             return
         detail = f"from={from_id}" + (f" text={obs_text}" if obs_text else "")
-        await self.transport.emit_obs("received", mid, detail)
+        # await self.transport.emit_obs("received", mid, detail)  # 2026-06-21 禁用以省带宽
         await self._handle_message(envelope, is_dm=True)
 
     async def _on_grp(self, envelope: dict, raw_msg):
@@ -1045,7 +1291,7 @@ class AIMClient:
         if from_id == self.agent_id:
             return
         detail = f"from={from_id}" + (f" text={obs_text}" if obs_text else "")
-        await self.transport.emit_obs("received", mid, detail)
+        # await self.transport.emit_obs("received", mid, detail)  # 2026-06-21 禁用以省带宽
         await self._handle_message(envelope, is_dm=False)
 
     async def _handle_message(self, envelope: dict, *, is_dm: bool):
@@ -1087,6 +1333,14 @@ class AIMClient:
         if not from_id:
             return
         msg_id = envelope.get("id", str(uuid.uuid4()))
+
+        # ── U-007: 群聊 reply_to 过滤 ──
+        # 群聊消息若明确回复他人消息，而我方未发过该消息 → 跳过 dispatch（只 observe）
+        if not is_dm:
+            reply_to = (envelope.get("meta") or {}).get("reply_to", "")
+            if reply_to and reply_to not in self._my_msg_ids:
+                self.logger.debug(f" [GRP-FILTER] reply_to={reply_to[:8]} 非我方消息, 跳过 dispatch")
+                return
 
         # 安全过滤 — 认证链
         if not await self.security.authenticate(from_id, token=payload.get("token", ""), msg_id=msg_id, envelope=envelope):

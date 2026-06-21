@@ -208,62 +208,6 @@ def parse_message(data: bytes | str) -> Dict[str, Any]:
     return json.loads(data)
 
 
-# ── Envelope 校验（Veritas v1.0 准入） ─────────────────
-
-# 硬伤：不合规直接拒绝
-ENVELOPE_HARD_KEYS = {"ver", "from", "payload"}
-# 软伤：warn 但过渡期继续处理
-ENVELOPE_SOFT_KEYS = {"payload.text"}
-# 过渡期容错映射：旧字段名 → 标准字段名
-ENVELOPE_ALIAS_MAP = {"content": "payload.text", "text": "payload.text"}
-
-def validate_envelope(envelope: dict) -> tuple[bool, list[str], list[str]]:
-    """校验 AIM v1.0 消息信封格式。
-
-    Returns:
-        (passed, hard_errors, soft_warnings)
-        - hard_errors: 致命问题，消息应被拒绝
-        - soft_warnings: 可容错问题，过渡期 warn 但继续处理
-    """
-    hard = []
-    soft = []
-
-    if not isinstance(envelope, dict):
-        return False, ["not a JSON object"], []
-
-    # ── 硬伤检查 ──
-    for key in ENVELOPE_HARD_KEYS:
-        if key not in envelope:
-            hard.append(f"missing required field: {key}")
-
-    # payload 类型检查
-    if "payload" in envelope:
-        payload = envelope["payload"]
-        if isinstance(payload, str):
-            # 容错：payload 是裸字符串 → 包装为 {"text": payload}
-            soft.append("payload is string, wrapping as payload.text")
-            envelope["payload"] = {"text": payload}
-        elif not isinstance(payload, dict):
-            hard.append("payload must be a JSON object or string")
-
-    # ── 软伤检查 ──
-    if "payload" in envelope and isinstance(envelope["payload"], dict):
-        payload = envelope["payload"]
-        if "text" not in payload:
-            # 尝试容错：旧字段名映射
-            found_alias = False
-            for alias, target in ENVELOPE_ALIAS_MAP.items():
-                if alias in payload:
-                    soft.append(f"using alias '{alias}' instead of '{target}'")
-                    payload["text"] = payload.pop(alias)
-                    found_alias = True
-                    break
-            if not found_alias:
-                soft.append("payload missing 'text' field")
-
-    return len(hard) == 0, hard, soft
-
-
 # ════════════════════════════════════════════════════════════════════
 #  Subject 命名
 # ════════════════════════════════════════════════════════════════════
@@ -1142,6 +1086,7 @@ class AIMNATSClient:
             "reconnect_time_wait": 2,
             "ping_interval": 30,
             "max_outstanding_pings": 5,
+            "drain_timeout": 5,
             "name": f"AIM-{self.agent_id}",
             "error_cb": self._on_nats_error,
             "disconnected_cb": self._on_nats_disconnected,
@@ -1260,11 +1205,8 @@ class AIMNATSClient:
             pass
         if self.nc:
             try:
-                await asyncio.wait_for(self.nc.drain(), timeout=5.0)
+                await self.nc.drain()
                 log.info(f"🔌 [{self.agent_id}] disconnected")
-            except asyncio.TimeoutError:
-                log.warning(f"🔌 [{self.agent_id}] drain timeout, force close")
-                await self.nc.close()
             except Exception as e:
                 log.debug(f"🔌 [{self.agent_id}] disconnect error: {e}")
 
@@ -1443,15 +1385,6 @@ class AIMNATSClient:
         async def _cb(msg):
             try:
                 envelope = parse_message(msg.data)
-                # ── Envelope 准入校验 ──
-                ok, hard, soft = validate_envelope(envelope)
-                if not ok:
-                    log.warning(f"[{self.agent_id}] 消息格式校验失败 (硬伤): {hard}")
-                    self._emit_validation_alert(envelope, hard, soft)
-                    return  # 拒绝处理
-                if soft:
-                    log.info(f"[{self.agent_id}] 消息格式偏差 (软伤/已容错): {soft}")
-                    self._emit_validation_alert(envelope, hard, soft)
                 msg_id = envelope.get("id", "")
                 # Pin 去重：如果已处理过则跳过
                 if msg_id and await self.pin.is_duplicate(msg_id):
@@ -1470,14 +1403,6 @@ class AIMNATSClient:
         async def _cb(msg):
             try:
                 parsed = parse_message(msg.data)
-                # ── Envelope 准入校验 ──
-                ok, hard, soft = validate_envelope(parsed)
-                if not ok:
-                    log.warning(f"[{self.agent_id}] DM 消息格式校验失败 (硬伤): {hard}")
-                    self._emit_validation_alert(parsed, hard, soft)
-                    return  # 拒绝处理
-                if soft:
-                    log.info(f"[{self.agent_id}] DM 消息格式偏差 (软伤/已容错): {soft}")
                 msg_id = parsed.get("id", "")
                 if msg_id and await self.pin.is_duplicate(msg_id):
                     return
@@ -1496,14 +1421,6 @@ class AIMNATSClient:
         async def _cb(msg):
             try:
                 parsed = parse_message(msg.data)
-                # ── Envelope 准入校验 ──
-                ok, hard, soft = validate_envelope(parsed)
-                if not ok:
-                    log.warning(f"[{self.agent_id}] GRP 消息格式校验失败 (硬伤): {hard}")
-                    self._emit_validation_alert(parsed, hard, soft)
-                    return  # 拒绝处理
-                if soft:
-                    log.info(f"[{self.agent_id}] GRP 消息格式偏差 (软伤/已容错): {soft}")
                 msg_id = parsed.get("id", "")
                 if msg_id and await self.pin.is_duplicate(msg_id):
                     return
@@ -1713,15 +1630,6 @@ class AIMNATSClient:
 
         return js_ok
 
-    def _emit_validation_alert(self, envelope: dict, hard: list[str], soft: list[str]):
-        """Log envelope validation failures (log-only, no observer emit)."""
-        try:
-            from_id = envelope.get("from", "unknown") if isinstance(envelope, dict) else "unknown"
-            detail = "; ".join(hard + soft)
-            log.warning(f"[{self.agent_id}] envelope_invalid from={from_id}: {detail}")
-        except Exception:
-            pass
-
     async def emit_obs(self, status: str, msg_id: str = "", detail: str = "",
                        use_jetstream: bool = True):
         """发布 Observer 状态事件（支持限流 + JetStream 持久化）
@@ -1748,8 +1656,11 @@ class AIMNATSClient:
         data = json.dumps(event, ensure_ascii=False).encode()
 
         # 双发策略：JS 持久化（历史回放） + raw 实时（observer/aim-watch 订阅）
+        # U-006: "received" 是瞬时状态事件，不需要 JS 持久化，只发 raw
+        is_transient = status in ("received", "heartbeat", "delivered")
+        import logging as _jjjlog; _jjjlog.getLogger("aim_nats_sdk").debug(f"[BOOM] status={status} transient={is_transient} js_pub={use_jetstream and self.js and not is_transient}")
         js_ok = False
-        if use_jetstream and self.js:
+        if use_jetstream and self.js and not is_transient:
             try:
                 headers = {"Nats-Msg-Id": f"obs-{self.agent_id}-{status}-{int(time.time()*1000)}"}
                 ack = await self.js.publish(subject, data, headers=headers)
@@ -2209,6 +2120,7 @@ class AIMObserverClient:
             "reconnect_time_wait": 2,
             "ping_interval": 30,
             "max_outstanding_pings": 5,
+            "drain_timeout": 5,
             "name": f"OBS-{self.observer_id}",
         }
         if self.credentials:
@@ -2338,10 +2250,7 @@ class AIMObserverClient:
             task.cancel()
         self._worker_tasks.clear()
         if self.nc:
-            try:
-                await asyncio.wait_for(self.nc.close(), timeout=3.0)
-            except (asyncio.TimeoutError, Exception):
-                pass  # 强制断开，防止 drain hang
+            await self.nc.close()
 
     @property
     def is_connected(self) -> bool:

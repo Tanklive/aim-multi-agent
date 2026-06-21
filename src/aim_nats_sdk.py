@@ -1658,6 +1658,7 @@ class AIMNATSClient:
         # 双发策略：JS 持久化（历史回放） + raw 实时（observer/aim-watch 订阅）
         # U-006: "received" 是瞬时状态事件，不需要 JS 持久化，只发 raw
         is_transient = status in ("received", "heartbeat", "delivered")
+        import logging as _jjjlog; _jjjlog.getLogger("aim_nats_sdk").debug(f"[BOOM] status={status} transient={is_transient} js_pub={use_jetstream and self.js and not is_transient}")
         js_ok = False
         if use_jetstream and self.js and not is_transient:
             try:

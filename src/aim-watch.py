@@ -238,6 +238,7 @@ class WatchDisplay:
         framework = event.get("framework", "")
 
         # 去重：SDK emit_obs 双发(JS+raw)导致重复 — 用 nonce 精确去重
+        msg_id = event.get("msg_id", "")
         nonce = event.get("nonce", "")
         dedup_key = (agent_id, nonce) if nonce else (agent_id, msg_id, status, int(event.get("ts", 0) * 10))
         if dedup_key in self._seen_events:
@@ -259,9 +260,11 @@ class WatchDisplay:
         if not self.show_heartbeat and status in SILENT_STATUSES:
             return
 
-        # 频道过滤：observer received 事件在 dm-only/grp-only 模式不显示
-        # 正文由 _show_message 正确按频道过滤显示
-        if self.channel_filter and status == "received":
+        # Observer received 事件在所有模式下隐藏
+        # 原因：_show_message 已从 direct NATS 消息显示完整内容
+        # received 事件的 from_id=原始发送者 → 即使来自不同 observer，显示也完全一样
+        # 保留 delivered/ai_*/heartbeat 等有用事件，只屏蔽纯冗余的 received
+        if status == "received":
             return
 
         self.displayed_events += 1

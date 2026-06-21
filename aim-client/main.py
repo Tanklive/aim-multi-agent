@@ -12,13 +12,21 @@ OAS 基础设施核心组件。
     ├── Queue+Scheduler+HealthProbe (Phase 0 内嵌)
     └── Adapter (call adapter.sh)
 
-Phase 1 (当前):
-  - 独立进程，launchd 保活
+Phase 2 (当前):
+  - 自托管进程：daemonize + auto-restart，不依赖系统 launchd
+  - 每 Agent 一个独立进程，由 agent_id 标识
+  - 安装即服务：aim-client/main.py --agent-id ZS0001 --config ... 直接后台运行
   - Transport 7 方法接口
   - Agent Card v1
   - Message/Task 分层 (AIMChat + AIMTask)
 启动:
     python3 aim-client/main.py --agent-id ZS0001 --config ~/.aim/agents/ZS0001/config.json
+    # 默认 daemonize（后台），--foreground 前台调试
+
+守护进程标准:
+  - pidfile: ~/.aim/run/aim-client-{agent_id}.pid
+  - lock:    ~/.aim/run/aim-client-{agent_id}.lock (SingleInstance)
+  - auto-restart: 异常退出自动重拉（指数退避 max 60s）
 
 依赖:
     - ~/.aim/bin/aim_nats_sdk.py (SDK)
@@ -210,6 +218,7 @@ class Transport:
         from aim_nats_sdk import AIMNATSClient
         self.agent_id = agent_id
         self._logger = logging.getLogger("aim-client.transport")
+        self._my_msg_ids: set = set()  # U-007: 追踪本 Agent 发出的消息 ID
         creds_path = Path.home() / ".aim" / "agents" / agent_id / "aim.creds"
         self._sdk = AIMNATSClient(
             agent_id=agent_id,
@@ -606,10 +615,11 @@ class AIMClient:
     async def start(self):
         if not self.lock.acquire():
             self.logger.error("另一个 aim-client 已在运行")
-            sys.exit(1)
+            raise SystemExit(1)
 
         atexit.register(self.lock.release)
-        signal.signal(signal.SIGTERM, lambda *_: self._shutdown())
+        signal.signal(signal.SIGINT, lambda *_: self._shutdown())
+        signal.signal(signal.SIGTERM, self._handle_sigterm)
         signal.signal(signal.SIGALRM, lambda *_: os._exit(0))  # P2: drain timeout 兜底
         self._reload_flag = False
         signal.signal(signal.SIGHUP, lambda *_: setattr(self, '_reload_flag', True))  # 619-09
@@ -778,6 +788,28 @@ class AIMClient:
 
     # 确认类关键词集
     _ACK_CORE_WORDS = {"收到", "ok", "OK", "Ok", "好的", "明白", "了解", "知道", "1", "确认"}
+    # L1 反信号模式（吉量方案 §2）：确认循环/状态同步
+    _ANTI_SIGNAL_PATTERNS = [
+        r'收到.*确认',
+        r'都(在|跑|齐|到位)了',
+        r'(继续干活|随时待命|状态正常|一切正常|待命中?|等指令)',
+        r'(三兄弟|三(方|向)).*(齐|通|正常|到位)',
+        r'有(活|任务|需要).*(喊|叫|招呼|同步)',
+    ]
+    # L3 消息分类（吉量方案 §3.2）
+    _INFO_PATTERNS = [
+        r'^(收到|看到了).*(确认|状态|情况|报告)',
+        r'(一切|状态|系统|链路|通道).*(正常|畅通|恢复|OK|ok)',
+        r'都(在|跑|齐|到位|上线)了',
+        r'(待命中?|等指令|随时待命|继续干活)',
+        r'(三兄弟|三方).*(齐|通|正常|到位)',
+        r'(没有|暂无|没).*(任务|工作|问题|异常)',
+        r'有(活|任务|需要).*(喊|叫|招呼|同步)',
+    ]
+    _INFO_CORE_WORDS = {
+        "收到", "确认", "待命", "待命中", "正常", "畅通", "没问题",
+        "没问题了", "没任务", "暂无", "暂时没有", "没有",
+    }
 
     # U-006: 信号/测试消息关键词 — 不调 adapter，零 token 消耗
     SIGNAL_PATTERNS = {"TEST-", "TEST_", "LOG-FIX-", "INVOKE-", "STACKTRACE-", "LOCK-TEST", "DEDUP-", "PING", "通信正常", "通道打通", "回执确认", "通道确认", "PONG"}
@@ -802,6 +834,16 @@ class AIMClient:
         # 短消息 + 纯确认 → 免 LLM（≤8字，交给 _has_substance 判定）
         if len(text) <= 8 and not self._has_substance(text):
             return True
+
+        # L3 前置分类（吉量方案 §3.2 + 火鸡儿 P0）：群聊 INFO/ACK 不进 adapter
+        if msg.grp_id:
+            msg_type = self._classify_msg_type(text)
+            if msg_type in ('INFO', 'ACK'):
+                self.logger.debug(
+                    f" [L3-{msg_type}] from={msg.from_id} text={text[:40]}"
+                )
+                return True
+
         return False
 
     def _init_fatigue_state(self):
@@ -930,21 +972,110 @@ class AIMClient:
                 max_sim = sim
         return 1.0 - max_sim  # 新意 = 1 - 最大相似度
 
+    def _match_anti_signal(self, text: str) -> bool:
+        """检测是否匹配反信号模式（确认循环/状态同步）。
+        
+        火鸡儿反馈：反信号不判死，降权使用。
+        匹配反信号 → _is_ineffective 要求更强正向信号才能通过。
+        """
+        import re as _re
+        for pat in self._ANTI_SIGNAL_PATTERNS:
+            if _re.search(pat, text):
+                return True
+        return False
+
+    def _has_strong_substance(self, text: str) -> bool:
+        """检查是否有强正向信号（数字/错误/TASK/问句/决策动词）。
+        
+        用于反信号降权：匹配反信号的消息需要强信号才能通过。
+        强信号包括：数字、错误关键词、明确TASK动词、问句。
+        """
+        import re as _re
+        if _re.search(r'\d+', text):
+            return True
+        if _re.search(r'(BUG|bug|error|Error|报错|错误|异常|失败|超时|死锁|卡住|挂了)', text):
+            return True
+        if _re.search(r'(分配|认领|负责|指派|修改|部署|重启|提交|推送|联调|上线|发布|修了|修好|改好|调通)', text):
+            return True
+        if _re.search(r'[？?]', text):
+            return True
+        if _re.search(r'(采用|确定|选择|改为|按照|决定)', text):
+            return True
+        return False
+
+    def _classify_msg_type(self, text: str) -> str:
+        """L3 消息分类：TASK / DISCUSSION / INFO / ACK
+        
+        吉量方案 §3.2：用于 _skip_adapter_for_operational 前置拦截。
+        INFO/ACK → 跳过 adapter；TASK/DISCUSSION → 正常处理。
+        """
+        import re as _re
+        core, ratio = self._strip_politeness(text)
+
+        # ACK: 剥离后纯确认词
+        core_stripped = core.rstrip('，,。.!！?？✅👍👌✨🐸🐴🐤')
+        if len(core_stripped) <= 8 and core_stripped in self._ACK_CORE_WORDS:
+            return 'ACK'
+        if len(core_stripped) <= 6:
+            stripped = _re.sub(r'[\s，,。.!！?？、：:；;…]', '', core_stripped)
+            if stripped in self._INFO_CORE_WORDS:
+                return 'ACK'
+
+        # INFO: 匹配状态同步模式 → 二次校验有实质内容不拦截
+        # 吉量反馈：例「一切正常但有个 bug」← pattern 命中但有实质 → 不归 INFO
+        for pat in self._INFO_PATTERNS:
+            if _re.search(pat, core):
+                if not self._has_substance(text):
+                    return 'INFO'
+                break  # 有实质 → 跳出，让后续 TASK/DISCUSSION 判断
+
+        # 高礼貌剥离率 + 无实质 → INFO
+        if ratio > 0.4 and not self._has_substance(text):
+            return 'INFO'
+
+        # TASK: 有具体待办
+        if _re.search(r'(请|帮我|需要|能否|麻烦).*(做|处理|修|查|部署|提交|测试|联调)', core):
+            return 'TASK'
+        if _re.search(r'TODO|FIXME|待办|任务|分配', core):
+            return 'TASK'
+
+        # DISCUSSION: 需要讨论
+        if _re.search(r'[？?]', core) or _re.search(r'(怎么|如何|为什么|能不能|要不要)', core):
+            return 'DISCUSSION'
+
+        # 默认
+        if self._has_substance(text):
+            return 'DISCUSSION'
+        return 'INFO'
+
     def _is_ineffective(self, grp_id: str, text: str) -> bool:
         """群聊消息无效判定
         
         原则：不看字数/关键词，看信息增量。
-        _has_substance 是唯一权威判定。新意检查仅用于确认回声。
+        _has_substance 是主判定。反信号降权（火鸡儿反馈）。
         """
         if not text or not text.strip():
             return True
-        # 主判定：_has_substance
-        if self._has_substance(text):
-            return False  # 有实质 → 有效
-        # 无实质 → 无效（新意检查仅用于日志，不覆盖判定）
-        # 例外：极短确认（≤4字）不计数 — 这些走 _skip_adapter_for_operational
+
+        has_subs = self._has_substance(text)
+        anti_hit = self._match_anti_signal(text)
+
+        # 有实质 + 无反信号 → 有效
+        if has_subs and not anti_hit:
+            return False
+
+        # 有实质 + 反信号降权 → 需要强信号验证
+        # 例："收到，3 项 P0 全部通过 ✅" → 有数字+完成 → 通过
+        # 例："收到确认，三方互通正常 ✨" → 无强信号 → 无效
+        if has_subs and anti_hit:
+            if self._has_strong_substance(text):
+                return False
+            self.logger.debug(f" [INEFFECTIVE] 反信号降权: {text[:60]}")
+            return True
+
+        # 无实质 → 无效
         if len(text.strip()) <= 4:
-            return False  # 太短不计数，避免 "收到" 触发疲劳
+            return False
         self.logger.debug(f" [INEFFECTIVE] 无实质内容: {text[:60]}")
         return True
 
@@ -1452,10 +1583,17 @@ class AIMClient:
             self.logger.error(f"🔄 [619-09] 配置重载失败: {e}")
 
     def _shutdown(self):
-        self.logger.info("收到终止信号，正在退出...")
+        """SIGINT 处理：正常退出（watchdog 不重拉）"""
+        self.logger.info("收到 SIGINT，正常退出...")
         self.running = False
-        # P2: 5s 安全网，防止 drain hang 导致僵尸
         signal.alarm(10)
+
+    def _handle_sigterm(self, signum, frame):
+        """SIGTERM 处理：异常退出（watchdog 自动重拉）"""
+        self.logger.info("收到 SIGTERM，异常退出（watchdog 重拉）")
+        self.running = False
+        signal.alarm(10)
+        os._exit(1)  # 非零退出码 → watchdog 判定异常 → 重拉
 
     async def close(self):
         self.running = False
@@ -1516,6 +1654,121 @@ async def _run_services(args):
                 pass
 
 
+# ═══════════════════════════════════════════════
+# 守护进程化 (Phase 2: 自托管)
+# ═══════════════════════════════════════════════
+
+PID_DIR = Path.home() / ".aim" / "run"
+PID_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _pidfile_path(agent_id: str) -> Path:
+    return PID_DIR / f"aim-client-{agent_id}.pid"
+
+
+def _write_pidfile(agent_id: str, pid: int) -> None:
+    _pidfile_path(agent_id).write_text(str(pid))
+
+
+def _remove_pidfile(agent_id: str) -> None:
+    _pidfile_path(agent_id).unlink(missing_ok=True)
+
+
+def _read_pidfile(agent_id: str) -> Optional[int]:
+    """读取 pidfile，验证进程是否存活"""
+    pf = _pidfile_path(agent_id)
+    if not pf.exists():
+        return None
+    try:
+        pid = int(pf.read_text().strip())
+        os.kill(pid, 0)
+        return pid
+    except (ValueError, OSError):
+        pf.unlink(missing_ok=True)
+        return None
+
+
+def daemonize_with_watchdog(agent_id: str, config_path: str) -> None:
+    """自托管守护进程：parent=watchdog, child=daemon.
+
+    父进程：轻量 watchdog，监控子进程，异常退出自动重拉。
+    子进程：实际 AIM client daemon。
+
+    结构:
+        aim-client (启动进程)
+          → fork → parent (watchdog loop, PID 写入 pidfile)
+                     → child (AIMClient.start(), 异常退出 → parent 重拉)
+
+    pidfile: ~/.aim/run/aim-client-{agent_id}.pid (记录 watchdog PID)
+    lock:    ~/.aim/run/aim-client-{agent_id}.lock (记录 daemon 子进程 PID)
+    """
+    # 0: 防重复
+    existing = _read_pidfile(agent_id)
+    if existing:
+        print(f"[aim-client] {agent_id} watchdog 已在运行 (PID {existing})，跳过", file=sys.stderr)
+        sys.exit(0)
+
+    # 1: fork → parent=watchdog, child=daemon
+    os.environ["AIM_DAEMON_CHILD"] = "1"  # 标记：子进程是 daemon，不走 watchdog 逻辑
+    pid = os.fork()
+    if pid > 0:
+        # ===== watchdog (父进程) =====
+        child_pid = pid
+        _write_pidfile(agent_id, os.getpid())
+        print(f"[aim-client] {agent_id} watchdog PID {os.getpid()}, daemon PID {child_pid}", file=sys.stderr)
+
+        # 脱离终端
+        os.setsid()
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in (sys.stdin.fileno(), sys.stdout.fileno(), sys.stderr.fileno()):
+            os.dup2(devnull, fd)
+        os.close(devnull)
+
+        # watchdog 主循环：监控子进程，异常退出自动重拉
+        backoff = 1
+        max_backoff = 60
+
+        while True:
+            try:
+                _, status = os.waitpid(child_pid, 0)
+            except (ChildProcessError, OSError):
+                break
+
+            if os.WIFEXITED(status):
+                exit_code = os.WEXITSTATUS(status)
+            elif os.WIFSIGNALED(status):
+                exit_code = -(os.WTERMSIG(status))
+            else:
+                exit_code = -1
+
+            if exit_code == 0:
+                print(f"[aim-client] {agent_id} daemon 正常退出", file=sys.stderr)
+                break
+
+            # 异常退出 → 重拉（exec 新进程以加载最新代码）
+            time.sleep(min(backoff, max_backoff))
+            backoff = min(backoff * 2, max_backoff)
+
+            child_pid = os.fork()
+            if child_pid == 0:
+                # 子进程：exec 自身以重新加载源码
+                script_path = str(Path(__file__).resolve())
+                os.execve(sys.executable,
+                          [sys.executable, "-u", script_path] + sys.argv[1:],
+                          dict(os.environ, AIM_DAEMON_CHILD="1"))
+
+        _remove_pidfile(agent_id)
+        sys.exit(0)
+
+    # ===== daemon 子进程 =====
+    # exec 自身以重新加载源码（避免继承 watchdog 内存中的旧代码）
+    script_path = str(Path(__file__).resolve())
+    os.chdir("/")
+    os.execve(sys.executable,
+              [sys.executable, "-u", script_path] + sys.argv[1:],
+              dict(os.environ, AIM_DAEMON_CHILD="1"))
+
+
 def main():
     parser = argparse.ArgumentParser(description=f"AIM Client -- 统一通信终端 v{_AIM_VERSION}")
     parser.add_argument("--agent-id", required=True, help="Agent ID")
@@ -1525,17 +1778,34 @@ def main():
     parser.add_argument("--services", action="store_true", default=False,
                        help="同时启动 Registry + GroupAdmission 服务")
     parser.add_argument("--credentials", default="", help="NATS credentials file")
+    parser.add_argument("--foreground", action="store_true", default=False,
+                       help="前台运行（调试用，默认 watchdog+daemonize）")
     args = parser.parse_args()
 
     if args.mode == "service" or args.services:
         asyncio.run(_run_services(args))
         return
 
+    # Phase 2: 自托管 = watchdog(parent) + daemon(child)
+    if not args.foreground and not os.environ.get("AIM_DAEMON_CHILD"):
+        daemonize_with_watchdog(args.agent_id, args.config)
+        # 到这里的是 daemon 子进程（exec 重新加载了源码）
+
+    # daemon 子进程：脱离终端
+    if os.environ.get("AIM_DAEMON_CHILD"):
+        os.chdir("/")
+        os.umask(0o027)
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in (sys.stdin.fileno(), sys.stdout.fileno(), sys.stderr.fileno()):
+            os.dup2(devnull, fd)
+        os.close(devnull)
+
+    # 运行 AIM client（daemon 子进程直接运行）
     client = AIMClient(args.config)
     try:
         asyncio.run(client.start())
     except KeyboardInterrupt:
-        print(f"\n[aim-client] {args.agent_id} 中断")
+        print(f"\n[aim-client] {args.agent_id} 中断", file=sys.stderr)
     finally:
         try:
             asyncio.run(client.close())

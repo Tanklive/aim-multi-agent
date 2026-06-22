@@ -1,7 +1,9 @@
 #!/bin/bash
-set -euo pipefail
+set -eu
+# v1.12.0: 移除 pipefail — 在 $() 嵌套调用场景下 pipefail 导致子进程继承破损 pipe fd 触发 SIGPIPE (141)
+# 脚本内无数据管道（所有管道已在 v1.12.0 中改为临时文件或 python3），pipefail 无保护价值
 # AIM Letta adapter — AIM Client v1.2 标准接口
-# VERSION: 1.8.2
+# VERSION: 1.11.0
 #
 # 6 个标准模式:
 #   adapter.sh process --message "..." --from "ZSxxxx"   处理消息
@@ -9,6 +11,7 @@ set -euo pipefail
 #   adapter.sh info                                      返回 Runtime 元信息
 #   adapter.sh cancel --task-id "..."                    取消任务
 #   adapter.sh recover                                   自修复（620 L3）
+#   adapter.sh trim                                      清理 dispatch history
 #
 # 返回码:
 #   process: 0=正常回复, 1=可重试, 2=降级, 3=人工介入
@@ -25,16 +28,22 @@ TIMEOUT="${ADAPTER_TIMEOUT:-120}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG_FILE="$SCRIPT_DIR/config.json"
 
+# Python 版本变量化（2026-06-20 P0-002）: 环境变量 > config.json > 系统默认 python3
+PYTHON_BIN="${PYTHON_BIN:-}"
 # 优先环境变量，回退到 config.json
 LETTA_BIN="${LETTA_BIN:-}"
 LETTA_AGENT_ID="${LETTA_AGENT_ID:-}"
 
-if [ -z "$LETTA_BIN" ] || [ -z "$LETTA_AGENT_ID" ]; then
+if [ -z "$LETTA_BIN" ] || [ -z "$LETTA_AGENT_ID" ] || [ -z "$PYTHON_BIN" ]; then
     if [ -f "$CONFIG_FILE" ]; then
+        [ -z "$PYTHON_BIN" ] && PYTHON_BIN=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE')).get('python_bin',''))" 2>/dev/null || true)
         [ -z "$LETTA_BIN" ] && LETTA_BIN=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE')).get('letta_bin',''))" 2>/dev/null || true)
         [ -z "$LETTA_AGENT_ID" ] && LETTA_AGENT_ID=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE')).get('letta_agent_id',''))" 2>/dev/null || true)
     fi
 fi
+
+# Python 最终默认值
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # 最终默认值
 LETTA_BIN="${LETTA_BIN:-$HOME/.npm-global/bin/letta}"
@@ -90,6 +99,9 @@ if [ "$MODE" = "health" ]; then
     # v1.7: 磁盘持久化检查（memfs/ 目录）
     #       移除 agents list 依赖（主 agent 不在子 agent 列表中）
     #       不用 -p "ping" --agent（会发起完整 LLM 对话 >10s，不适合 health check）
+    # v1.9.0: 也验证 dispatch_conv_ids.txt 可写（池化依赖此文件）
+    DISPATCH_IDS_FILE="$SCRIPT_DIR/dispatch_conv_ids.txt"
+    touch "$DISPATCH_IDS_FILE" 2>/dev/null || { echo '{"status":"degraded","detail":"dispatch_conv_ids.txt not writable"}'; exit 1; }
     _verify_agent_id && echo '{"status":"healthy","detail":"letta CLI reachable"}' && exit 0
     echo '{"status":"unhealthy","detail":"agent data not found on disk"}' && exit 4
 fi
@@ -107,7 +119,7 @@ if [ "$MODE" = "info" ]; then
   "provider": "letta",
   "version": "${LETTA_VERSION}",
   "execution_model": "deferred",
-  "max_concurrency": 1,
+  "max_concurrency": "pooled(--new)",
   "agent_id": "${LETTA_AGENT_ID:-null}"
 }
 EOF
@@ -156,28 +168,38 @@ if [ "$MODE" = "recover" ]; then
 fi
 
 # ═══════════════════════════════════════
-# MODE: trim — 清理 dispatch conversation（620 L3）
+# MODE: trim — 清理 dispatch conversations（620 L3，v1.9.0 池化）
 # ═══════════════════════════════════════
-# v2.1: trim 清空 dispatch conv 消息历史 (= truncate messages.jsonl)
-#       不删除目录（保留 conversation.json / manifest.json 结构）
-#       避免 "👂 收到" 模式污染 future 回复质量
+# v1.9.0: 从 dispatch_conv_ids.txt 读取所有池内 conv → 逐个 truncate messages.jsonl
+#         不再依赖写死的 local-conv-1422
 if [ "$MODE" = "trim" ]; then
     _detect_letta || exit 2
+    _load_pool_size
 
-    TRIM_CONV="${LETTA_DISPATCH_CONV:-local-conv-1422}"
     CONV_BASE="${HOME}/.letta/lc-local-backend/conversations"
-    ENCODED_NAME=$(echo -n "conversation:${TRIM_CONV}" | base64)
-    CONV_DIR="${CONV_BASE}/${ENCODED_NAME}"
-    MSG_FILE="${CONV_DIR}/messages.jsonl"
+    TOTAL_BEFORE=0
+    TOTAL_AFTER=0
+    COUNT=0
 
-    if [ -f "$MSG_FILE" ]; then
-        BEFORE=$(wc -l < "$MSG_FILE" | tr -d ' ')
-        : > "$MSG_FILE"   # truncate to 0 bytes
-        AFTER=$(wc -l < "$MSG_FILE" | tr -d ' ')
-        echo "{\"status\":\"trimmed\",\"conv\":\"$TRIM_CONV\",\"lines_before\":$BEFORE,\"lines_after\":$AFTER}"
-    else
-        echo "{\"status\":\"skipped\",\"conv\":\"$TRIM_CONV\",\"reason\":\"no messages.jsonl\"}"
+    if [ -f "$DISPATCH_IDS_FILE" ]; then
+        while IFS= read -r conv_id; do
+            [ -z "$conv_id" ] && continue
+            ENCODED_NAME=$(echo -n "conversation:${conv_id}" | base64)
+            CONV_DIR="${CONV_BASE}/${ENCODED_NAME}"
+            MSG_FILE="${CONV_DIR}/messages.jsonl"
+
+            if [ -f "$MSG_FILE" ]; then
+                BEFORE=$(wc -l < "$MSG_FILE" | tr -d ' ')
+                : > "$MSG_FILE"
+                AFTER=$(wc -l < "$MSG_FILE" | tr -d ' ')
+                TOTAL_BEFORE=$((TOTAL_BEFORE + BEFORE))
+                TOTAL_AFTER=$((TOTAL_AFTER + AFTER))
+                COUNT=$((COUNT + 1))
+            fi
+        done < "$DISPATCH_IDS_FILE"
     fi
+
+    echo "{\"status\":\"trimmed\",\"convs_trimmed\":$COUNT,\"total_lines_before\":$TOTAL_BEFORE,\"total_lines_after\":$TOTAL_AFTER}"
     exit 0
 fi
 
@@ -196,33 +218,116 @@ _detect_letta || exit 3
 _verify_agent_id || exit 4
 
 # ══════════════════════════════════════════════════════════════
-# 双会话隔离机制 — Letta 架构的 AIM Client 适配方案
+# Dispatch conv 池化机制 — 变量化 + 跨环境可迁移（v1.9.0）
 # ══════════════════════════════════════════════════════════════
 #
 # 设计理由:
-#   Letta 是 deferred 模型 (max_concurrency=1)，主会话被 TUI 占用时
-#   adapter process 不能抢主会话。必须用独立 dispatch 会话处理 AIM 消息。
+#   1. Letta --new 支持多 conversation 并发，但 --conversation <固定ID> 内部串行
+#   2. TUI 活跃时复用固定 conv 会排队超时 → 用 --new 每次新 conv 解耦并发
+#   3. conv ID 是全局自增计数器，不能硬编码 (1422/1423 换环境会断裂)
+#   4. 用 dispatch_conv_ids.txt 持久化映射真实 ID → 跨环境可迁移
 #
 # 机制:
-#   1. DISPATCH_CONV 从环境变量 LETTA_DISPATCH_CONV 读取（可动态配置）
-#      默认值 ref: [[reference/aim/adapter-dispatch-session.md]]
-#   2. process 模式自动检测并初始化 dispatch conv:
-#      a) 检查磁盘目录 (conversation.json + manifest.json + messages.jsonl)
-#      b) 目录缺失 → 用 ensure_dispatch_conv() 通过 letta 创建
-#      c) 目录存在 → 直接 --conversation 复用
-#   3. health 模式也验证 dispatch conv 存活（目录存在 = healthy）
-#   4. cleanup-conversations.sh 永久排除 dispatch conv（不清理）
-#   5. 存活监控: adapter health 探针检测 dispatch conv 目录存在性
+#   1. 每次 process 调用 —> letta --new -p "..."  → 创建新 conv → 回复
+#   2. 新 conv ID 写入 dispatch_conv_ids.txt（去重 append）
+#   3. health 验证 dispatch_conv_ids.txt 可写 + letta CLI 可用
+#   4. trim 通过 dispatch_conv_ids.txt 找到所有池内 conv → truncate messages.jsonl
+#   5. cleanup cron 通过 dispatch_conv_ids.txt 判定保护白名单
+#
+# 变量化路径:
+#   config.json → dispatch_conv_pool_size (默认 2)
+#   dispatch_conv_ids.txt → 持久化真实 conv ID 映射
+#   LETTA_DISPATCH_CONV → 环境变量覆盖（可选，向后兼容）
 #
 # @see [[reference/aim/adapter-dispatch-session.md]]  完整说明
 # @see [[reference/aim/gotchas.md]]                   相关陷阱
 # ══════════════════════════════════════════════════════════════
 
-PROBE_TIMEOUT=15
-DISPATCH_CONV="${LETTA_DISPATCH_CONV:-local-conv-1422}"
+PROBE_TIMEOUT=25
+DISPATCH_IDS_FILE="$SCRIPT_DIR/dispatch_conv_ids.txt"
+POOL_SIZE="${DISPATCH_CONV_POOL_SIZE:-2}"
 PROMPT="[AIM dispatch - 仅回复本条消息，不要回复历史] ${MESSAGE}"
 
-# ── 确保 dispatch conv 存在 ──────────────────
+# ── 读取 config.json 获取 pool_size ─────
+_load_pool_size() {
+    local cfg="${DISPATCH_CONV_POOL_SIZE:-}"
+    if [ -z "$cfg" ] && [ -f "$CONFIG_FILE" ]; then
+        cfg=$(${PYTHON_BIN} -c "import json; print(json.load(open('$CONFIG_FILE')).get('dispatch_conv_pool_size',''))" 2>/dev/null || true)
+    fi
+    POOL_SIZE="${cfg:-2}"
+}
+
+# ── 用 --new 创建新 dispatch conv，记录 ID ─────
+# v1.12.0: 用临时文件做 I/O，根除 bash pipefail nested subprocess SIGPILE
+_dispatch_with_new_conv() {
+    local raw_output="" rc=0 _tmp_out after_latest new_conv_id
+
+    _tmp_out=$(mktemp /tmp/aim-dispatch.XXXXXX)
+    before_latest=$(ls -t "${HOME}/.letta/lc-local-backend/conversations/" 2>/dev/null | head -1)
+
+    set +e
+    timeout "$PROBE_TIMEOUT" "$LETTA_BIN" \
+        --agent "$LETTA_AGENT_ID" \
+        --new \
+        -p "$PROMPT" > "$_tmp_out" 2>/dev/null
+    rc=$?
+    raw_output=$(cat "$_tmp_out")
+    rm -f "$_tmp_out"
+    set -e
+
+    # 冷启动重试
+    if [ $rc -eq 124 ] || [ $rc -eq 141 ]; then
+        _tmp_out=$(mktemp /tmp/aim-dispatch.XXXXXX)
+        set +e
+        timeout "$PROBE_TIMEOUT" "$LETTA_BIN" \
+            --agent "$LETTA_AGENT_ID" \
+            --new \
+            -p "$PROMPT" > "$_tmp_out" 2>/dev/null
+        rc=$?
+        raw_output=$(cat "$_tmp_out")
+        rm -f "$_tmp_out"
+        set -e
+    fi
+
+    # conv ID 追踪（echo 之前完成）
+    if [ $rc -eq 0 ] && [ -n "$raw_output" ]; then
+        after_latest=$(ls -t "${HOME}/.letta/lc-local-backend/conversations/" 2>/dev/null | head -1)
+        if [ "$after_latest" != "$before_latest" ]; then
+            new_conv_id=$(${PYTHON_BIN} -c "
+import base64, sys
+try:
+    raw = sys.argv[1]
+    decoded = base64.b64decode(raw).decode()
+    if decoded.startswith('conversation:'):
+        print(decoded.split(':')[1])
+except:
+    pass
+" "$after_latest" 2>/dev/null)
+            if [ -n "$new_conv_id" ]; then
+                _track_conv_id "$new_conv_id"
+            fi
+        fi
+    fi
+
+    printf '%s\n' "$raw_output"
+    return $rc
+}
+
+# ── 记录新 conv ID 到 ids 文件 ─────
+_track_conv_id() {
+    local conv_id="$1"
+    touch "$DISPATCH_IDS_FILE" 2>/dev/null
+    if ! grep -qxF "$conv_id" "$DISPATCH_IDS_FILE" 2>/dev/null; then
+        echo "$conv_id" >> "$DISPATCH_IDS_FILE"
+    fi
+    # LRU 淘汰: 保留最近 pool_size * 2 个 ID
+    local keep=$((POOL_SIZE * 2 + 5))
+    if [ "$(wc -l < "$DISPATCH_IDS_FILE" | tr -d ' ')" -gt "$keep" ]; then
+        tail -n "$keep" "$DISPATCH_IDS_FILE" > "${DISPATCH_IDS_FILE}.tmp" && mv "${DISPATCH_IDS_FILE}.tmp" "$DISPATCH_IDS_FILE"
+    fi
+}
+
+# ── 确保 dispatch conv 存在（仅用于 trim/旧兼容） ──
 ensure_dispatch_conv() {
     local conv_id="$1"
     local base_dir="${HOME}/.letta/lc-local-backend/conversations"
@@ -240,7 +345,7 @@ ensure_dispatch_conv() {
     mkdir -p "$conv_dir" 2>/dev/null || true
 
     # 写 conversation.json（Letta 通过此文件识别 conv）
-    python3 -c "
+    ${PYTHON_BIN} -c "
 import json, os
 from datetime import datetime, timezone
 now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
@@ -266,31 +371,26 @@ open(os.path.join('$conv_dir', 'messages.jsonl'), 'a').close()
     return 0
 }
 
-# ── 初始化 + 调用 dispatch ────────────────
-ensure_dispatch_conv "$DISPATCH_CONV"
+# ── process 主流程：--new 每次新 conv，避免复用串行 ──
+_load_pool_size
 
+# 尝试用 --new 创建新 conversation 处理消息
+# v1.12.0: redirect 到临时文件，不用 $() 捕获函数输出（规避 pipefail SIGPIPE）
+ADAPTER_TMP=$(mktemp /tmp/aim-letta-adapter.XXXXXX)
 set +e
-RAW_OUTPUT=$(timeout "$PROBE_TIMEOUT" "$LETTA_BIN" \
-    --conversation "$DISPATCH_CONV" \
-    -p "$PROMPT" 2>/dev/null)
+_dispatch_with_new_conv > "$ADAPTER_TMP" 2>/dev/null
 RC=$?
 set -e
-
-# v2.0.1: dispatch conv 冷启动重试 — 首次 --conversation 需要加载 agent 到内存 (15-20s)，
-#         15s 超时边界可能不够。非超时的失败（RC≠0 & RC≠124）在 agent 已加载后
-#         第二次调用通常秒级成功。重试一次即可覆盖冷启动。
-if [ $RC -ne 0 ] && [ $RC -ne 124 ]; then
-    set +e
-    RAW_OUTPUT=$(timeout "$PROBE_TIMEOUT" "$LETTA_BIN" \
-        --conversation "$DISPATCH_CONV" \
-        -p "$PROMPT" 2>/dev/null)
-    RC=$?
-    set -e
-fi
+RAW_OUTPUT=$(cat "$ADAPTER_TMP" 2>/dev/null || true)
+rm -f "$ADAPTER_TMP"
 
 if [ $RC -eq 124 ]; then
     echo "[letta-adapter] 处理超时 (${PROBE_TIMEOUT}s)，可重试" >&2
     exit 1
+elif [ $RC -eq 141 ]; then
+    # rc=141=SIGPIPE: 管道竞争瞬态 → 透传给 main.py 做退避重试，不降级
+    echo "[letta-adapter] SIGPIPE rc=141，透传重试" >&2
+    exit 141
 elif [ $RC -ne 0 ]; then
     echo "[letta-adapter] 调用失败 rc=$RC" >&2
     exit 2
@@ -310,7 +410,7 @@ if [ -n "$RAW_OUTPUT" ]; then
         echo "$REPLY"
         # v1.6: 记录回复到 .aim-replies/
         TIMESTAMP=$(date +%s)
-        BODY_JSON=$(python3 -c "import json; print(json.dumps('''$REPLY'''.strip()))" 2>/dev/null || echo "\"$REPLY\"")
+        BODY_JSON=$(${PYTHON_BIN} -c "import json; print(json.dumps('''$REPLY'''.strip()))" 2>/dev/null || echo "\"$REPLY\"")
         printf '{"ts":%s,"from":"%s","reply":%s}\n' "$TIMESTAMP" "${FROM_ID:-unknown}" "$BODY_JSON" >> "$REPLIES_DIR/replies.jsonl"
     fi
 else

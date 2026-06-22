@@ -45,7 +45,8 @@ fi
 # Python 最终默认值
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
-# 最终默认值
+# 最终默认值（P0: 添加 HOME 守卫，防止 set -eu 下 unbound variable 崩溃）
+: "${HOME:=/Users/yangzs}"
 LETTA_BIN="${LETTA_BIN:-$HOME/.npm-global/bin/letta}"
 FILTER_SCRIPT="$SCRIPT_DIR/filter_letta_output.sh"
 
@@ -243,7 +244,8 @@ _verify_agent_id || exit 4
 # @see [[reference/aim/gotchas.md]]                   相关陷阱
 # ══════════════════════════════════════════════════════════════
 
-PROBE_TIMEOUT=25
+PROBE_TIMEOUT=35
+# P0: 35s 一次给够（冷启动实测 17s + LLM 推理 5-15s），取消重试避免浪费时间
 DISPATCH_IDS_FILE="$SCRIPT_DIR/dispatch_conv_ids.txt"
 POOL_SIZE="${DISPATCH_CONV_POOL_SIZE:-2}"
 PROMPT="[AIM dispatch - 仅回复本条消息，不要回复历史] ${MESSAGE}"
@@ -274,20 +276,6 @@ _dispatch_with_new_conv() {
     raw_output=$(cat "$_tmp_out")
     rm -f "$_tmp_out"
     set -e
-
-    # 冷启动重试
-    if [ $rc -eq 124 ] || [ $rc -eq 141 ]; then
-        _tmp_out=$(mktemp /tmp/aim-dispatch.XXXXXX)
-        set +e
-        timeout "$PROBE_TIMEOUT" "$LETTA_BIN" \
-            --agent "$LETTA_AGENT_ID" \
-            --new \
-            -p "$PROMPT" > "$_tmp_out" 2>/dev/null
-        rc=$?
-        raw_output=$(cat "$_tmp_out")
-        rm -f "$_tmp_out"
-        set -e
-    fi
 
     # conv ID 追踪（echo 之前完成）
     if [ $rc -eq 0 ] && [ -n "$raw_output" ]; then

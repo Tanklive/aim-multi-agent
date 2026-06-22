@@ -863,6 +863,7 @@ class AIMClient:
         self._last_dispatch_time: float = 0.0
 
         self._stall_timeout_sec = self.config.get("stall_watchdog_sec", 30.0)
+        self._max_msg_age_sec = self.config.get("max_msg_age_sec", 900)  # POST-05: 旧消息过期保护
 
         self._stall_recovery_count: int = 0  # 619-20: 连续自愈计数（>3 次则丢弃卡死消息）
 
@@ -1015,6 +1016,31 @@ class AIMClient:
                         self.queue.ack(msg.msg_id)
 
                         continue
+
+                    # POST-05: 旧消息过期保护 — 重启后跳过超时消息，防毒化循环
+
+                    import time as _t_post5
+
+                    msg_ts = getattr(msg, 'ts', None)
+                    if msg_ts is None:
+                        msg_ts = getattr(msg, 'received_at', 0)
+                    if msg_ts and msg_ts > 0:
+                        msg_age = _t_post5.time() - msg_ts
+                        if msg_age > self._max_msg_age_sec:
+                            self.logger.info(f" [{msg.msg_id[:8]}] 过期消息 ({msg_age:.0f}s>{self._max_msg_age_sec}s)，skip+ack")
+                            self.queue.ack(msg.msg_id)
+
+                            # 不阻塞: 通知发件人消息已过期丢弃（避免无限重传）
+
+                            try:
+
+                                await self.transport.send_ack(msg.from_id, msg.msg_id)
+
+                            except Exception:
+
+                                pass
+
+                            continue
 
                     self._last_dispatch_time = _t619_wd.time()  # 记录最近投递时间
 
@@ -1226,6 +1252,406 @@ class AIMClient:
 
 
 
+    # ── 系统自举：launchd + healthd 自动管理 ──────────────────
+
+    def _ensure_launchd(self):
+        """确保当前 agent 的 launchd plist 存在且已 loaded。
+
+        这是 AIM 系统内置的进程生命周期管理，零外部 cron 依赖。
+        由 config.launchd.auto_manage 控制（默认 true）。
+        """
+        cfg = (self.config or {}).get("launchd", {})
+        if not cfg.get("auto_manage", True):
+            self.logger.debug("launchd auto_manage 已关闭，跳过自举")
+            return
+
+        import plistlib, shutil
+
+        label = f"com.aim.agent.{self.agent_id}"
+        plist_path = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+        python_bin = shutil.which("python3.13") or sys.executable
+        main_py = str(Path.home() / "shared" / "aim" / "aim-client" / "main.py")
+        config_abs = str(self.config_path.resolve())
+        log_path = str(Path.home() / "Library" / "Logs" / f"aim-client-{self.agent_id}.log")
+
+        expected_plist = {
+            "Label": label,
+            "Disabled": False,
+            "ProgramArguments": [
+                python_bin, "-u", main_py,
+                "--agent-id", self.agent_id,
+                "--config", config_abs,
+                "--mode", "direct",
+                "--foreground",
+            ],
+            "RunAtLoad": True,
+            "KeepAlive": {"SuccessfulExit": False},
+            "StandardOutPath": log_path,
+            "StandardErrorPath": log_path,
+            "ThrottleInterval": 10,
+            "EnvironmentVariables": {
+                "PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
+                "HOME": str(Path.home()),
+            },
+        }
+
+        need_write = False
+        if plist_path.exists():
+            try:
+                with open(plist_path, "rb") as pf:
+                    existing = plistlib.load(pf)
+                # 检查关键字段是否需要更新
+                if (existing.get("Label") != label
+                        or existing.get("KeepAlive") != {"SuccessfulExit": False}
+                        or existing.get("Disabled") is not False
+                        or existing.get("ProgramArguments") != expected_plist["ProgramArguments"]):
+                    self.logger.info(f"launchd plist 内容过期，自动更新")
+                    need_write = True
+            except Exception:
+                self.logger.warning(f"launchd plist 读取失败，重新生成")
+                need_write = True
+        else:
+            self.logger.info(f"launchd plist 不存在，自动创建")
+            need_write = True
+
+        if need_write:
+            plist_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(plist_path, "wb") as pf:
+                plistlib.dump(expected_plist, pf)
+            self.logger.info(f"✅ launchd plist 已写入: {plist_path}")
+
+        # 检查是否已 loaded
+        try:
+            result = __import__("subprocess").run(
+                ["launchctl", "list"], capture_output=True, text=True, timeout=5)
+            loaded = any(label in ln for ln in result.stdout.split("\n"))
+        except Exception:
+            loaded = False
+
+        if not loaded:
+            self.logger.info(f"launchd 未管理此 agent，触发 bootstrap...")
+            try:
+                rc = os.system(
+                    f"launchctl bootstrap gui/{os.getuid()} {plist_path} 2>/dev/null")
+                if rc == 0:
+                    self.logger.info(f"✅ launchd bootstrap 成功")
+                else:
+                    # 619-01: bootstrap 失败可能是 launchd 已禁用此 label
+                    # （比如之前 plist 指向不存在的路径导致反复崩溃被 throttle）
+                    self.logger.warning(f"⚠️ bootstrap 失败 (rc={rc})，检查是否被 launchd disabled...")
+                    try:
+                        import subprocess as _sp
+                        disabled_info = _sp.run(
+                            ["launchctl", "print-disabled", f"gui/{os.getuid()}"],
+                            capture_output=True, text=True, timeout=5)
+                        if f'"{label}" => disabled' in disabled_info.stdout:
+                            self.logger.info(f"🔧 {label} 被 launchd disabled，执行 enable...")
+                            os.system(
+                                f"launchctl enable gui/{os.getuid()}/{label}")
+                            # 重试 bootstrap
+                            rc = os.system(
+                                f"launchctl bootstrap gui/{os.getuid()} {plist_path} 2>/dev/null")
+                            if rc == 0:
+                                self.logger.info(f"✅ launchd bootstrap 成功（enable 后重试）")
+                            else:
+                                self.logger.warning(f"⚠️ enable 后 bootstrap 仍失败 (rc={rc})")
+                    except Exception:
+                        pass
+                    # 如果仍失败，尝试 legacy load
+                    if rc != 0:
+                        rc2 = os.system(f"launchctl load {plist_path} 2>/dev/null")
+                        if rc2 == 0:
+                            self.logger.info(f"✅ launchd load 成功（legacy）")
+                        else:
+                            self.logger.warning(f"⚠️ launchd bootstrap/load 均失败，当前进程继续运行")
+            except Exception as e:
+                self.logger.warning(f"⚠️ launchd bootstrap 异常: {e}")
+        else:
+            self.logger.debug(f"launchd 已管理此 agent")
+
+    async def _ensure_healthd(self):
+        """确保 healthd 守护进程正在运行。
+
+        检查 healthd plist 是否存在且 loaded；否则自动创建并 bootstrap。
+        同时启动后台协程周期性检查 healthd 存活。
+        """
+        cfg = (self.config or {}).get("healthd", {})
+        if not cfg.get("auto_ensure", True):
+            self.logger.debug("healthd auto_ensure 已关闭，跳过")
+            return
+
+        import plistlib, shutil
+
+        label = "com.aim.healthd"
+        plist_path = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+        healthd_py = str(Path.home() / ".aim" / "bin" / "aim_healthd.py")
+        log_path = str(Path.home() / "Library" / "Logs" / "aim-healthd.log")
+
+        # 检查 healthd 脚本是否存在
+        if not Path(healthd_py).exists():
+            self.logger.warning(f"healthd 脚本不存在: {healthd_py}，跳过")
+            return
+
+        expected_plist = {
+            "Label": label,
+            "Disabled": False,
+            "ProgramArguments": [
+                shutil.which("python3.13") or sys.executable,
+                healthd_py,
+            ],
+            "RunAtLoad": True,
+            "KeepAlive": {"SuccessfulExit": False},
+            "StandardOutPath": log_path,
+            "StandardErrorPath": log_path,
+            "ThrottleInterval": 30,
+            "EnvironmentVariables": {
+                "PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
+            },
+        }
+
+        need_write = False
+        if plist_path.exists():
+            try:
+                with open(plist_path, "rb") as pf:
+                    existing = plistlib.load(pf)
+                if (existing.get("KeepAlive") != {"SuccessfulExit": False}
+                        or existing.get("ProgramArguments") != expected_plist["ProgramArguments"]):
+                    need_write = True
+            except Exception:
+                need_write = True
+        else:
+            need_write = True
+
+        if need_write:
+            plist_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(plist_path, "wb") as pf:
+                plistlib.dump(expected_plist, pf)
+            self.logger.info(f"✅ healthd plist 已写入: {plist_path}")
+
+        # 检查并启动 healthd
+        try:
+            result = __import__("subprocess").run(
+                ["launchctl", "list"], capture_output=True, text=True, timeout=5)
+            loaded = any(label in ln for ln in result.stdout.split("\n"))
+        except Exception:
+            loaded = False
+
+        if not loaded:
+            self.logger.info(f"healthd 未运行，触发 bootstrap...")
+            try:
+                rc = os.system(
+                    f"launchctl bootstrap gui/{os.getuid()} {plist_path} 2>/dev/null")
+                if rc == 0:
+                    self.logger.info(f"✅ healthd bootstrap 成功")
+                else:
+                    rc2 = os.system(f"launchctl load {plist_path} 2>/dev/null")
+                    if rc2 == 0:
+                        self.logger.info(f"✅ healthd load 成功（legacy）")
+            except Exception as e:
+                self.logger.warning(f"⚠️ healthd bootstrap 异常: {e}")
+        else:
+            self.logger.debug(f"healthd 已运行")
+
+        # 启动后台监控协程
+        interval = cfg.get("check_interval_s", 30)
+        asyncio.create_task(self._monitor_healthd(interval))
+
+    async def _monitor_healthd(self, interval_s: int = 30):
+        """后台协程：周期性检查 healthd 存活，挂了自动拉起"""
+        db_path = Path.home() / ".aim" / "system" / "health.db"
+        plist_path = Path.home() / "Library" / "LaunchAgents" / "com.aim.healthd.plist"
+
+        await asyncio.sleep(interval_s)  # 启动后等一会再检查
+
+        while self.running:
+            try:
+                need_recovery = False
+
+                # 检查1: launchctl 是否管理
+                result = __import__("subprocess").run(
+                    ["launchctl", "list"], capture_output=True, text=True, timeout=5)
+                if "com.aim.healthd" not in result.stdout:
+                    need_recovery = True
+                    self.logger.warning("⚠️ healthd 不在 launchd 列表中")
+
+                # 检查2: health.db 最后写入时间
+                if not need_recovery and db_path.exists():
+                    try:
+                        import sqlite3, time
+                        conn = sqlite3.connect(str(db_path))
+                        cur = conn.execute(
+                            "SELECT MAX(ts) FROM health_events")
+                        row = cur.fetchone()
+                        conn.close()
+                        if row and row[0]:
+                            age = time.time() - row[0]
+                            if age > 120:
+                                self.logger.warning(
+                                    f"⚠️ health.db {age:.0f}s 未更新，可能僵死")
+                                need_recovery = True
+                    except Exception:
+                        pass
+
+                # 恢复操作
+                if need_recovery:
+                    self.logger.info("🔄 尝试恢复 healthd...")
+                    try:
+                        os.system(
+                            f"launchctl bootstrap gui/{os.getuid()} {plist_path} 2>/dev/null")
+                        self.logger.info("✅ healthd 已重新 bootstrap")
+                    except Exception as e:
+                        self.logger.error(f"healthd 恢复失败: {e}")
+
+            except Exception as e:
+                self.logger.debug(f"healthd 监控异常: {e}")
+
+            await asyncio.sleep(interval_s)
+
+    async def _ensure_registry(self):
+        """确保 Registry 服务正在运行（launchd 托管，零 cron 依赖）。
+
+        检查 com.aim.registry plist 是否存在且 loaded；否则自动创建并 bootstrap。
+        同时启动后台协程周期性检查 Registry 存活。
+        """
+        cfg = (self.config or {}).get("registry", {})
+        if not cfg.get("auto_ensure", True):
+            self.logger.debug("registry auto_ensure 已关闭，跳过")
+            return
+
+        import plistlib, shutil
+        from pathlib import Path as _Path
+
+        label = "com.aim.registry"
+        plist_path = _Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+        registry_py = str(_Path.home() / "shared" / "aim" / "aim-client" / "registry.py")
+        log_path = str(_Path.home() / "Library" / "Logs" / "aim-registry.log")
+        creds_path = str(_Path.home() / ".aim" / "registry.creds")
+
+        # 检查 Registry 脚本是否存在
+        if not _Path(registry_py).exists():
+            self.logger.warning(f"Registry 脚本不存在: {registry_py}，跳过")
+            return
+
+        python_path = shutil.which("python3.13") or sys.executable
+        nats_url = cfg.get("nats_url", "nats://127.0.0.1:4222")
+        creds = cfg.get("credentials", str(_Path.home() / ".aim" / "registry.creds"))
+
+        expected_plist = {
+            "Label": label,
+            "Disabled": False,
+            "ProgramArguments": [
+                python_path,
+                "-u",
+                registry_py,
+                "--nats-url", nats_url,
+                "--credentials", creds,
+            ],
+            "RunAtLoad": True,
+            "KeepAlive": {"SuccessfulExit": False},
+            "StandardOutPath": log_path,
+            "StandardErrorPath": log_path,
+            "ThrottleInterval": 10,
+            "EnvironmentVariables": {
+                "PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
+            },
+        }
+
+        need_write = False
+        if plist_path.exists():
+            try:
+                with open(plist_path, "rb") as pf:
+                    existing = plistlib.load(pf)
+                if (existing.get("KeepAlive") != {"SuccessfulExit": False}
+                        or existing.get("ProgramArguments") != expected_plist["ProgramArguments"]):
+                    need_write = True
+            except Exception:
+                need_write = True
+        else:
+            need_write = True
+
+        if need_write:
+            plist_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(plist_path, "wb") as pf:
+                plistlib.dump(expected_plist, pf)
+            self.logger.info(f"✅ Registry plist 已写入: {plist_path}")
+
+        # 检查并启动 Registry
+        try:
+            result = __import__("subprocess").run(
+                ["launchctl", "list"], capture_output=True, text=True, timeout=5)
+            loaded = any(label in ln for ln in result.stdout.split("\n"))
+        except Exception:
+            loaded = False
+
+        if not loaded:
+            self.logger.info(f"Registry 未运行，触发 bootstrap...")
+            try:
+                rc = os.system(
+                    f"launchctl bootstrap gui/{os.getuid()} {plist_path} 2>/dev/null")
+                if rc == 0:
+                    self.logger.info(f"✅ Registry bootstrap 成功")
+                else:
+                    rc2 = os.system(f"launchctl load {plist_path} 2>/dev/null")
+                    if rc2 == 0:
+                        self.logger.info(f"✅ Registry load 成功（legacy）")
+                    else:
+                        self.logger.warning(f"⚠️ Registry bootstrap/load 均失败")
+            except Exception as e:
+                self.logger.warning(f"⚠️ Registry bootstrap 异常: {e}")
+        else:
+            self.logger.debug(f"Registry 已运行")
+
+        # 启动后台健康监控协程
+        check_interval = cfg.get("check_interval_s", 30)
+        asyncio.create_task(self._monitor_registry(check_interval))
+
+    async def _monitor_registry(self, interval_s: int = 30):
+        """后台协程：周期性检查 Registry 存活，挂了自动拉起"""
+        plist_path = Path.home() / "Library" / "LaunchAgents" / "com.aim.registry.plist"
+
+        await asyncio.sleep(interval_s)  # 启动后等一会再检查
+
+        while self.running:
+            try:
+                need_recovery = False
+
+                # 检查1: launchctl 是否管理
+                result = __import__("subprocess").run(
+                    ["launchctl", "list"], capture_output=True, text=True, timeout=5)
+                if "com.aim.registry" not in result.stdout:
+                    need_recovery = True
+                    self.logger.warning("⚠️ Registry 不在 launchd 列表中")
+
+                # 检查2: NATS health probe — 尝试请求 Registry 健康端点
+                if not need_recovery and hasattr(self, 'transport'):
+                    try:
+                        # Transport 封装层，直接用 request 方法
+                        resp = await self.transport.request(
+                            "aim.registry.health_query",
+                            {"agent_id": self.agent_id, "ts": __import__("time").time(), "fields": ["status"]},
+                            timeout=3
+                        )
+                    except Exception:
+                        self.logger.warning("⚠️ Registry NATS 健康查询无响应")
+                        need_recovery = True
+
+                # 恢复操作
+                if need_recovery:
+                    self.logger.info("🔄 尝试恢复 Registry...")
+                    try:
+                        os.system(
+                            f"launchctl kickstart -k gui/{os.getuid()}/{plist_path.name.replace('.plist','')} 2>/dev/null")
+                    except Exception as e:
+                        # kickstart 可能失败，尝试 bootstrap
+                        os.system(
+                            f"launchctl bootstrap gui/{os.getuid()} {plist_path} 2>/dev/null")
+                    self.logger.info("✅ Registry 恢复已触发")
+
+            except Exception as e:
+                self.logger.debug(f"Registry 监控异常: {e}")
+
+            await asyncio.sleep(interval_s)
+
     async def start(self):
 
         if not self.lock.acquire():
@@ -1304,6 +1730,19 @@ class AIMClient:
 
         self.logger.info(f" {self.agent_id} AIM Client v{_AIM_VERSION} 启动完成")
 
+        # ── 系统自举：launchd plist + healthd（零 cron 依赖）──
+        try:
+            self._ensure_launchd()
+        except Exception as e:
+            self.logger.warning(f"launchd 自举跳过: {e}")
+        try:
+            await self._ensure_healthd()
+        except Exception as e:
+            self.logger.warning(f"healthd 自举跳过: {e}")
+        try:
+            await self._ensure_registry()
+        except Exception as e:
+            self.logger.warning(f"registry 自举跳过: {e}")
 
 
         # NOTICE 1.3.0: 运行时版本检查（拒绝低于最低要求的 SDK）
@@ -1397,6 +1836,16 @@ class AIMClient:
                     self.logger.warning(f"⚠️  [{self.agent_id}] adapter {_last_state}→{new_state}")
 
                     await self.transport.emit_health("state_change", "", f"{_last_state}→{new_state}")
+
+
+
+                # POST-04: exit 3 永久停止告警（CLI不存在/配置错误）
+
+                if getattr(report, 'exit_code', 0) == 3:
+
+                    self.logger.error(f"🛑 [{self.agent_id}] health exit=3 (CLI不存在/配置错误)，需人工介入")
+
+                    await self.transport.emit_health("fatal", "", "exit=3 CLI unavailable")
 
 
 
@@ -2748,7 +3197,10 @@ class AIMClient:
 
             raise RetryableError(stderr_text or f"adapter exit=1")
 
-
+        elif rc == 141:
+            # SIGPIPE (128+13): 管道被断（大输出/过早关闭）→ 退避重试，非真故障
+            # 不影响现有 timeout/exit=2/DEGRADE 语义
+            raise RetryableError(stderr_text or "adapter SIGPIPE (rc=141)")
 
         elif rc == 2:
 
@@ -3593,7 +4045,7 @@ def main():
         stopped = False
 
         # 1) 优先用 launchd bootout（--foreground 模式）
-        label = f"ai.aim-client.{args.agent_id}"
+        label = f"com.aim.agent.{args.agent_id}"
         rc = os.system(f"launchctl bootout gui/$UID/{label} 2>/dev/null")
         if rc == 0:
             print(f"✅ [{args.agent_id}] 已通过 launchd 停止")
@@ -3635,14 +4087,15 @@ def main():
                 print(f"⚠️  [{args.agent_id}] 未找到运行中的进程")
         return
 
-    # --- --install: 安装 launchd plist（开机自启） ---
+    # --- --install: 安装 launchd plist（开机自启+崩溃自动重启） ---
     if args.install:
         import plistlib, shutil
         python_bin = shutil.which("python3.13") or sys.executable
-        plist_label = f"ai.aim-client.{args.agent_id}"
+        plist_label = f"com.aim.agent.{args.agent_id}"
         plist_path = os.path.expanduser(f"~/Library/LaunchAgents/{plist_label}.plist")
         plist = {
             "Label": plist_label,
+            "Disabled": False,
             "ProgramArguments": [
                 python_bin, "-u",
                 os.path.expanduser("~/shared/aim/aim-client/main.py"),
@@ -3652,9 +4105,10 @@ def main():
                 "--foreground",
             ],
             "RunAtLoad": True,
-            "KeepAlive": False,
+            "KeepAlive": {"SuccessfulExit": False},
             "StandardOutPath": os.path.expanduser(f"~/Library/Logs/aim-client-{args.agent_id}.log"),
             "StandardErrorPath": os.path.expanduser(f"~/Library/Logs/aim-client-{args.agent_id}.log"),
+            "ThrottleInterval": 10,
             "EnvironmentVariables": {
                 "PATH": "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin",
                 "HOME": os.path.expanduser("~"),
@@ -3663,16 +4117,20 @@ def main():
         os.makedirs(os.path.dirname(plist_path), exist_ok=True)
         with open(plist_path, "wb") as pf:
             plistlib.dump(plist, pf)
-        os.system(f"launchctl load {plist_path}")
-        print(f"✅ [{args.agent_id}] launchd plist 已安装 → 下次登录自动启动")
+        os.system(f"launchctl bootout gui/$UID/{plist_label} 2>/dev/null || true")
+        # 619-01: 先 enable（防止被 launchd throttle 标记为 disabled）
+        os.system(f"launchctl enable gui/$UID/{plist_label} 2>/dev/null || true")
+        rc = os.system(f"launchctl bootstrap gui/$UID {plist_path} 2>/dev/null")
+        if rc != 0:
+            # fallback: legacy load
+            os.system(f"launchctl load {plist_path} 2>/dev/null")
+        print(f"✅ [{args.agent_id}] launchd plist 已安装（KeepAlive + 崩溃自恢复）")
         print(f"   路径: {plist_path}")
-        os.system(f"launchctl kickstart gui/$UID/{plist_label} 2>/dev/null || true")
-        print(f"   已触发启动")
         return
 
     # --- --uninstall: 卸载 launchd plist ---
     if args.uninstall:
-        plist_label = f"ai.aim-client.{args.agent_id}"
+        plist_label = f"com.aim.agent.{args.agent_id}"
         plist_path = os.path.expanduser(f"~/Library/LaunchAgents/{plist_label}.plist")
         os.system(f"launchctl bootout gui/$UID/{plist_label} 2>/dev/null || true")
         try:
@@ -3688,7 +4146,7 @@ def main():
         # 检查 launchd
         result = _sp2.run(["launchctl", "list"], capture_output=True, text=True)
         for ln in result.stdout.split('\n'):
-            if f"ai.aim-client.{args.agent_id}" in ln:
+            if f"com.aim.agent.{args.agent_id}" in ln:
                 pid = ln.split()[0]
                 if pid.isdigit():
                     print(f"⚠️  [{args.agent_id}] 已在运行 (launchd PID {pid})，无需重复启动")

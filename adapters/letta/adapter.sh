@@ -3,7 +3,8 @@ set -eu
 # v1.12.0: 移除 pipefail — 在 $() 嵌套调用场景下 pipefail 导致子进程继承破损 pipe fd 触发 SIGPIPE (141)
 # 脚本内无数据管道（所有管道已在 v1.12.0 中改为临时文件或 python3），pipefail 无保护价值
 # AIM Letta adapter — AIM Client v1.2 标准接口
-# VERSION: 1.11.0
+# VERSION: 1.13.1    [v1.13.0: --new 池化回退 — --conversation 复用实验已放弃]
+#                     [v1.13.1: --from 强制必填，移除 "unknown" 默认值回退]
 #
 # 6 个标准模式:
 #   adapter.sh process --message "..." --from "ZSxxxx"   处理消息
@@ -215,7 +216,7 @@ if [ "$MODE" != "process" ]; then
 fi
 
 [ -n "$MESSAGE" ] || { echo "缺少 --message" >&2; exit 3; }
-[ -n "$FROM_ID" ] || FROM_ID="unknown"
+[ -n "$FROM_ID" ] || { echo "[letta-adapter] 缺少 --from 参数 (必填)" >&2; exit 3; }
 
 _detect_letta || exit 3
 _verify_agent_id || exit 4
@@ -279,23 +280,11 @@ _dispatch_with_new_conv() {
     rm -f "$_tmp_out"
     set -e
 
-    # conv ID 追踪（echo 之前完成）
+    # conv ID 追踪：--new 模式下目录名就是 conv ID（如 local-conv-312），无需 base64 解码
     if [ $rc -eq 0 ] && [ -n "$raw_output" ]; then
         after_latest=$(ls -t "${HOME}/.letta/lc-local-backend/conversations/" 2>/dev/null | head -1)
-        if [ "$after_latest" != "$before_latest" ]; then
-            new_conv_id=$(${PYTHON_BIN} -c "
-import base64, sys
-try:
-    raw = sys.argv[1]
-    decoded = base64.b64decode(raw).decode()
-    if decoded.startswith('conversation:'):
-        print(decoded.split(':')[1])
-except:
-    pass
-" "$after_latest" 2>/dev/null)
-            if [ -n "$new_conv_id" ]; then
-                _track_conv_id "$new_conv_id"
-            fi
+        if [ "$after_latest" != "$before_latest" ] && [ -n "$after_latest" ]; then
+            _track_conv_id "$after_latest"
         fi
     fi
 

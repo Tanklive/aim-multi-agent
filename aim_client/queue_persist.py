@@ -146,8 +146,12 @@ class QueuePersist:
         for msg_id, last_op in last_ops.items():
             if last_op["op"] == "enqueue":
                 data = last_op.get("data", {})
+                if not isinstance(data, dict):
+                    logger.warning(f"QueuePersist restore 跳过非 dict data: {type(data).__name__}")
+                    continue
                 msg = _dict_to_message(data)
-                restored.append(msg)
+                if msg is not None:
+                    restored.append(msg)
             elif last_op["op"] == "ack":
                 ack_count += 1
             elif last_op["op"] == "nack":
@@ -168,7 +172,11 @@ class QueuePersist:
                     if not line:
                         continue
                     try:
-                        ops.append(json.loads(line))
+                        entry = json.loads(line)
+                        if not isinstance(entry, dict):
+                            logger.warning(f"QueuePersist 跳过非 dict entry: {type(entry).__name__}")
+                            continue
+                        ops.append(entry)
                     except json.JSONDecodeError:
                         logger.warning(f"QueuePersist 跳过损坏的行: {line[:100]}")
         except FileNotFoundError:
@@ -201,9 +209,12 @@ class QueuePersist:
         if len(ops) < 2:
             return
 
-        # 找需要保留的 msg_id
+        # 找需要保留的 msg_id（防御性验证每个 entry）
         last_ops: Dict[str, dict] = {}
         for entry in ops:
+            if not isinstance(entry, dict):
+                logger.warning(f"QueuePersist compact 跳过非 dict entry: {type(entry).__name__}")
+                continue
             mid = entry.get("msg_id", "")
             if mid:
                 last_ops[mid] = entry
@@ -216,10 +227,14 @@ class QueuePersist:
                 keep_lines.append(json.dumps(last_op, ensure_ascii=False) + "\n")
                 kept += 1
 
-        # 原子写入
+        # 原子写入 — 确保文件至少不为空（防止后续读取误判为 []）
         tmp = self.filepath.with_suffix(".tmp")
-        with open(tmp, "w") as f:
-            f.writelines(keep_lines)
+        if not keep_lines:
+            # 无待保留条目 → 写入显式空行而非真正空文件
+            Path(tmp).write_text("")
+        else:
+            with open(tmp, "w") as f:
+                f.writelines(keep_lines)
         os.replace(tmp, self.filepath)
 
         logger.info(f"QueuePersist 压缩完成: {len(ops)}→{kept} 行, {self.filepath.stat().st_size}B")
@@ -242,6 +257,8 @@ def _message_to_dict(msg: Message) -> dict:
 
 
 def _dict_to_message(data: dict) -> Message:
+    if not isinstance(data, dict):
+        return None
     return Message(
         msg_id=data.get("msg_id", ""),
         from_id=data.get("from_id", ""),

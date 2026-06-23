@@ -73,6 +73,7 @@ class HealthProbe:
                     active_sessions=info.get("active_sessions", 0),
                     avg_latency_ms=info.get("avg_latency_ms", 0),
                     last_heartbeat=time.time(),
+                    exit_code=0,
                 )
 
             elif exit_code == 1:
@@ -83,16 +84,40 @@ class HealthProbe:
                     status=AgentState.BUSY,
                     active_sessions=1,
                     last_heartbeat=time.time(),
+                    exit_code=1,
+                )
+
+            elif exit_code == 3:
+                # POST-04: CLI不存在/配置错误 → 永久停止，需人工介入
+                self._degraded_count += 1
+                stderr_text = stderr.decode()[:200] if stderr else ""
+                logger.warning(f"HealthProbe: FATAL (exit=3, CLI unavailable): {stderr_text}")
+                return StateReport(
+                    status=AgentState.OFFLINE,
+                    last_heartbeat=time.time(),
+                    exit_code=3,
+                )
+
+            elif exit_code == 4:
+                # POST-04: 数据丢失/agent不可达 → 可降级恢复
+                self._degraded_count += 1
+                stderr_text = stderr.decode()[:200] if stderr else ""
+                logger.warning(f"HealthProbe: DEGRADE (exit=4, agent unreachable): {stderr_text}")
+                return StateReport(
+                    status=AgentState.OFFLINE,
+                    last_heartbeat=time.time(),
+                    exit_code=4,
                 )
 
             else:
-                # 挂了
+                # 挂了 (exit=2, 5+, etc)
                 self._degraded_count += 1
                 stderr_text = stderr.decode()[:200] if stderr else "未知"
                 logger.warning(f"HealthProbe: unhealthy (exit={exit_code}): {stderr_text}")
                 return StateReport(
                     status=AgentState.OFFLINE,
                     last_heartbeat=time.time(),
+                    exit_code=exit_code,
                 )
 
         except FileNotFoundError:

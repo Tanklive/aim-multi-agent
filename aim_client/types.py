@@ -60,6 +60,7 @@ class StateReport:
     consecutive_failures: int = 0          # 连续 dispatch 失败次数
     last_success_ts: float = 0.0           # 上次 dispatch 成功时间戳
     last_heartbeat: float = field(default_factory=time.time)
+    exit_code: int = 0                     # POST-04: health adapter 返回的原始 exit code
 
     def __post_init__(self):
         if self.degrade_level is None:

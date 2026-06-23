@@ -5,10 +5,9 @@ AIM NATS 消息发送工具 — 基于 aim_nats_sdk.py (Veritas 协议)
 维护: ZS0001 (呱呱) | 2026-06-19 起接 | 详见 shared/aim/GOVERNANCE.md
 
 用法:
-  python3 aim_send_nats.py ZS0002 "你好"               # 私聊
-  python3 aim_send_nats.py grp_trio "大家好" --group    # 群聊
-  python3 aim_send_nats.py ZS0002 "ping" --request     # 请求（等待回复）
-  python3 aim_send_nats.py ZS0002 "你好" --from ZS0001  # 指定发送者
+  python3 aim_send_nats.py ZS0002 "你好" --from ZS0001               # 私聊
+  python3 aim_send_nats.py grp_trio "大家好" --group --from ZS0001    # 群聊
+  python3 aim_send_nats.py ZS0002 "ping" --request --from ZS0001     # 请求（等待回复）
 """
 
 import argparse
@@ -142,7 +141,7 @@ async def main():
     parser = argparse.ArgumentParser(description="AIM NATS 消息发送工具 (Veritas 协议)")
     parser.add_argument("target", help="目标 Agent ID 或群组名")
     parser.add_argument("content", help="消息内容")
-    parser.add_argument("--from", dest="from_id", default="ZS0001", help="发送者 ID")
+    parser.add_argument("--from", dest="from_id", default=None, required=True, help="发送者 ID（必填，ZS0001/ZS0002/ZS0003）")
     parser.add_argument("--group", action="store_true", help="群聊消息")
     parser.add_argument("--request", action="store_true", help="请求模式（等待回复）")
     parser.add_argument("--timeout", type=int, default=10, help="请求超时（秒）")

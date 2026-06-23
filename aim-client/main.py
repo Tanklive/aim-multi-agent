@@ -2712,47 +2712,36 @@ class AIMClient:
 
 
     def _is_confirm_loop(self, msg, reply: str) -> bool:
+        """P0-004 合并双检测器：L3 ACK/INFO 拦截 + 疲劳检测 → mute 60s
 
-        """检测群聊确认死锁：疲劳检测 → mute 60s
-
-        
-
-        新原则（2026-06-21 大哥）：不看字数/关键词，看信息增量。
-
-        30-100字的「收到+客气话」同样判定为无效。
-
+        统一 _classify_msg_type（L3 分类）为入口，呱呱 ACK skip 与吉量疲劳
+        检测共享同一判定逻辑。两步走：
+          1. L3 快速拦截：AI 回复是 ACK/INFO → 直接 skip，不进疲劳计数
+          2. 疲劳检测：连续 N 轮无效 → mute 60s（安全网）
         """
-
         if not msg.grp_id:
-
             return False
-
         in_text = (msg.content or "").strip()
-
         out_text = reply.strip()
-
         # 入站消息记录到内容历史
-
         self._record_grp_msg(msg.grp_id, in_text)
-
-        # 出站回复判定
-
-        is_effective = not self._is_ineffective(msg.grp_id, out_text)
-
-        self._record_grp_reply(msg.grp_id, out_text, is_effective)
-
-        if self._grp_is_fatigued(msg.grp_id):
-
-            self.logger.info(
-
-                f" [{msg.msg_id[:8]}] ⛔ 群聊疲劳 mute: {msg.grp_id} "
-
-                f"(连续 {self.GRP_FATIGUE_MAX_EMPTY} 轮无效, mute {self.GRP_FATIGUE_MUTE}s)"
-
+        # P0-004: L3 快速 ACK/INFO 拦截 — 与 _skip_adapter_for_operational 共享判定
+        reply_type = self._classify_msg_type(out_text)
+        if reply_type in ('ACK', 'INFO'):
+            self._record_grp_reply(msg.grp_id, out_text, False)
+            self.logger.debug(
+                f" [{msg.msg_id[:8]}] 群聊回复拦截 (L3-{reply_type}): {out_text[:40]}"
             )
-
             return True
-
+        # 疲劳检测路径（安全网）
+        is_effective = not self._is_ineffective(msg.grp_id, out_text)
+        self._record_grp_reply(msg.grp_id, out_text, is_effective)
+        if self._grp_is_fatigued(msg.grp_id):
+            self.logger.info(
+                f" [{msg.msg_id[:8]}] ⛔ 群聊疲劳 mute: {msg.grp_id} "
+                f"(连续 {self.GRP_FATIGUE_MAX_EMPTY} 轮无效, mute {self.GRP_FATIGUE_MUTE}s)"
+            )
+            return True
         return False
 
 
@@ -3222,6 +3211,12 @@ class AIMClient:
 
             raise HumanInterventionError(stderr_text or f"adapter exit=3")
 
+        elif rc == 124:
+
+            # exit=124 = timeout 命令被杀 → 可重试（适配器内 124→1 映射可能因 set -e 未触发）
+
+            raise RetryableError(stderr_text or "adapter timeout (rc=124)")
+
         elif rc == 4:
 
             # AGENT_UNREACHABLE（exit=4）：agent数据不在磁盘/框架崩溃 → DEGRADE+可恢复
@@ -3230,7 +3225,7 @@ class AIMClient:
 
         else:
 
-            # 5+ UNKNOWN → 按 FATAL 处理（未知即不安全）
+            # 其他未知 exit code → 按 FATAL 处理（未知即不安全）
 
             raise HumanInterventionError(f"unknown exit={rc}: {stderr_text[:100]}")
 

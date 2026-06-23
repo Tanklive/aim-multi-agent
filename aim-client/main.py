@@ -856,7 +856,13 @@ class AIMClient:
 
         self._dispatched_ids: set = set()  # U-006: 已 dispatch 去重（发送 adapter 后）
 
+        # R-002: 去重集持久化，防重启丢失（120s 幻觉窗口）
+        self._dedup_persist_path: Optional[Path] = None
+
         self._my_msg_ids: set = set()  # U-007: 本 Agent 发出的消息 ID，用于群聊 reply_to 过滤
+
+        # R-002: 恢复持久化去重集
+        self._init_dedup_persist()
 
         # 619-20: StallWatchdog — 检测 dispatch_loop 假死
 
@@ -1120,7 +1126,7 @@ class AIMClient:
 
                         if msg.msg_id:
 
-                            self._dispatched_ids.add(msg.msg_id)
+                            self._add_dispatched_id(msg.msg_id)
 
                         self.queue.ack(msg.msg_id)
 
@@ -1164,7 +1170,7 @@ class AIMClient:
 
                             if msg.msg_id:
 
-                                self._dispatched_ids.add(msg.msg_id)
+                                self._add_dispatched_id(msg.msg_id)
 
                             self._retry_tracker.pop(msg.msg_id, None)
 
@@ -3435,19 +3441,11 @@ class AIMClient:
 
         if msg_id:
 
-            self._processed_ids.add(msg_id)
+            self._add_processed_id(msg_id)
 
         self._seen_msg_keys[dedup_key] = now_ts
 
-        # 限制去重集合大小
-
-        if len(self._processed_ids) > 2000:
-
-            self._processed_ids = set(list(self._processed_ids)[-500:])
-
-        if len(self._dispatched_ids) > 2000:
-
-            self._dispatched_ids = set(list(self._dispatched_ids)[-500:])
+        # 限制去重集合大小（_processed_ids/_dispatched_ids 在 add 方法内已处理）
 
         if len(self._seen_msg_keys) > 500:
 
@@ -3489,6 +3487,108 @@ class AIMClient:
 
         self.scheduler.on_message_enqueued()
 
+    # ── R-002: 去重集持久化 ──────────────────────────────────────
+
+    def _init_dedup_persist(self):
+        """初始化去重持久化文件路径（需在 agent_id 确定后调用）"""
+        if not self.agent_id:
+            return
+        data_dir = Path.home() / ".aim" / "agents" / self.agent_id
+        data_dir.mkdir(parents=True, exist_ok=True)
+        self._dedup_persist_path = data_dir / "dedup_ids.jsonl"
+        self._restore_dedup_ids()
+
+    def _restore_dedup_ids(self):
+        """R-002: 从 JSONL 文件恢复去重集，防重启丢失"""
+        if not self._dedup_persist_path or not self._dedup_persist_path.exists():
+            return
+        try:
+            with open(self._dedup_persist_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        s = entry.get("set", "")
+                        mid = entry.get("msg_id", "")
+                        if s == "processed" and mid:
+                            self._processed_ids.add(mid)
+                        elif s == "dispatched" and mid:
+                            self._dispatched_ids.add(mid)
+                    except json.JSONDecodeError:
+                        pass
+            # 应用上限
+            if len(self._processed_ids) > 2000:
+                self._processed_ids = set(list(self._processed_ids)[-500:])
+            if len(self._dispatched_ids) > 2000:
+                self._dispatched_ids = set(list(self._dispatched_ids)[-500:])
+            self.logger.info(
+                f"R-002 dedup restore: processed={len(self._processed_ids)}"
+                f" dispatched={len(self._dispatched_ids)}"
+            )
+        except Exception as e:
+            self.logger.warning(f"R-002 dedup restore failed: {e}")
+
+    def _persist_dedup_id(self, set_name: str, msg_id: str):
+        """追加一行去重 ID 到持久化文件（同步写入，单行 JSON 足够快）"""
+        if not self._dedup_persist_path:
+            return
+        try:
+            line = json.dumps(
+                {"set": set_name, "msg_id": msg_id, "ts": time.time()},
+                ensure_ascii=False,
+            ) + "\n"
+            with open(self._dedup_persist_path, "a") as f:
+                f.write(line)
+            # 定期压缩：文件 > 50KB 时触发
+            if self._dedup_persist_path.stat().st_size > 50_000:
+                self._compact_dedup_persist()
+        except Exception:
+            pass  # 持久化失败不影响主流程
+
+    def _compact_dedup_persist(self):
+        """R-002: 压缩去重持久化文件，只保留最近的 ID"""
+        if not self._dedup_persist_path:
+            return
+        try:
+            processed = list(self._processed_ids)[-500:]
+            dispatched = list(self._dispatched_ids)[-500:]
+            now = time.time()
+            lines = []
+            for mid in processed:
+                lines.append(json.dumps(
+                    {"set": "processed", "msg_id": mid, "ts": now},
+                    ensure_ascii=False,
+                ))
+            for mid in dispatched:
+                lines.append(json.dumps(
+                    {"set": "dispatched", "msg_id": mid, "ts": now},
+                    ensure_ascii=False,
+                ))
+            tmp = self._dedup_persist_path.with_suffix(".tmp")
+            tmp.write_text("\n".join(lines) + ("\n" if lines else ""))
+            os.replace(tmp, self._dedup_persist_path)
+            self.logger.debug(
+                f"R-002 dedup compact: processed={len(processed)}"
+                f" dispatched={len(dispatched)}"
+            )
+        except Exception:
+            pass
+
+    def _add_processed_id(self, msg_id: str):
+        """R-002: 添加去重 ID（内存 + 持久化），自动上限裁剪"""
+        self._processed_ids.add(msg_id)
+        self._persist_dedup_id("processed", msg_id)
+        if len(self._processed_ids) > 2000:
+            self._processed_ids = set(list(self._processed_ids)[-500:])
+
+    def _add_dispatched_id(self, msg_id: str):
+        """R-002: 添加 dispatch 去重 ID（内存 + 持久化），自动上限裁剪"""
+        self._dispatched_ids.add(msg_id)
+        self._persist_dedup_id("dispatched", msg_id)
+        if len(self._dispatched_ids) > 2000:
+            self._dispatched_ids = set(list(self._dispatched_ids)[-500:])
 
 
     def _validate_envelope(self, envelope: dict):

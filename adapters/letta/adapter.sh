@@ -3,7 +3,7 @@ set -eu
 # v1.12.0: 移除 pipefail — 在 $() 嵌套调用场景下 pipefail 导致子进程继承破损 pipe fd 触发 SIGPIPE (141)
 # 脚本内无数据管道（所有管道已在 v1.12.0 中改为临时文件或 python3），pipefail 无保护价值
 # AIM Letta adapter — AIM Client v1.2 标准接口
-# VERSION: 1.13.1    [v1.13.0: --new 池化回退 — --conversation 复用实验已放弃]
+# VERSION: 1.13.2    [v1.13.2: +context-live L2 即时上下文注入]
 #                     [v1.13.1: --from 强制必填，移除 "unknown" 默认值回退]
 #
 # 6 个标准模式:
@@ -251,7 +251,17 @@ PROBE_TIMEOUT=35
 # P0: 35s 一次给够（冷启动实测 17s + LLM 推理 5-15s），取消重试避免浪费时间
 DISPATCH_IDS_FILE="$SCRIPT_DIR/dispatch_conv_ids.txt"
 POOL_SIZE="${DISPATCH_CONV_POOL_SIZE:-2}"
-PROMPT="[AIM dispatch - 仅回复本条消息，不要回复历史] ${MESSAGE}"
+# L2 即时上下文（L1 项目骨架走 MemFS）
+CTX_LIVE=""
+if [ -f "${AIM_SHARED:-$HOME/shared/aim}/PROJECT/context-live.md" ]; then
+    CTX_LIVE="$(head -10 "${AIM_SHARED:-$HOME/shared/aim}/PROJECT/context-live.md")"
+fi
+
+PROMPT=""
+if [ -n "$CTX_LIVE" ]; then
+    PROMPT="${PROMPT}[即时上下文: ${CTX_LIVE}] "
+fi
+PROMPT="${PROMPT}[AIM群聊 — 你是火鸡儿🐤，按你的性格回复，信息密度优先，别当应答机] ${MESSAGE}"
 
 # ── 读取 config.json 获取 pool_size ─────
 _load_pool_size() {

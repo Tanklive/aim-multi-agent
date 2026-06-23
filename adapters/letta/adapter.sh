@@ -175,7 +175,9 @@ fi
 #         不再依赖写死的 local-conv-1422
 if [ "$MODE" = "trim" ]; then
     _detect_letta || exit 2
-    _load_pool_size
+    POOL_SIZE="${DISPATCH_CONV_POOL_SIZE:-2}"
+    DISPATCH_IDS_FILE="${DISPATCH_IDS_FILE:-$SCRIPT_DIR/dispatch_conv_ids.txt}"
+    # inline _load_pool_size + DISPATCH_IDS_FILE (定义在后面，trim 在定义前调用)
 
     CONV_BASE="${HOME}/.letta/lc-local-backend/conversations"
     TOTAL_BEFORE=0

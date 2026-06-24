@@ -818,12 +818,23 @@ class AIMClient:
 
         self._init_fatigue_state()  # U-107: 群聊疲劳检测
 
+        # 注入 config.json 中声明的环境变量（三框架通用）
+        # L1: adapter_env（框架专属变量，如 HERMES_API_KEY）
+        adapter_env_cfg = self.config.get("adapter_env", {})
+        if isinstance(adapter_env_cfg, dict):
+            for k, v in adapter_env_cfg.items():
+                self.adapter_env[str(k)] = str(v)
+
+        # L2: env（通用环境变量，如 HERMES_BIN / OPENCLAW_BIN）
+        env_cfg = self.config.get("env", {})
+        if isinstance(env_cfg, dict):
+            for k, v in env_cfg.items():
+                self.adapter_env[str(k)] = str(v)
+
+        # L3: 旧格式兼容（letta_bin / letta_agent_id 作为顶层的旧写法）
         for config_key in ("letta_bin", "letta_agent_id"):
-
             val = self.config.get(config_key)
-
-            if val:
-
+            if val and config_key.upper() not in self.adapter_env:
                 self.adapter_env[config_key.upper()] = str(val)
 
 

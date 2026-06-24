@@ -765,12 +765,14 @@ ZS0003: PROTOCOL_VERSION=1.0 ✅
 - [ ] CHANGELOG 更新了吗？（看 5.3）
 - [ ] shared 同步了吗？（看 六）
 - [ ] 部署版和 shared 版一致吗？（看 十五）
+- [ ] `bash adapters/sync-check.sh` 跑了吗？（v1.4 新增，部署一致性自动检查）
 
 **版本冲突时**：
 - 📌 以 SDK 为基准（看 3.4）
 
 **发布前**：
 - 📌 跑 十五 检查清单
+- 📌 `bash adapters/sync-check.sh --fix`（自动修复部署不一致，v1.4 新增）
 
 **内部重构**：
 - 📌 不 bump 版本号，CHANGELOG 标"内部重构"（看 5.3）
@@ -779,7 +781,8 @@ ZS0003: PROTOCOL_VERSION=1.0 ✅
 - 📌 跑 十 回滚流程
 
 **子模块说明**：
-- aim-watch 临时独立版本（2.1.0），下次 MAJOR→2.0 纳入统一版本；Queue / Scheduler / Security 按 3.2 子模块规则
+- aim-watch 临时独立版本（2.2.0），下次 MAJOR→2.0 纳入统一版本；Queue / Scheduler / Security 按 3.2 子模块规则
+- sync-check.sh 由吉量实现 v1.0（2026-06-24），集成到日常速查流程（v1.4.0）
 
 ## 十八、版本管理和项目开发流程耦合（[手动] 标记，自动化脚本待 P2）
 

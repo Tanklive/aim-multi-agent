@@ -1,12 +1,16 @@
-# AIM 即时上下文 2026-06-23
+# AIM 即时上下文 2026-06-24
 ## 当前阶段
-context-card 冷启动上下文注入方案部署完成（三方 adapter 全部上线 + 端到端验证通过）
+v1.4.0 版本管理全面整治完成。三 Agent 本地 VERSION 统一 1.4.0，git tag v1.4.0 已打。
 
 ## 阻塞
-U-002(Letta TUI占) / U-004(单点故障) / U-106(adapter版本分裂) / P0-004(归档)
-— 4项等群聊回复推进
+U-002(Letta TUI占) / U-004(单点故障) — 2项等群聊回复推进
+
+## 已关闭
+U-106(adapter版本分裂) ✅ — v1.4.0 版本对齐
+P0-004(归档) ✅ — archive-cold.sh + cron 每月1号
 
 ## 最近决策
+- 6/24 v1.4.0 版本管理整治：版本号全对齐、CHANGELOG 补全、git tag v1.4.0、sync-check.sh 集成
 - 6/23 context-card 两层注入上线：ZS0001 v2.2(session-key)/ZS0002 v1.5/Z0003 v1.13.2
 - 6/23 任务闭环协议：✅结论标记 → 自动验证 → 汇报大哥
 - 6/23 ZS0001 adapter 切 --session-key 独立 session，不阻塞主会话

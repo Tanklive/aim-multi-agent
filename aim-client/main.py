@@ -994,9 +994,11 @@ class AIMClient:
                             self._stall_recovery_count = 0
 
                         else:
+                            # 623: 只在队列非空时复位，避免空队列误报
+                            if self.queue.size() > 0:
+                                self.scheduler.reset_to_idle()
 
-                            self.scheduler.reset_to_idle()
-
+                        # 620: 修复 StallWatchdog 触发后 _dispatch_event 未 set 致 dispatch 永久阻塞
                         # 620: 修复 StallWatchdog 触发后 _dispatch_event 未 set 致 dispatch 永久阻塞
 
                         self._dispatch_event.set()

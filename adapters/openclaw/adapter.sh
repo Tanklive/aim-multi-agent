@@ -1,6 +1,6 @@
 #!/bin/bash
-# adapter-version: v2.0  (项目 1.3.3 | OpenClaw adapter | ZS0001 呱呱)
-# OpenClaw AIM Adapter — v1.5 (2026-06-20)
+# adapter-version: v2.2  (项目 1.4.0 | OpenClaw adapter | ZS0001 呱呱)
+# 构建: 2026-06-23 +context-card + --session-key 隔离
 # process: 直接调用 OpenClaw CLI，调用方阻塞等回复（≤30s）
 # 退出码: 0=正常, 1=可重试, 2=挂了, 3=需人工介入
 
@@ -50,11 +50,38 @@ done
 [ -z "$MESSAGE" ] && { echo "缺少 --message" >&2; exit 2; }
 FROM_ID="${FROM_ID:-unknown}"
 
-# 直接调 OpenClaw agent 生成回复
+# 注入性格 + 项目上下文（L1 骨架 + L2 即时）
+PERSONALITY=""
+if [ -f "$AIM_WORKSPACE/SOUL.md" ]; then
+    PERSONALITY="$(sed -n '/^### 性格/,/^## /p' "$AIM_WORKSPACE/SOUL.md" | head -15)"
+fi
+CONTEXT=""
+if [ -f "$AIM_SHARED/PROJECT/context-card.md" ]; then
+    CONTEXT="$(head -30 "$AIM_SHARED/PROJECT/context-card.md")"
+fi
+if [ -f "$AIM_SHARED/PROJECT/context-live.md" ]; then
+    CONTEXT="${CONTEXT}
+$(head -10 "$AIM_SHARED/PROJECT/context-live.md")"
+fi
+
+# 构建 prompt
+BASE="你是呱呱🐸，来自 ${FROM_ID} 的消息"
+if [ -n "$PERSONALITY" ]; then
+    BASE="${BASE}。你的性格：${PERSONALITY}"
+fi
+if [ -n "$CONTEXT" ]; then
+    PROMPT="${BASE}。项目上下文：${CONTEXT}。直接回复(20-80字)以🐸开头：${MESSAGE}"
+else
+    PROMPT="${BASE}。直接回复(20-80字)以🐸开头：${MESSAGE}"
+fi
+
+# 独立 session key 隔离，不阻塞主会话（等同 hermes chat -q 新进程）
+SESSION_KEY="agent:main:aim-reply-$(date +%s)-$$"
+
 REPLY=$("$OPENCLAW_BIN" agent \
-    --agent main \
-    --message "你是呱呱🐸，来自 ${FROM_ID} 的消息。直接回复(20-80字)以🐸开头：${MESSAGE}" \
-    --json --timeout 25 2>/dev/null | python3 -c "
+    --session-key "$SESSION_KEY" \
+    --message "${PROMPT}" \
+    --json --timeout 25 2>/dev/null | python3.13 -c "
 import sys,json
 try:
     d=json.load(sys.stdin)

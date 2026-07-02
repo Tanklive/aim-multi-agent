@@ -892,8 +892,8 @@ _BLOCKED_PATTERNS = [
     r"^\s*(?:sudo|bash|sh|curl|wget|chmod|chown|rm\s+-rf|mkfs|dd|:(){)\s",
     # 裸配置命令
     r"^\s*(?:nsc|nkeys|jwt|nats)\s",
-    # 纯 JSON 非信封（无 ver/from/id 字段）
-    r"^\{\s*\"(?!ver|from|id|type)\w+\":",
+    # 纯 JSON 非信封 — 放行 v1.0 协议字段(ver/from/id/type/status/version/reply/error/error_code/session_id/elapsed_ms)
+    r"^\{\s*\"(?!ver|from|id|type|status|version|reply|error|error_code|session_id|elapsed_ms)\w+\":",
     # 二进制/不可打印字符
     # 通过长度检查覆盖
 ]

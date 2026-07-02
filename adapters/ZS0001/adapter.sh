@@ -1,5 +1,6 @@
 #!/bin/bash
-# OpenClaw AIM Adapter — v1.5 (2026-06-20)
+# adapter-version: v2.2  (项目 1.4.0 | OpenClaw adapter | ZS0001 呱呱)
+# 构建: 2026-06-23 +context-card + --session-key 隔离
 # process: 直接调用 OpenClaw CLI，调用方阻塞等回复（≤30s）
 # 退出码: 0=正常, 1=可重试, 2=挂了, 3=需人工介入
 
@@ -23,7 +24,7 @@ fi
 
 # ── info ──
 if [ "$MODE" = "info" ]; then
-    printf '{"provider":"openclaw","execution_model":"realtime"}\n'; exit 0
+    printf '{"provider":"openclaw","execution_model":"realtime","version":"v2.0","project":"%s"}\n' "$(cat ~/shared/aim/VERSION 2>/dev/null || echo unknown)"; exit 0
 fi
 
 # ── cancel ──
@@ -49,34 +50,38 @@ done
 [ -z "$MESSAGE" ] && { echo "缺少 --message" >&2; exit 2; }
 FROM_ID="${FROM_ID:-unknown}"
 
-# ── 纯确认过滤（防 ping-pong 循环）──
-# 这些消息不需要回复：收到、1、👍、👌、✅ 等短确认
-_filter_ack() {
-    local msg="$1"
-    # 去掉 emoji/空白后的纯文本
-    local stripped
-    stripped=$(echo "$msg" | sed 's/[✨🐴🐸👂👍👌✅⏸️🟢🔌🤝💪👀🧠]/ /g' | sed 's/  */ /g' | xargs)
-    # 纯数字/单字
-    [[ "$stripped" =~ ^[0-9]+$ ]] && return 0
-    # 纯收到
-    [[ "$stripped" =~ ^收到 ]] && return 0
-    # 纯好/OK/行/知道了
-    [[ "$stripped" =~ ^(好的|知道了|OK|行|好|嗯|哦) ]] && return 0
-    # 纯表情回复
-    [[ -z "$stripped" ]] && return 0
-    return 1
-}
-
-if _filter_ack "$MESSAGE"; then
-    echo "[纯确认，跳过]" >&2
-    exit 0  # 空回复 = 静默ack，不发消息，不触发重试
+# 注入性格 + 项目上下文（L1 骨架 + L2 即时）
+PERSONALITY=""
+if [ -f "$AIM_WORKSPACE/SOUL.md" ]; then
+    PERSONALITY="$(sed -n '/^### 性格/,/^## /p' "$AIM_WORKSPACE/SOUL.md" | head -15)"
+fi
+CONTEXT=""
+if [ -f "$AIM_SHARED/PROJECT/context-card.md" ]; then
+    CONTEXT="$(head -30 "$AIM_SHARED/PROJECT/context-card.md")"
+fi
+if [ -f "$AIM_SHARED/PROJECT/context-live.md" ]; then
+    CONTEXT="${CONTEXT}
+$(head -10 "$AIM_SHARED/PROJECT/context-live.md")"
 fi
 
-# 直接调 OpenClaw agent 生成回复
+# 构建 prompt
+BASE="你是呱呱🐸，来自 ${FROM_ID} 的消息"
+if [ -n "$PERSONALITY" ]; then
+    BASE="${BASE}。你的性格：${PERSONALITY}"
+fi
+if [ -n "$CONTEXT" ]; then
+    PROMPT="${BASE}。项目上下文：${CONTEXT}。直接回复(20-80字)以🐸开头：${MESSAGE}"
+else
+    PROMPT="${BASE}。直接回复(20-80字)以🐸开头：${MESSAGE}"
+fi
+
+# 独立 session key 隔离，不阻塞主会话（等同 hermes chat -q 新进程）
+SESSION_KEY="agent:main:aim-reply-$(date +%s)-$$"
+
 REPLY=$("$OPENCLAW_BIN" agent \
-    --agent main \
-    --message "你是呱呱🐸，来自 ${FROM_ID} 的消息。直接回复(20-80字)以🐸开头：${MESSAGE}" \
-    --json --timeout 25 2>/dev/null | python3 -c "
+    --session-key "$SESSION_KEY" \
+    --message "${PROMPT}" \
+    --json --timeout 25 2>/dev/null | python3.13 -c "
 import sys,json
 try:
     d=json.load(sys.stdin)

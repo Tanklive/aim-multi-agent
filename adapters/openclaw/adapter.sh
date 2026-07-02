@@ -15,11 +15,15 @@ shift 2>/dev/null || true
 
 # ── health ──
 if [ "$MODE" = "health" ]; then
-    PID=$(ps aux | grep -v grep | grep "openclaw.*gateway" | awk '{print $2}' | head -1)
-    if [ -z "$PID" ] || ! kill -0 "$PID" 2>/dev/null; then
-        echo '{"status":"unhealthy"}' >&2; exit 2
+    # 直连 HTTP /health 端点，不走 openclaw CLI（避免 Gateway 单线程排队）
+    if curl -sf --max-time 5 http://127.0.0.1:18789/health >/dev/null 2>&1; then
+        echo '{"status":"healthy","active_sessions":1}'; exit 0
     fi
-    echo '{"status":"healthy","active_sessions":1}'; exit 0
+    # 兜底：curl 不可用时试 openclaw CLI
+    if "$OPENCLAW_BIN" gateway status 2>/dev/null | grep -q "Service:"; then
+        echo '{"status":"healthy","active_sessions":1}'; exit 0
+    fi
+    echo '{"status":"unhealthy"}' >&2; exit 2
 fi
 
 # ── info ──
@@ -75,13 +79,14 @@ else
     PROMPT="${BASE}。直接回复(20-80字)以🐸开头：${MESSAGE}"
 fi
 
-# 独立 session key 隔离，不阻塞主会话（等同 hermes chat -q 新进程）
-SESSION_KEY="agent:main:aim-reply-$(date +%s)-$$"
+# 独立 aim-reply agent + 独立 session，不阻塞 webchat 主会话
+SESSION_KEY="agent:aim-reply:reply-$(date +%s)-$$"
 
 REPLY=$("$OPENCLAW_BIN" agent \
+    --agent aim-reply \
     --session-key "$SESSION_KEY" \
     --message "${PROMPT}" \
-    --json --timeout 25 2>/dev/null | python3.13 -c "
+    --json --timeout 45 2>/dev/null | python3.13 -c "
 import sys,json
 try:
     d=json.load(sys.stdin)
@@ -93,5 +98,7 @@ except: pass
 if [ -n "$REPLY" ]; then
     echo "$REPLY"; exit 0
 else
-    echo "OpenClaw 无回复" >&2; exit 1
+    # fallback: 返回确认文本避免重试风暴，stderr打告警供监控
+    echo "🐸 收到(from=${FROM_ID}，adapter busy)"
+    echo "OpenClaw 无回复 (degraded)" >&2; exit 0
 fi

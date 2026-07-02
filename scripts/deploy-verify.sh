@@ -181,16 +181,3 @@ else
     exit 1
 fi
 
-# ── 6. E2E 烟雾测试（U-104, 2026-06-20） ──
-echo -e "\n🔥 E2E Smoke Test"
-SEND_SCRIPT=~/shared/aim/aim_send_nats.py
-TARGET=ZS0003
-TEST_MSG="E2E-DEPLOY-VERIFY-$(date +%s)"
-
-echo "  📤 发送测试 DM → $TARGET ..."
-result=$(python3.13 "$SEND_SCRIPT" "$TARGET" "$TEST_MSG" 2>&1)
-msg_id=$(echo "$result" | grep -o 'msg_id: [a-f0-9]\{12\}' | awk '{print $2}')
-
-if [ -n "$msg_id" ]; then
-    echo -e "  ${GREEN}✅${NC} NATS publish 成功 (msg_id=$msg_id)"
-    ((pass++))

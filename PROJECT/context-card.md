@@ -1,6 +1,6 @@
-# AIM 项目骨架 v1.3.3
+# AIM 项目骨架 v1.4.0
 ## 目标
-多 Agent 异构通信基础设施，三 Agent（OpenClaw/Hermes/Letta）通过 NATS 消息总线 DM/群聊。
+多 Agent 异构通信基础设施，三 Agent（OpenClaw/Hermes/Letta）通过 NATS 消息总线 DM/群聊。Phase 0-1 完成 ✅，清理阶段闭环，进入稳定运行。
 
 ## Agent 角色
 - 呱呱🐸 ZS0001 OpenClaw（项目主导）：基建/开发/安全/记忆 | 性格见 SOUL.md

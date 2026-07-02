@@ -1,33 +1,33 @@
-# AIM 即时上下文 2026-06-24
+# AIM 即时上下文 2026-06-30
 ## 当前阶段
-v1.4.0 版本管理全面整治完成。三 Agent 本地 VERSION 统一 1.4.0，git tag v1.4.0 已打。
+v1.4.0 稳定运行。四座大山已清零 ✅。Round 2 8/8 全链路闭环。
 
 ## 阻塞
-U-002(Letta TUI占) / U-004(单点故障) — 2项等群聊回复推进
+— 暂无
+
+## 今日修复 (6/30)
+- adapter timeout 25→45s（webchat 活跃时不超时）
+- fallback exit 1→0（不触发重试风暴）
+- `--agent aim-reply` 独立 agent（避免 main agent Gateway 竞争）
+- health probe `curl` 代替 `openclaw gateway status`（消灭假 OFFLINE）
+- 三方连通验证：群消息收发正常 ✅
 
 ## 已关闭
-U-106(adapter版本分裂) ✅ — v1.4.0 版本对齐
-P0-004(归档) ✅ — archive-cold.sh + cron 每月1号
+- U-002(Letta TUI) ✅ 架构上限，已确认
+- U-004(单点故障) ✅ 架构上限
+- U-106(adapter版本分裂) ✅
+- P0-004(归档) ✅
+
+## 待推进
+- T021 Agent SDK 化（P0，待分配）
+- T022 Advisor 模式（P0，待分配）
+- T023 工具参数级权限（P1，待分配）
+- Python 3.14 brew 残留（等大哥确认 uninstall）
+- ZS0002 偶发不稳定（macOS 网络栈瞬断，P2）
 
 ## 最近决策
-- 6/24 v1.4.0 版本管理整治：版本号全对齐、CHANGELOG 补全、git tag v1.4.0、sync-check.sh 集成
-- 6/23 context-card 两层注入上线：ZS0001 v2.2(session-key)/ZS0002 v1.5/Z0003 v1.13.2
-- 6/23 任务闭环协议：✅结论标记 → 自动验证 → 汇报大哥
-- 6/23 ZS0001 adapter 切 --session-key 独立 session，不阻塞主会话
-- 6/21 无效沟通三层防护上线 / Python 3.14清零 / 三Agent锁3.13
-
-## 当前讨论
-卡片共享方案评审 ✅：
-- 三方一致：方向对（平台下发+按组隔离），时机未到（OAS Phase 0 开展）
-- 当前 `~/shared/aim/PROJECT/` 本地共享继续用
-- 卡片平台下发方案进入 OAS Phase 0 研究议题池
-
-## 技术状态
-- 6/23 20:14 StallWatchdog 毒化队列已修复（清 aim-messages 5669条 + 清本地队列 + 重启）
-- ZS0002 偶发 1次 Watchdog 残留，ZS0003 恢复正常
-- 卡片讨论群消息收发验证：✅ 全链路正常
-
-## 2026-06-24 凌晨更新
-- P0-004 冷归档落地：脚本 ~/shared/aim/scripts/archive-cold.sh + cron 每月1号 03:00
-- 四座大山全部收尾：U-002 ✅ U-004 ✅(架构上限) U-106 ✅ P0-004 ✅
-- AIM 清理阶段基本完成，待进入 OAS Phase 0
+- 6/30 adapter 4项优化：timeout+fallback+aim-reply+health-curl
+- 6/24 v1.4.0 版本管理整治
+- 6/23 context-card 两层注入上线
+- 6/23 任务闭环协议
+- 6/21 无效沟通三层防护 / Python 3.14清零

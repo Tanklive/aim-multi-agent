@@ -71,3 +71,11 @@
 - v1.2.0: adapter 4 接口标准化 + 三级降级模型
 - v1.1.0: Registry KV 健康快照 + 事件日志
 - v1.0.0: AIM Client 独立进程，直连 NATS
+
+## 2026-06-30 ZS0001 adapter health 修复
+
+### Fixed
+- **adapter.sh health**: macOS TCC 安全策略在 AIM Client 子进程上下文拦截 `/bin/ps`，导致 health 探针误报 unhealthy
+- 修复：改用 `openclaw gateway status` 替代 `ps aux | grep`，不依赖进程查询权限
+- 验证：`adapter.sh health` → `{"status":"healthy","active_sessions":1}`
+- 同步：已同步到 shared/aim/adapters/openclaw/adapter.sh

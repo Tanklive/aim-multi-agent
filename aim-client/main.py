@@ -133,6 +133,8 @@ from aim_client.queue import MessageQueue
 from aim_client.scheduler import Scheduler
 
 from aim_client.health_probe import HealthProbe
+from aim_client.notification import NotificationHandler  # 624: 新消息提醒接口标准
+from aim_client.grp_policy import GroupPolicyManager  # 624: 群聊冷却机制
 
 from aim_nats_sdk import load_global_config
 
@@ -506,6 +508,52 @@ class Transport:
 
 
 
+    async def subscribe_notification(self, handler):
+
+        """625: 订阅 aim.notification.<agent_id> — 通知消费侧实时推送
+
+        R-001 修复：NATS 推送通道已就绪但无人订阅，导致 @提醒等通知
+
+        只能通过心跳轮询 JSONL 文件（最长 30s 延迟）。
+
+        此方法订阅后，通知实时推送到 handler 回调。
+
+        """
+
+        subject = f"aim.notification.{self.agent_id}"
+
+
+
+        async def _cb(msg):
+
+            try:
+
+                import json
+
+                data = json.loads(msg.data.decode())
+
+                self._logger.debug(f"[notification] 收到实时通知: {data.get('event', '?')} from={data.get('from_id', '?')}")
+
+                await handler(data)
+
+            except Exception as e:
+
+                self._logger.warning(f"[notification] 处理通知异常: {e}")
+
+
+
+        try:
+
+            sub = await self._sdk.nc.subscribe(subject, cb=_cb)
+
+            self._logger.info(f"🔔 已订阅通知: {subject}")
+
+        except Exception as e:
+
+            self._logger.error(f"[notification] 订阅 {subject} 失败: {e}")
+
+
+
     async def send_dm(self, to_id: str, text: str):
 
         """发送私聊消息 + 送达确认"""
@@ -604,6 +652,20 @@ class Transport:
 
         # await self._sdk.emit_obs("delivered", mid, f"→ {to_id} via {via}")  # 2026-06-21 禁用以省带宽
 
+    async def emit_notification(self, envelope: dict) -> None:
+        """624: 发布通知事件到 NATS system_event 通道
+
+        发布到 aim.notification.<agent_id>，供 Gateway/OpenClaw 订阅后注入会话。
+        与 emit_health 走不同的 subject 空间，互不干扰。
+        """
+        try:
+            import json
+            subject = f"aim.notification.{self.agent_id}"
+            payload = json.dumps(envelope, ensure_ascii=False).encode()
+            await self._sdk.nc.publish(subject, payload)
+        except Exception as e:
+            self._logger.debug(f"emit_notification 失败: {e}")
+
 
 
     async def send_registry_health_report(self, health: dict):
@@ -678,7 +740,7 @@ class Transport:
 
         cfg = load_global_config()
 
-        peers = cfg.get("trusted_peers", ["ZS0001"])
+        peers = cfg.get("trusted_peers", [])
 
         return peer_id in peers
 
@@ -837,6 +899,22 @@ class AIMClient:
             if val and config_key.upper() not in self.adapter_env:
                 self.adapter_env[config_key.upper()] = str(val)
 
+        # L4: 服务发现 — services.api → 通用 AIM_API_* 变量（624 吉量提出）
+        #      扩展口：services.tts / services.vision 同模式追加
+        services = self.config.get("services", {})
+        api_svc = services.get("api", {})
+        if isinstance(api_svc, dict) and api_svc.get("url"):
+            self.adapter_env["AIM_API_URL"] = str(api_svc["url"])
+            auth = api_svc.get("auth", {})
+            if isinstance(auth, dict):
+                cred_ref = auth.get("credential", "")
+                if isinstance(cred_ref, str):
+                    if cred_ref.startswith("${") and cred_ref.endswith("}"):
+                        env_var = cred_ref[2:-1]
+                        self.adapter_env["AIM_API_CREDENTIAL"] = os.getenv(env_var, "") or self.adapter_env.get(env_var, "")
+                    else:
+                        self.adapter_env["AIM_API_CREDENTIAL"] = cred_ref
+
 
 
         self.health_probe = HealthProbe(
@@ -897,6 +975,37 @@ class AIMClient:
         self._stall_min_sec = self.config.get("stall_watchdog_min_sec", 10.0)
 
         self._recover_task: Optional[asyncio.Task] = None  # P2: non-blocking recover handle
+
+        # 624: 群聊冷却机制 — server 端统一配置
+        self.grp_policy = GroupPolicyManager(logger=self.logger)
+
+        # 624: 新消息提醒 Notification API（类似微信红点）
+        _notify_cfg = self.config.get("notification", {})
+        _notify_channels = _notify_cfg.get("channel", ["file"])
+        # 平台标准：system_event 通道强制开启（NATS 推送），不受 config 控制
+        if "system_event" not in _notify_channels:
+            _notify_channels.append("system_event")
+        _notify_webhook = _notify_cfg.get("webhook_url", "")
+        self.notification = NotificationHandler(
+            agent_id=self.agent_id,
+            channels=_notify_channels,
+            webhook_url=_notify_webhook,
+            system_event_publisher=None,  # 延迟注入：等 transport 就绪后调用 set_system_event_publisher()
+            logger=self.logger,
+        )
+        # @mention 检测 — 本 Agent 的名称列表
+        self._mention_names: List[str] = self.config.get("mention_names", [self.agent_id])
+        # 从用户库（_registry.json）自动注入 nickname，新增Agent零代码改动
+        _registry_path = Path.home() / ".aim" / "agents" / "_registry.json"
+        try:
+            if _registry_path.exists():
+                _r = json.loads(_registry_path.read_text())
+                _me = _r.get(self.agent_id, {})
+                _nick = _me.get("nickname", "")
+                if _nick and _nick not in self._mention_names:
+                    self._mention_names.append(_nick)
+        except Exception as e:
+            self.logger.debug(f"读取 _registry.json 失败: {e}")
 
         # L3 护栏: N=3 次自修复失败 → 永久停止 + 告警
 
@@ -1101,6 +1210,18 @@ class AIMClient:
 
                             continue
 
+                        # 624: 群聊冷却机制 — 三级热状态 (grp_policy)
+                        if msg.grp_id:
+                            if not self.grp_policy.should_process(
+                                msg.grp_id,
+                                is_mentioned=msg.is_mentioned,
+                                has_substance=self._has_substance(msg.content),
+                            ):
+                                self._dispatch_event.set()
+                                self.scheduler.on_processing_done()
+                                self.queue.ack(msg.msg_id)
+                                continue
+
                         reply = await self._call_adapter(msg)
 
                         if reply:
@@ -1121,7 +1242,7 @@ class AIMClient:
 
                                 elif self._is_confirm_loop(msg, reply):
 
-                                    self.logger.info(f" [{msg.msg_id[:8]}] 群聊确认循环跳过: in={msg.text[:20]} out={reply[:20]}")
+                                    self.logger.info(f" [{msg.msg_id[:8]}] 群聊确认循环跳过: in={msg.content[:20]} out={reply[:20]}")
 
                                 else:
 
@@ -1145,6 +1266,13 @@ class AIMClient:
 
                         self._stall_recovery_count = 0  # 620-01: 成功投递才清零
 
+                        # 624: 通知 — message.processed
+                        _elapsed = int((time.time() - msg.created_at) * 1000) if hasattr(msg, 'created_at') else 0
+                        await self.notification.processed(
+                            msg_id=msg.msg_id, from_id=msg.from_id,
+                            reply_preview=reply or "", elapsed_ms=_elapsed,
+                        )
+
                         self._retry_tracker.pop(msg.msg_id, None)  # 退避跟踪清除
 
                     except DegradeError:
@@ -1156,6 +1284,12 @@ class AIMClient:
                         # 619-11: 降级告警
 
                         self.logger.warning(f"⚠️  [{self.agent_id}] adapter 降级，停止投递")
+
+                        # 624: 通知 — message.failed (degrade)
+                        await self.notification.failed(
+                            msg_id=msg.msg_id, from_id=msg.from_id,
+                            reason="degrade", retries=0,
+                        )
 
                         await self.transport.emit_health("degrade", msg.msg_id[:8], "adapter DEGRADE")
 
@@ -1178,6 +1312,12 @@ class AIMClient:
                         if rt >= 3:
 
                             self.logger.warning(f" [{msg.msg_id[:8]}] 退避耗尽 ({rt}次)，入死信")
+
+                            # 624: 通知 — message.failed (retries_exhausted)
+                            await self.notification.failed(
+                                msg_id=msg.msg_id, from_id=msg.from_id,
+                                reason="retries_exhausted", retries=rt,
+                            )
 
                             self.queue.ack(msg.msg_id)  # ack 移除，不 requeue
 
@@ -1245,6 +1385,12 @@ class AIMClient:
 
                         self.logger.error(f"💀 [{self.agent_id}] FATAL exit=3, 永久停止 dispatch")
 
+                        # 624: 通知 — message.failed (fatal)
+                        await self.notification.failed(
+                            msg_id=msg.msg_id, from_id=msg.from_id,
+                            reason="fatal", retries=0,
+                        )
+
                         await self.transport.emit_health("fatal", msg.msg_id[:8], "exit=3")
 
                         self._dispatch_event.set()
@@ -1270,6 +1416,67 @@ class AIMClient:
                 self._reload_config()
 
 
+
+    async def _stall_watchdog_loop(self):
+        """625: 独立看门狗循环 — 与 dispatch_loop 解耦的假死检测 + 自愈
+
+        原 inline StallWatchdog（在 _dispatch_loop 内）无法检测 dispatch 真死锁：
+        dispatch 卡在阻塞 await 时，inline 代码永远不执行。
+
+        此独立 asyncio Task 周期性检查 _last_dispatch_time，
+        dispatch 假死时：
+          1-2 次 → set _dispatch_event + reset_to_idle 尝试唤醒
+          ≥3 次 → sys.exit(4) 让 launchd 重启进程
+        """
+        import time
+        import sys as _sys
+
+        self.logger.info("🔍 StallWatchdog (独立) 启动, timeout={}s".format(self._stall_timeout_sec))
+
+        while self.running:
+            try:
+                await asyncio.sleep(5)
+
+                # 队列空 → 一切正常，重置计数
+                if self.queue.size() == 0:
+                    if self._stall_recovery_count > 0:
+                        self._stall_recovery_count = 0
+                    continue
+
+                now = time.time()
+                stall_sec = now - self._last_dispatch_time if self._last_dispatch_time > 0 else 999
+
+                if stall_sec > self._stall_timeout_sec:
+                    self._stall_recovery_count += 1
+                    self.logger.warning(
+                        f"⏰ StallWatchdog(独立): dispatch 假死 {stall_sec:.0f}s, "
+                        f"queue={self.queue.size()}, 自愈 #{self._stall_recovery_count}"
+                    )
+
+                    if self._stall_recovery_count >= 3:
+                        self.logger.critical(
+                            f"⛔ StallWatchdog: 连续 {self._stall_recovery_count} 次自愈失败, "
+                            f"dispatch 假死 {stall_sec:.0f}s → 进程自重启 (exit=4)"
+                        )
+                        self.running = False
+                        _sys.exit(4)  # SELF_HEAL_RESTART — launchd 会自动拉起
+                    else:
+                        # 尝试唤醒 dispatch: 复位 scheduler + set event
+                        if self.queue.size() > 0:
+                            self.scheduler.reset_to_idle()
+                        self._dispatch_event.set()
+                else:
+                    if self._stall_recovery_count > 0:
+                        self.logger.info(
+                            f"✅ StallWatchdog: dispatch 恢复正常, stall={stall_sec:.1f}s"
+                        )
+                        self._stall_recovery_count = 0
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"StallWatchdog(独立) 异常: {e}")
+                await asyncio.sleep(5)
 
     # ── 系统自举：launchd + healthd 自动管理 ──────────────────
 
@@ -1713,6 +1920,9 @@ class AIMClient:
 
             sys.exit(1)
 
+        # 624: transport 就绪后，注入 system_event publisher
+        self.notification.set_system_event_publisher(self.transport.emit_notification)
+
 
 
         await self.transport.authenticate()
@@ -1745,9 +1955,27 @@ class AIMClient:
 
 
 
+        # 625: 订阅 NATS 通知通道（R-001 修复 — 通知消费侧实时推送）
+
+        try:
+
+            await self.transport.subscribe_notification(self._on_notification)
+
+        except Exception as e:
+
+            self.logger.warning(f"通知订阅跳过: {e}")
+
+
+
         self.running = True
 
         self.logger.info(f" {self.agent_id} AIM Client v{_AIM_VERSION} 启动完成")
+
+        # 625: observer 事件恢复 — aim-watch 可见的启动事件
+
+        await self.transport.emit_obs("online", "", f"v{_AIM_VERSION} started")
+
+
 
         # ── 系统自举：launchd plist + healthd（零 cron 依赖）──
         try:
@@ -1818,6 +2046,10 @@ class AIMClient:
 
         asyncio.create_task(self._dispatch_loop())
 
+        # 625: 独立 StallWatchdog — 与 dispatch_loop 解耦的假死检测
+
+        asyncio.create_task(self._stall_watchdog_loop())
+
         self._dispatch_event.set()
 
 
@@ -1855,6 +2087,10 @@ class AIMClient:
                     self.logger.warning(f"⚠️  [{self.agent_id}] adapter {_last_state}→{new_state}")
 
                     await self.transport.emit_health("state_change", "", f"{_last_state}→{new_state}")
+
+                    # 625: observer 事件恢复 — aim-watch 可见的状态变迁
+
+                    await self.transport.emit_obs("state_change", "", f"{_last_state}→{new_state}")
 
 
 
@@ -3270,6 +3506,34 @@ class AIMClient:
 
 
 
+    async def _on_notification(self, data: dict):
+        """625: NATS 通知通道消费端 — 实时处理 aim.notification.<id> 推送
+
+        R-001 修复：替代 JSONL 轮询（30s 延迟），实现实时通知触达。
+        事件类型: received / processed / failed / mentioned
+        """
+        event = data.get("event", "?")
+        content = data.get("content", "")
+        from_id = data.get("from_id", "?")
+        ts = data.get("ts", 0)
+
+        # mentioned 事件 — 高优先级，直接记录以便心跳感知
+        if event == "mentioned":
+            self.logger.info(f"🔔 [NOTIFY] @mentioned by {from_id}: {content[:80]}")
+            # 写入待处理标记，心跳检查时优先消费
+            notify_mark = Path.home() / ".aim" / "notifications" / ".mentioned_alert"
+            try:
+                import json as _json, time as _time
+                notify_mark.parent.mkdir(parents=True, exist_ok=True)
+                alert = {"from_id": from_id, "content": content, "ts": ts, "read_at": 0}
+                notify_mark.write_text(_json.dumps(alert, ensure_ascii=False))
+            except Exception:
+                pass
+        elif event in ("received", "processed"):
+            self.logger.debug(f"[NOTIFY] {event} from={from_id}")
+        elif event == "failed":
+            self.logger.warning(f"[NOTIFY] ❌ 消息处理失败: {content[:80]}")
+
     async def _on_dm(self, envelope: dict, raw_msg):
 
         from_id = envelope.get("from", envelope.get("from_id", ""))
@@ -3288,7 +3552,7 @@ class AIMClient:
 
         detail = f"from={from_id}" + (f" text={obs_text}" if obs_text else "")
 
-        # await self.transport.emit_obs("received", mid, detail)  # 2026-06-21 禁用以省带宽
+        await self.transport.emit_obs("received", mid, detail)
 
         await self._handle_message(envelope, is_dm=True)
 
@@ -3312,7 +3576,7 @@ class AIMClient:
 
         detail = f"from={from_id}" + (f" text={obs_text}" if obs_text else "")
 
-        # await self.transport.emit_obs("received", mid, detail)  # 2026-06-21 禁用以省带宽
+        await self.transport.emit_obs("received", mid, detail)
 
         await self._handle_message(envelope, is_dm=False)
 
@@ -3497,6 +3761,20 @@ class AIMClient:
         self.queue.enqueue(msg)
 
         self._dispatch_event.set()
+
+        # 624: 新消息提醒 — message.received
+        await self.notification.received(
+            msg_id=msg_id, from_id=from_id,
+            content_preview=content, is_dm=is_dm,
+            grp_id=msg.grp_id,
+        )
+        # 624: 检测 @ 提及 — message.mentioned
+        if not is_dm and NotificationHandler.detect_mention(content, self._mention_names):
+            msg.is_mentioned = True  # 标记给 grp_policy 使用
+            await self.notification.mentioned(
+                msg_id=msg_id, from_id=from_id,
+                content_preview=content, grp_id=msg.grp_id,
+            )
 
         self.scheduler.on_message_enqueued()
 
@@ -3761,6 +4039,9 @@ class AIMClient:
         await self.queue.close_persist()
 
         await self.transport.disconnect()
+
+        # 624: 关闭通知通道
+        await self.notification.close()
 
         self.lock.release()
 

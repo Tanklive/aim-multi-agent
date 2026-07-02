@@ -79,6 +79,7 @@ class Message:
     received_at: float = field(default_factory=time.time)
     dequeued_at: float = 0.0
     retry_count: int = 0
+    is_mentioned: bool = False  # 624: grp_policy — 被 @ 标记
 
 @dataclass
 class AIMChat:

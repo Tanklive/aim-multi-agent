@@ -32,7 +32,7 @@
 | U-103 | 版本 | NOTICE 1.3.0 三项未做 — 运行时版本检查/MIN_SDK_VERSION拒绝/adapter info标准版 | 🟡 | 呱呱 | P0-P2审计 23:35 |
 | U-104 | 部署 | deploy-verify 仅检查文件存在，不做功能测试（E2E smoke test） | 🟡 | 呱呱 | P0-P2审计 23:35 |
 | U-105 | 协议 | PROTOCOL_VERSION=1.0 落后协议文档 v1.2（含已读回执） | ✅ 已解决 | 呱呱 | P0-P2审计 23:35 |
-| U-106 | adapter | adapter.sh 版本分裂未根本解决 — ZS0001(无)/ZS0002(v1.3)/ZS0003(v2.1) | 🟡 🔄 呱呱(ZS0001已补) | 火鸡儿/吉量(待补) | P0-P2审计 23:35 |
+| U-106 | adapter | adapter.sh 版本分裂未根本解决 — shared v2.0 (2026-06-24), ZS0001(已补v1.5+), ZS0002 deploy v1.3(待补→v2.0), ZS0003(v2.1) | 🟡 🔄 呱呱(ZS0001已补) | 火鸡儿/吉量(待补) | P0-P2审计 23:35 |
 | U-107 | 运维 | healthd 查询异常 — 679条事件但 agent 状态查询失败 | ✅ 误报 | — | P0-P2审计 23:35 |
 
 ## 🟢 低优（P2 — 优化/清理）
@@ -130,3 +130,5 @@
 | 2026-06-20 22:43 | ZS0003 | 🟡 P1 | 双会话隔离从未实际部署 (v1.5→v1.8 注释骗了自己) | v1.5 注释写了 --conversation 方案但代码从未传参, 4个版本都在裸 letta -p → 新增 conv 目录 修复: v2.0 ensure_dispatch_conv() + --conversation 真正隔离 已修: adapter.sh v2.0 |
 | 2026-06-20 22:43 | ZS0003 | 🟢 P2 | conv 清理 cron 未排除 dispatch conv | cleanup cron 每天 4 点可能误删 dispatch conv (local-conv-1422) 修复: cleanup-conversations.sh 解码目录名匹配 conversation:local-conv-1422 跳过不删 已修: cleanup-conversations.sh v1.0 |
 | 2026-06-20 23:18 | ZS0002 | 🔴 P0 | dispatch 无幂等去重 → adapter 幻觉 | StallWatchdog重复投递+dispatch无PROCESSED_IDS→同消息多次进adapter→基于过期上下文编造回复。业界方案:NATS/Kafka/AWS/OpenAI全在传输层做message ID去重。修复:dispatch入口加PROCESSED_IDS set(~7行)。详细分析见PROJECT/adapter-hallucination-analysis.md |
+|| 2026-06-24 22:10 | ZS0002 | 🟡 P1 | aim_install.py 未集成 services.api 标准接口 | API Server 标准接口已部署验证通过，逻辑通路就绪。但 aim_install.py 安装时不会自动生成 services.api 字段、不会提示设置 API_SERVER_KEY 环境变量，用户仍需手动填 config.json。待 AIM Client 稳定后集成。详见 ~/shared/aim/规划/api-server-key-standard.md |
+|| 2026-06-24 | ZS0002 | 🟡 P1 | **adapter deployment sync** — shared v2.0 (services.api) vs deploy v1.3 分裂 | 共享目录 ~/shared/aim/adapters/hermes/adapter.sh 已升级到 v2.0（services.api 架构，64行），但部署目录 ~/.aim/adapters/hermes/adapter.sh 仍停在 v1.3（146行旧版）。根因与 U-106 相同：shared 更新后 deploy 未同步。呱呱标记为 bug，后续统一 deploy 同步机制。当前暂不修，避免干扰第三轮测试。 |

@@ -35,7 +35,7 @@ esac
 if [ -n "$RAW" ]; then
     MESSAGE=$(echo "$RAW" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message',''))" 2>/dev/null)
     CTX=$(echo "$RAW" | python3 -c "import sys,json; print(json.load(sys.stdin).get('context',''))" 2>/dev/null)
-    FROM_ID=$(echo "$RAW" | python3 -c "import sys,json; print(json.load(sys.stdin).get('from_id',''))" 2>/dev/null)
+    FROM_ID=$(echo "$RAW" | python3 -c "import sys,json; print(json.load(sys.stdin).get('from',''))" 2>/dev/null)
     SESSION_ID=$(echo "$RAW" | python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null)
 fi
 

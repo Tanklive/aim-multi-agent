@@ -1,6 +1,6 @@
 #!/bin/bash
 set -eu
-# v1.12.0: 移除 pipefail — 在 $() 嵌套调用场景下 pipefail 导致子进程继承破损 pipe fd 触发 SIGPIPE (141)
+# v1.14.1: JSON stdin 双协议 + shlex.quote 安全注入 — 在 $() 嵌套调用场景下 pipefail 导致子进程继承破损 pipe fd 触发 SIGPIPE (141)
 # 脚本内无数据管道（所有管道已在 v1.12.0 中改为临时文件或 python3），pipefail 无保护价值
 # AIM Letta adapter — AIM Client v1.2 标准接口
 # VERSION: 1.13.2    [v1.13.2: +context-live L2 即时上下文注入]

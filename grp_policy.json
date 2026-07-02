@@ -1,0 +1,10 @@
+{
+  "version": "1.0.0",
+  "description": "\u7fa4\u6d88\u606f\u51b7\u5374\u673a\u5236 \u2014 \u4e09\u7ea7\u70ed\u72b6\u6001\uff0cserver \u7aef\u7edf\u4e00\u914d\u7f6e\uff0c\u5404 agent \u63a5\u5165\u81ea\u52a8\u9075\u5faa",
+  "hot_after_mention_sec": 600,
+  "warm_after_idle_sec": 600,
+  "cold_after_idle_sec": 3600,
+  "dm_policy": "always",
+  "comment": "HOT: \u88ab@\u540e600s\u4e3b\u52a8 | WARM: HOT\u95f2300s\u540e\u6709\u5b9e\u8d28\u624d\u56de | COLD: \u518d3600s\u8df3\u8fc7(\u4f46\u5fc3\u8df3\u65f6\u5f3a\u5236\u68c0\u67e5)",
+  "warm_after_hot_idle_sec": 300
+}

@@ -442,9 +442,8 @@ class AIMPin:
 
     Usage:
         pin = AIMPin(agent_id="ZS0002", ttl=120)
-        if not await pin.is_duplicate(msg_id):
-            await pin.mark(msg_id)
-            # process message
+        if await pin.check_and_mark(msg_id):
+            # process message (原子操作，无 TOCTOU 竞态)
     """
 
     DEFAULT_TTL = 120        # 呱呱建议：与 JetStream duplicate_window 一致
@@ -562,6 +561,54 @@ class AIMPin:
 
             self.stats["misses"] += 1
             return False
+
+    async def check_and_mark(self, msg_id: str) -> bool:
+        """原子操作：检查 + 标记。True = 新消息（未处理），False = 重复。
+
+        修复 TOCTOU：原 is_duplicate + mark 分离，锁释放间隙可被并发绕过。
+        此方法持锁完成 check+mark，消除竞态窗口。
+        """
+        async with self._lock:
+            if await self._is_duplicate_locked(msg_id):
+                return False
+            now = time.time()
+            self._cache[msg_id] = now
+            if len(self._cache) > self.max_memory:
+                sorted_items = sorted(self._cache.items(), key=lambda x: x[1])
+                evict_count = len(self._cache) - self.max_memory
+                for mid, _ in sorted_items[:evict_count]:
+                    del self._cache[mid]
+                    self.stats["evicted"] += 1
+            return True
+
+    async def _is_duplicate_locked(self, msg_id: str) -> bool:
+        """内部方法：调用方必须持有 self._lock"""
+        now = time.time()
+        ts = self._cache.get(msg_id)
+        if ts is not None:
+            if now - ts <= self.ttl:
+                self.stats["hits"] += 1
+                return True
+            del self._cache[msg_id]
+        if msg_id in self._persisted:
+            self.stats["hits"] += 1
+            return True
+        try:
+            conn = sqlite3.connect(self._db_path, timeout=3)
+            cursor = conn.execute(
+                "SELECT ts FROM pins WHERE msg_id = ? AND ts + ttl > ?",
+                (msg_id, now),
+            )
+            row = cursor.fetchone()
+            conn.close()
+            if row:
+                self._persisted.add(msg_id)
+                self.stats["hits"] += 1
+                return True
+        except Exception:
+            pass
+        self.stats["misses"] += 1
+        return False
 
     async def mark(self, msg_id: str):
         """标记 msg_id 为已处理（先 is_duplicate 检查通过后调用）"""
@@ -1386,14 +1433,11 @@ class AIMNATSClient:
             try:
                 envelope = parse_message(msg.data)
                 msg_id = envelope.get("id", "")
-                # Pin 去重：如果已处理过则跳过
-                if msg_id and await self.pin.is_duplicate(msg_id):
+                # Pin 去重：原子 check+mark，消除 TOCTOU 竞态
+                if msg_id and not await self.pin.check_and_mark(msg_id):
                     log.debug(f"⏭️ [{self.agent_id}] duplicate msg skipped: {msg_id}")
                     return
                 await handler(envelope, msg)
-                # 标记已处理
-                if msg_id:
-                    await self.pin.mark(msg_id)
             except Exception as e:
                 log.error(f"Handler error: {e}")
         return _cb
@@ -1404,11 +1448,9 @@ class AIMNATSClient:
             try:
                 parsed = parse_message(msg.data)
                 msg_id = parsed.get("id", "")
-                if msg_id and await self.pin.is_duplicate(msg_id):
+                if msg_id and not await self.pin.check_and_mark(msg_id):
                     return
                 await handler(parsed, msg)
-                if msg_id:
-                    await self.pin.mark(msg_id)
             except Exception as e:
                 log.error(f"[{self.agent_id}] DM handler error: {e}")
         sub = await self.nc.subscribe(subject, cb=_cb)
@@ -1422,11 +1464,9 @@ class AIMNATSClient:
             try:
                 parsed = parse_message(msg.data)
                 msg_id = parsed.get("id", "")
-                if msg_id and await self.pin.is_duplicate(msg_id):
+                if msg_id and not await self.pin.check_and_mark(msg_id):
                     return
                 await handler(parsed, msg)
-                if msg_id:
-                    await self.pin.mark(msg_id)
             except Exception as e:
                 log.error(f"[{self.agent_id}] GRP handler error: {e}")
         sub = await self.nc.subscribe(subject, cb=_cb)
@@ -1439,11 +1479,9 @@ class AIMNATSClient:
         async def _cb(msg):
             parsed = parse_message(msg.data)
             msg_id = parsed.get("id", "")
-            if msg_id and await self.pin.is_duplicate(msg_id):
+            if msg_id and not await self.pin.check_and_mark(msg_id):
                 return
             await handler(parsed, msg)
-            if msg_id:
-                await self.pin.mark(msg_id)
         sub = await self.nc.subscribe(subject, cb=_cb)
         self._subscriptions[subject] = sub
         log.info(f"👁️ [{self.agent_id}] subscribed observer: {subject}")
@@ -1452,11 +1490,9 @@ class AIMNATSClient:
         async def _cb(msg):
             parsed = parse_message(msg.data)
             msg_id = parsed.get("id", "")
-            if msg_id and await self.pin.is_duplicate(msg_id):
+            if msg_id and not await self.pin.check_and_mark(msg_id):
                 return
             await handler(parsed, msg)
-            if msg_id:
-                await self.pin.mark(msg_id)
         sub = await self.nc.subscribe(Subjects.sys_all(), cb=_cb)
         self._subscriptions[Subjects.sys_all()] = sub
         log.info(f"📡 [{self.agent_id}] subscribed system events")
@@ -2051,14 +2087,12 @@ class AIMNATSClient:
             try:
                 envelope = parse_message(msg.data)
                 msg_id = envelope.get("id", "")
-                # Pin 去重
-                if msg_id and await self.pin.is_duplicate(msg_id):
+                # Pin 去重：原子 check+mark
+                if msg_id and not await self.pin.check_and_mark(msg_id):
                     log.debug(f"⏭️ [{self.agent_id}] JS duplicate: {msg_id}")
                     await msg.ack()
                     continue
                 await handler(envelope, msg)
-                if msg_id:
-                    await self.pin.mark(msg_id)
                 await msg.ack()
             except Exception as e:
                 log.error(f"JS handler error: {e}")

@@ -65,7 +65,7 @@
 
 ## 二、分层架构
 
-### 2.1 三层协议栈
+### 2.1 三层协议栈 + OAS 扩展面
 
 ```
 ┌──────────────────────────────────────────────────────┐
@@ -73,6 +73,11 @@
 │  MCP Bridge · A2A Bridge · REST/Webhook Bridge       │
 │  让 AIM 兼容外部协议，不必要求外部 Agent 学 NATS       │
 │  状态: 方向确认，MCP 优先，火鸡儿 PoC                 │
+├──────────────────────────────────────────────────────┤
+│  OAS: 开放 Agent 标准 (扩展层，贯穿 L0-L2)            │
+│  Capability Registry · Trust Routing · DID Resolver   │
+│  不替代 NATS，而是标准化 payload + 能力发现            │
+│  状态: Phase 0 完成，待 Phase 1 实施                  │
 ├──────────────────────────────────────────────────────┤
 │  L1: 内部适配器协议 (Adapter Protocol)                │
 │  ADAPTER-PROTOCOL v1.0 JSON stdin/stdout              │
@@ -180,7 +185,41 @@ Response (JSON stdout):
 | CLI (args) | 向后兼容 | <15s | 未切协议时 |
 | API Server | ZS0002 (Hermes) | 8s | 常驻服务，免冷启动 |
 
-### 3.4 L2 Protocol Bridges（规划中）
+### 3.4 OAS 扩展层（Phase 0 研究完成，待 Phase 1 实施）
+
+> 设计文档: `docs/OAS-DESIGN.md` v1.2（2026-06-13）
+> 大哥定调: "先兼容天下，再形成标准，最后兼并"
+
+**OAS (Open Agent Standard) 是 AIM 的对内/对外统一标准层，不是独立项目，而是 AIM 架构的扩展面。**
+
+```
+OAS 在当前架构中的位置:
+
+┌─────────────────────────────────────┐
+│ L2 Protocol Bridges (MCP/A2A/REST)  │  ← 协议翻译
+├─────────────────────────────────────┤
+│ OAS 扩展层 (Capability/Trust/DID)   │  ← 能力标准 ← 本层
+│  AIM Core (NATS + Client)           │  ← 消息中枢
+│  L1 Adapter Protocol v1.0           │  ← 内部适配
+└─────────────────────────────────────┘
+```
+
+**建设范围**:
+
+| 模块 | 定位 | 优先级 | Phase |
+|------|------|--------|-------|
+| Capability Registry | Agent 能力声明 (passport)，meta缓存自动派生 | 🥇 | P1.1 |
+| Trust Routing | 信任级别路由 (direct/oversight/sandbox) | 🥈 | P1.2 |
+| DID Resolver | 去中心化身份 (跨平台唯一 ID) | 🥉 | P2 |
+| Capability Discovery | 跨 Agent 能力发现与协商 | 🥈 | P1.2 |
+
+**关键约束**:
+- OAS 不替代 NATS Subject，而是承载 NATS 消息的 JSON payload 标准化
+- capability 发布走 `ext.oas.capability`，路由缓存走 `meta.capability`（自动派生，不做两套维护）
+- capability_changed 事件自动通知订阅者
+- Passport 带 heartbeat 声明周期，超时自动失效
+
+### 3.5 L2 Protocol Bridges（规划中）
 
 | Bridge | 对接协议 | 优先级 | 负责人 | 状态 |
 |--------|---------|--------|--------|------|
@@ -188,7 +227,7 @@ Response (JSON stdout):
 | A2A Bridge | Google A2A (tasks/send, Agent Card) | 🥈 | 吉量 ZS0002 | 规范研究 |
 | REST Bridge | HTTP/Webhook | 🥉 | 待定 | 待规划 |
 
-**L2 设计原则**: 不要求外部 Agent 学 NATS，AIM 主动兼容外部协议。L2 Bridge 作为翻译层，将 MCP/A2A/REST 请求转译为内部 NATS 消息。
+**L2 设计原则**: 不要求外部 Agent 学 NATS，AIM 主动兼容外部协议。L2 Bridge 作为翻译层，将 MCP/A2A/REST 请求转译为内部 NATS 消息。与 OAS 的分工：L2 做协议翻译，OAS 做能力标准化。
 
 ---
 

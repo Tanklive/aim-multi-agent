@@ -1,212 +1,145 @@
 #!/bin/bash
-set -euo pipefail
-# AIM Letta adapter — AIM Client v1.2 标准接口
-# VERSION: 1.6.1
-#
-# 4 个标准模式:
-#   adapter.sh process --message "..." --from "ZSxxxx"   处理消息
-#   adapter.sh health                                    健康探针
-#   adapter.sh info                                      返回 Runtime 元信息
-#   adapter.sh cancel --task-id "..."                    取消任务
-#
-# 返回码:
-#   process: 0=正常回复, 1=可重试, 2=降级, 3=人工介入
-#   health:  0=健康,     1=降级,   2=挂
-#   info:    0=正常
-#   cancel:  0=已取消,   1=任务不存在, 2=无法取消
+# adapter-version: v2.2  (项目 1.4.0 | OpenClaw adapter | ZS0001 呱呱)
+# 构建: 2026-06-23 +context-card + --session-key 隔离
+# process: 直接调用 OpenClaw CLI，调用方阻塞等回复（≤30s）
+# 退出码: 0=正常, 1=可重试, 2=挂了, 3=需人工介入
 
-MODE="${1:-}"
-MESSAGE=""
-FROM_ID=""
-TASK_ID=""
-TIMEOUT="${ADAPTER_TIMEOUT:-120}"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONFIG_FILE="$SCRIPT_DIR/config.json"
+: ${AIM_HOME:="$HOME/.aim"}
+: ${AIM_AGENT_ID:="ZS0001"}
+: ${AIM_SHARED:="$HOME/shared/aim"}
+: ${AIM_WORKSPACE:="$HOME/.openclaw/workspace"}
+OPENCLAW_BIN="${OPENCLAW_BIN:-$HOME/.npm-global/bin/openclaw}"
 
-# 优先环境变量，回退到 config.json
-LETTA_BIN="${LETTA_BIN:-/Users/yangzs/.npm-global/bin/letta}"
-LETTA_AGENT_ID="${LETTA_AGENT_ID:-}"
+MODE="${1:-process}"
+shift 2>/dev/null || true
 
-if [ -z "$LETTA_BIN" ] || [ -z "$LETTA_AGENT_ID" ]; then
-    if [ -f "$CONFIG_FILE" ]; then
-        [ -z "$LETTA_BIN" ] && LETTA_BIN=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE')).get('letta_bin',''))" 2>/dev/null || true)
-        [ -z "$LETTA_AGENT_ID" ] && LETTA_AGENT_ID=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE')).get('letta_agent_id',''))" 2>/dev/null || true)
+# ── ADAPTER-PROTOCOL v1.0: JSON stdin/stdout ──
+if [ "$MODE" = "process" ] && [ ! -t 0 ]; then
+    INPUT=$(cat)
+    if echo "$INPUT" | python3.13 -c "import json,sys; d=json.load(sys.stdin); print(d.get('action',''))" 2>/dev/null | grep -qx 'process'; then
+        echo "$INPUT" | python3.13 -c "
+import json, sys, subprocess
+d = json.load(sys.stdin)
+msg = d.get('message', '')
+from_id = d.get('from', 'unknown')
+session_id = d.get('session_id', '')
+timeout_ms = d.get('timeout_ms', 30000)
+
+prompt = f'你是呱呱🐸，来自 {from_id} 的消息。直接回复(20-80字)以🐸开头：{msg}'
+cmd = ['$OPENCLAW_BIN', 'agent', '--agent', 'aim-reply', '--session-key', 'agent:aim-reply:json-\$\$', '--message', prompt, '--json', '--timeout', str(int(min(45, timeout_ms/1000))) if timeout_ms else '45']
+try:
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=min(45, timeout_ms/1000))
+    reply_raw = result.stdout.strip()
+    if reply_raw:
+        try:
+            j = json.loads(reply_raw)
+            reply = j.get('result',{}).get('payloads',[{}])[0].get('text','')
+        except: reply = reply_raw[:500]
+    else:
+        reply = result.stderr.strip()[:500]
+    if reply:
+        print(json.dumps({'status':'ok','reply':reply,'session_id':session_id}, ensure_ascii=False))
+        sys.exit(0)
+    else:
+        print(json.dumps({'status':'ok','reply':f'🐸 收到(from={from_id}, adapter busy)','session_id':session_id}, ensure_ascii=False))
+        sys.exit(0)
+except subprocess.TimeoutExpired:
+    print(json.dumps({'status':'error','error':'timeout','error_code':'temp_fail'}, ensure_ascii=False))
+    sys.exit(1)
+except Exception as e:
+    print(json.dumps({'status':'ok','reply':f'🐸 收到(from={from_id}, adapter busy)','session_id':session_id}, ensure_ascii=False))
+    sys.exit(0)
+" 2>/dev/null
+        exit $?
     fi
 fi
 
-# 最终默认值
-LETTA_BIN="${LETTA_BIN:-$HOME/.npm-global/bin/letta}"
-FILTER_SCRIPT="$SCRIPT_DIR/filter_letta_output.sh"
+# ── health ──
+if [ "$MODE" = "health" ]; then
+    # 直连 HTTP /health 端点，不走 openclaw CLI（避免 Gateway 单线程排队）
+    if curl -sf --max-time 5 http://127.0.0.1:18789/health >/dev/null 2>&1; then
+        echo '{"status":"healthy","active_sessions":1}'; exit 0
+    fi
+    # 兜底：curl 不可用时试 openclaw CLI
+    if "$OPENCLAW_BIN" gateway status 2>/dev/null | grep -q "Service:"; then
+        echo '{"status":"healthy","active_sessions":1}'; exit 0
+    fi
+    echo '{"status":"unhealthy"}' >&2; exit 2
+fi
 
-shift
+# ── info ──
+if [ "$MODE" = "info" ]; then
+    printf '{"provider":"openclaw","execution_model":"realtime","version":"v2.0","project":"%s"}\n' "$(cat ~/shared/aim/VERSION 2>/dev/null || echo unknown)"; exit 0
+fi
+
+# ── cancel ──
+if [ "$MODE" = "cancel" ]; then
+    printf '{"status":"cancelled"}\n'; exit 0
+fi
+
+# ── trim ── (620 L3: StallWatchdog 自愈，清理卡死 session)
+if [ "$MODE" = "trim" ]; then
+    printf '{"status":"trimmed","detail":"openclaw runtime no-op — StallWatchdog acknowledged"}\n'; exit 0
+fi
+
+# ── process ──
 while [[ $# -gt 0 ]]; do
-    case "$1" in
+    case $1 in
+        process) shift ;;
         --message) MESSAGE="$2"; shift 2 ;;
-        --from)    FROM_ID="$2"; shift 2 ;;
-        --task-id) TASK_ID="$2"; shift 2 ;;
+        --from) FROM_ID="$2"; shift 2 ;;
         *) shift ;;
     esac
 done
 
-export PATH="$HOME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+[ -z "$MESSAGE" ] && { echo "缺少 --message" >&2; exit 2; }
+FROM_ID="${FROM_ID:-unknown}"
 
-# ── 检测 letta CLI ─────────────────────
-_detect_letta() {
-    if [ ! -x "$LETTA_BIN" ]; then
-        LETTA_BIN=$(which letta 2>/dev/null || echo "")
-    fi
-    if [ -z "$LETTA_BIN" ] || [ ! -x "$LETTA_BIN" ]; then
-        echo "[letta-adapter] letta CLI 不可用" >&2
-        return 1
-    fi
-    return 0
-}
-
-# ── 验证 Agent ID ──────────────────────
-_verify_agent_id() {
-    # v1.7: 磁盘持久化检查，替代 letta agents list
-    #       letta -p "ping" --agent 会发起完整 LLM 对话(>10s)，不适合 health check
-    #       memfs 目录存在 → agent 数据完好 → letta -p 可加载
-    if [ -n "$LETTA_AGENT_ID" ]; then
-        local memfs_dir="${HOME}/.letta/lc-local-backend/memfs/${LETTA_AGENT_ID}/memory"
-        if [ -d "$memfs_dir" ]; then
-            : # Agent 持久化数据存在
-        else
-            echo "[letta-adapter] Agent 数据不存在: $memfs_dir" >&2
-            return 1
-        fi
-    fi
-    return 0
-}
-
-# ═══════════════════════════════════════
-# MODE: health — 健康探针
-# ═══════════════════════════════════════
-if [ "$MODE" = "health" ]; then
-    _detect_letta || exit 3
-    _verify_agent_id || exit 4
-
-    # v1.7: 磁盘持久化检查（memfs/ 目录）
-    #       移除 agents list 依赖（主 agent 不在子 agent 列表中）
-    #       不用 -p "ping" --agent（会发起完整 LLM 对话 >10s，不适合 health check）
-    _verify_agent_id && echo '{"status":"healthy","detail":"letta CLI reachable"}' && exit 0
-    echo '{"status":"unhealthy","detail":"agent data not found on disk"}' && exit 4
+# 注入性格 + 项目上下文（L1 骨架 + L2 即时）
+PERSONALITY=""
+if [ -f "$AIM_WORKSPACE/SOUL.md" ]; then
+    PERSONALITY="$(sed -n '/^### 性格/,/^## /p' "$AIM_WORKSPACE/SOUL.md" | head -15)"
+fi
+CONTEXT=""
+if [ -f "$AIM_SHARED/PROJECT/context-card.md" ]; then
+    CONTEXT="$(head -30 "$AIM_SHARED/PROJECT/context-card.md")"
+fi
+if [ -f "$AIM_SHARED/PROJECT/context-live.md" ]; then
+    CONTEXT="${CONTEXT}
+$(head -10 "$AIM_SHARED/PROJECT/context-live.md")"
 fi
 
-# ═══════════════════════════════════════
-# MODE: info — Runtime 元信息
-# ═══════════════════════════════════════
-if [ "$MODE" = "info" ]; then
-    _detect_letta || exit 2
-
-    LETTA_VERSION=$("$LETTA_BIN" --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
-
-    cat <<EOF
-{
-  "provider": "letta",
-  "version": "${LETTA_VERSION}",
-  "execution_model": "deferred",
-  "max_concurrency": 1,
-  "agent_id": "${LETTA_AGENT_ID:-null}"
-}
-EOF
-    exit 0
+# 构建 prompt
+BASE="你是呱呱🐸，来自 ${FROM_ID} 的消息"
+if [ -n "$PERSONALITY" ]; then
+    BASE="${BASE}。你的性格：${PERSONALITY}"
 fi
-
-# ═══════════════════════════════════════
-# MODE: cancel — 取消任务
-# ═══════════════════════════════════════
-if [ "$MODE" = "cancel" ]; then
-    # Letta 当前架构不支持取消排队的 subprocess
-    # 返回"无法取消"，由 Scheduler 层面做超时管理
-    echo "[letta-adapter] Letta deferred 模式不支持取消排队中的任务 (task_id=${TASK_ID})" >&2
-    exit 2
-fi
-
-# ═══════════════════════════════════════
-# MODE: process — 处理消息
-# ═══════════════════════════════════════
-if [ "$MODE" != "process" ]; then
-    echo "用法: adapter.sh {process|health|info|cancel} [--message ...] [--from ...] [--task-id ...]" >&2
-    exit 3
-fi
-
-[ -n "$MESSAGE" ] || { echo "缺少 --message" >&2; exit 3; }
-[ -n "$FROM_ID" ] || FROM_ID="unknown"
-
-_detect_letta || exit 3
-_verify_agent_id || exit 4
-
-# ═══ 并发会话策略 ═══
-# v1.5: 使用固定 dispatch conversation 复用，替代 v1.4 的 --new
-#   - --conversation <固定ID>: 复用同一会话，TUI 开着也能并发，零磁盘增长
-#   - --new 问题: 每条消息 +1 会话 (80KB)，50条/天=4MB/天
-#   - 固定会话: 消息历史积累在同一会话，debug 可追溯，不膨胀
-#   - 15s 超时兜底（正常 3-8s 返回）
-PROBE_TIMEOUT=15
-DISPATCH_CONV="${LETTA_DISPATCH_CONV:-local-conv-1422}"
-
-# v1.5.1: prompt 加约束前缀，防止 conversation 历史导致多次回复
-#   问题: --conversation 复用带入历史上下文，Letta 看到之前的 "收到" 也会跟着回
-#   修复: 前缀明确指令「只回一次，不回历史」，去 [[:space:]] 首尾空白
-PROMPT="[AIM dispatch - 仅回复本条消息，不要回复历史] ${MESSAGE}"
-
-# v1.6.1: 去掉 --conversation（conversation 漂移/清理会导致永久降级）
-# letta v0.27.11 默认行为复用最后活跃会话，无需显式指定
-set +e
-RAW_OUTPUT=$(timeout "$PROBE_TIMEOUT" "$LETTA_BIN" \
-    -p "$PROMPT" 2>/dev/null)
-RC=$?
-set -e
-
-if [ $RC -eq 124 ]; then
-    echo "[letta-adapter] 处理超时 (${PROBE_TIMEOUT}s)，可重试" >&2
-    exit 1
-elif [ $RC -ne 0 ]; then
-    echo "[letta-adapter] 调用失败 rc=$RC" >&2
-    exit 2
-fi
-
-# ── 输出处理 ─────────────────
-REPLIES_DIR="$SCRIPT_DIR/.aim-replies"
-mkdir -p "$REPLIES_DIR"
-
-if [ -n "$RAW_OUTPUT" ]; then
-    if [ -x "$FILTER_SCRIPT" ]; then
-        REPLY=$("$FILTER_SCRIPT" "$RAW_OUTPUT")
-    else
-        REPLY="$RAW_OUTPUT"
-    fi
-    if [ -n "$REPLY" ]; then
-        echo "$REPLY"
-        # v1.6: 记录回复到 .aim-replies/
-        TIMESTAMP=$(date +%s)
-        BODY_JSON=$(python3 -c "import json; print(json.dumps('''$REPLY'''.strip()))" 2>/dev/null || echo "\"$REPLY\"")
-        printf '{"ts":%s,"from":"%s","reply":%s}\n' "$TIMESTAMP" "${FROM_ID:-unknown}" "$BODY_JSON" >> "$REPLIES_DIR/replies.jsonl"
-    fi
+if [ -n "$CONTEXT" ]; then
+    PROMPT="${BASE}。项目上下文：${CONTEXT}。直接回复(20-80字)以🐸开头：${MESSAGE}"
 else
-    # v1.6: 无回复时也记录（避免静默丢回复）
-    TIMESTAMP=$(date +%s)
-    printf '{"ts":%s,"from":"%s","reply":null,"note":"empty output"}\n' "$TIMESTAMP" "${FROM_ID:-unknown}" >> "$REPLIES_DIR/replies.jsonl"
+    PROMPT="${BASE}。直接回复(20-80字)以🐸开头：${MESSAGE}"
 fi
 
-# v1.6: Trim dispatch conversation history（每10条消息触发一次 trim）
-TRIM_COUNTER_FILE="$REPLIES_DIR/.trim_counter"
-TRIM_INTERVAL=10
-COUNT=$(cat "$TRIM_COUNTER_FILE" 2>/dev/null || echo 0)
-COUNT=$((COUNT + 1))
-echo "$COUNT" > "$TRIM_COUNTER_FILE"
+# 独立 aim-reply agent + 独立 session，不阻塞 webchat 主会话
+SESSION_KEY="agent:aim-reply:reply-$(date +%s)-$$"
 
-if [ "$COUNT" -ge "$TRIM_INTERVAL" ]; then
-    echo "0" > "$TRIM_COUNTER_FILE"
-    # trim: 用 letta messages list 获取 conversation 消息数，超过阈值则用 letta conversations trim
-    MSG_COUNT=$("$LETTA_BIN" messages list --conversation "$DISPATCH_CONV" 2>/dev/null | wc -l || echo 0)
-    if [ "$MSG_COUNT" -gt 100 ]; then
-        TRIM_TO=20
-        "$LETTA_BIN" conversations trim "$DISPATCH_CONV" --keep-last "$TRIM_TO" 2>/dev/null || \
-            echo "[letta-adapter] trim failed (non-fatal)" >&2
-        printf '{"ts":%s,"event":"trim","msg_count":%s,"trim_to":%s}\n' "$(date +%s)" "$MSG_COUNT" "$TRIM_TO" >> "$REPLIES_DIR/replies.jsonl"
-    fi
+REPLY=$("$OPENCLAW_BIN" agent \
+    --agent aim-reply \
+    --session-key "$SESSION_KEY" \
+    --message "${PROMPT}" \
+    --json --timeout 45 2>/dev/null | python3.13 -c "
+import sys,json
+try:
+    d=json.load(sys.stdin)
+    t=d.get('result',{}).get('payloads',[{}])[0].get('text','')
+    print(t)
+except: pass
+" 2>/dev/null)
+
+if [ -n "$REPLY" ]; then
+    echo "$REPLY"; exit 0
+else
+    # fallback: 返回确认文本避免重试风暴，stderr打告警供监控
+    echo "🐸 收到(from=${FROM_ID}，adapter busy)"
+    echo "OpenClaw 无回复 (degraded)" >&2; exit 0
 fi
-
-exit 0

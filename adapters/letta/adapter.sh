@@ -52,15 +52,53 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 LETTA_BIN="${LETTA_BIN:-$HOME/.npm-global/bin/letta}"
 FILTER_SCRIPT="$SCRIPT_DIR/filter_letta_output.sh"
 
-shift
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --message) MESSAGE="$2"; shift 2 ;;
-        --from)    FROM_ID="$2"; shift 2 ;;
-        --task-id) TASK_ID="$2"; shift 2 ;;
-        *) shift ;;
-    esac
-done
+# ── v1.14.1: JSON stdin 协议支持 (protocol v1.0) ──
+# 当 MODE 为空或看起来像 JSON（以 { 开头）时，尝试从 stdin 解析
+# 与 CLI args 模式并存，向后兼容
+_V1_PROTOCOL=false
+_V1_TIMEOUT_MS=""
+
+_parse_v1_stdin() {
+    [ -t 0 ] && return 1
+    local raw
+    raw=$(cat 2>/dev/null) || return 1
+    [ -z "$raw" ] && return 1
+    # 一次 python3 调用提取全部字段
+    local parsed
+    parsed=$(echo "$raw" | ${PYTHON_BIN:-python3} -c "
+import json,sys
+d=json.load(sys.stdin)
+for k in ['action','message','from','timeout_ms']:
+    print(d.get(k,''))
+" 2>/dev/null) || return 1
+    [ -z "$parsed" ] && return 1
+    MODE=$(echo "$parsed" | sed -n '1p')
+    MESSAGE=$(echo "$parsed" | sed -n '2p')
+    FROM_ID=$(echo "$parsed" | sed -n '3p')
+    _V1_TIMEOUT_MS=$(echo "$parsed" | sed -n '4p')
+    # 超时传递给冷启动场景
+    [ -n "$_V1_TIMEOUT_MS" ] && TIMEOUT=$((_V1_TIMEOUT_MS / 1000 + 5))
+    _V1_PROTOCOL=true
+    return 0
+}
+
+# v1.14.1: MODE 为空或看起来像 JSON → 尝试 stdin 解析
+if [ -z "$MODE" ] || [ "${MODE:0:1}" = "{" ]; then
+    _parse_v1_stdin || true
+fi
+
+# CLI args 解析（只在有位置参数时运行，v1.0 协议无参数时跳过）
+if [ $# -gt 0 ]; then
+    shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --message) MESSAGE="$2"; shift 2 ;;
+            --from)    FROM_ID="$2"; shift 2 ;;
+            --task-id) TASK_ID="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+fi
 
 export PATH="$HOME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
@@ -451,7 +489,17 @@ if [ -n "$RAW_OUTPUT" ]; then
         REPLY="$RAW_OUTPUT"
     fi
     if [ -n "$REPLY" ]; then
-        echo "$REPLY"
+        # v1.14.1: 走 JSON stdin 协议时输出 JSON 响应
+        if [ "$_V1_PROTOCOL" = true ]; then
+            REPLY_JSON=$(${PYTHON_BIN} -c "
+import json, sys
+reply = '''$REPLY'''.strip()
+print(json.dumps({'status':'ok','reply':reply}, ensure_ascii=False))
+" 2>/dev/null || echo '{\"status\":\"error\",\"error\":\"json encode failed\"}')
+            echo "$REPLY_JSON"
+        else
+            echo "$REPLY"
+        fi
         # v1.6: 记录回复到 .aim-replies/
         TIMESTAMP=$(date +%s)
         BODY_JSON=$(${PYTHON_BIN} -c "import json; print(json.dumps('''$REPLY'''.strip()))" 2>/dev/null || echo "\"$REPLY\"")

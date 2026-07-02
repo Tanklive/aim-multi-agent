@@ -63,21 +63,21 @@ _parse_v1_stdin() {
     local raw
     raw=$(cat 2>/dev/null) || return 1
     [ -z "$raw" ] && return 1
-    # 一次 python3 调用提取全部字段
-    local parsed
-    parsed=$(echo "$raw" | ${PYTHON_BIN:-python3} -c "
-import json,sys
+    # v1.14.1: shlex.quote + eval，避免 sed 行号被消息内换行打乱
+    local vars
+    vars=$(echo "$raw" | ${PYTHON_BIN:-python3} -c "
+import json,sys,shlex
 d=json.load(sys.stdin)
-for k in ['action','message','from','timeout_ms']:
-    print(d.get(k,''))
+# 映射 JSON 字段 → bash 变量名
+print(f'MODE={shlex.quote(d.get(\"action\",\"\"))}')
+print(f'MESSAGE={shlex.quote(d.get(\"message\",\"\"))}')
+print(f'FROM_ID={shlex.quote(d.get(\"from\",\"\"))}')
+print(f'timeout_ms={shlex.quote(str(d.get(\"timeout_ms\",\"\")))}')
 " 2>/dev/null) || return 1
-    [ -z "$parsed" ] && return 1
-    MODE=$(echo "$parsed" | sed -n '1p')
-    MESSAGE=$(echo "$parsed" | sed -n '2p')
-    FROM_ID=$(echo "$parsed" | sed -n '3p')
-    _V1_TIMEOUT_MS=$(echo "$parsed" | sed -n '4p')
+    [ -z "$vars" ] && return 1
+    eval "$vars"
     # 超时传递给冷启动场景
-    [ -n "$_V1_TIMEOUT_MS" ] && TIMEOUT=$((_V1_TIMEOUT_MS / 1000 + 5))
+    [ -n "$timeout_ms" ] && TIMEOUT=$((timeout_ms / 1000 + 5))
     _V1_PROTOCOL=true
     return 0
 }

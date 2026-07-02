@@ -1,5 +1,23 @@
 # AIM Client Changelog
 
+## v1.4.1 (2026-07-02 14:08 +8)
+
+### 变更
+- **ZS0002 adapter v2.0**: API Server 优先 + CLI fallback，根治冷启动 54s → 8s
+  - adapter.sh 重写：`services.api` 服务发现 → `AIM_API_URL`/`AIM_API_CREDENTIAL` → curl API
+  - config.json `adapter_env` 注入 `API_SERVER_KEY`，main.py 自动展开 `${ENV}` 引用
+  - printf 动态构造 Auth header，绕过 Hermes mask 系统
+  - health probe 优先 API `/health`，不可达时 fallback CLI
+- **fix**: shared v2.0 adapter 未部署问题 — sync 到 `~/.aim/adapters/hermes/`，MD5 一致
+- **fix**: `$SP` 未定义、`aim_hermes_req.py` 依赖移除，payload 内联构造
+
+### 测试
+- ✅ API 路径：8.68s（vs CLI 冷启动 54s）
+- ✅ AIM 端到端 DM：ZS0001 → ZS0002 → 正常回复
+- ✅ CLI fallback：API 不可达时静默降级
+- ✅ health probe：API 优先，健康检查正常
+- ✅ 无回退：日志零 "fallback to CLI"
+
 ## v1.4.0 (2026-06-24 12:30 +8)
 
 ### 新增

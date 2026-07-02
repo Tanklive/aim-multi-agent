@@ -253,6 +253,7 @@ def _message_to_dict(msg: Message) -> dict:
         "received_at": msg.received_at,
         "dequeued_at": msg.dequeued_at,
         "retry_count": msg.retry_count,
+        "is_mentioned": msg.is_mentioned,
     }
 
 
@@ -269,4 +270,5 @@ def _dict_to_message(data: dict) -> Message:
         received_at=data.get("received_at", time.time()),
         dequeued_at=data.get("dequeued_at", 0.0),
         retry_count=data.get("retry_count", 0),
+        is_mentioned=data.get("is_mentioned", False),
     )

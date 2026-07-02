@@ -13,6 +13,47 @@ OPENCLAW_BIN="${OPENCLAW_BIN:-$HOME/.npm-global/bin/openclaw}"
 MODE="${1:-process}"
 shift 2>/dev/null || true
 
+# ── ADAPTER-PROTOCOL v1.0: JSON stdin/stdout ──
+if [ "$MODE" = "process" ] && [ ! -t 0 ]; then
+    INPUT=$(cat)
+    if echo "$INPUT" | python3.13 -c "import json,sys; d=json.load(sys.stdin); print(d.get('action',''))" 2>/dev/null | grep -qx 'process'; then
+        echo "$INPUT" | python3.13 -c "
+import json, sys, subprocess
+d = json.load(sys.stdin)
+msg = d.get('message', '')
+from_id = d.get('from', 'unknown')
+session_id = d.get('session_id', '')
+timeout_ms = d.get('timeout_ms', 30000)
+
+prompt = f'你是呱呱🐸，来自 {from_id} 的消息。直接回复(20-80字)以🐸开头：{msg}'
+cmd = ['$OPENCLAW_BIN', 'agent', '--agent', 'aim-reply', '--session-key', 'agent:aim-reply:json-\$\$', '--message', prompt, '--json', '--timeout', str(int(min(45, timeout_ms/1000))) if timeout_ms else '45']
+try:
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=min(45, timeout_ms/1000))
+    reply_raw = result.stdout.strip()
+    if reply_raw:
+        try:
+            j = json.loads(reply_raw)
+            reply = j.get('result',{}).get('payloads',[{}])[0].get('text','')
+        except: reply = reply_raw[:500]
+    else:
+        reply = result.stderr.strip()[:500]
+    if reply:
+        print(json.dumps({'status':'ok','reply':reply,'session_id':session_id}, ensure_ascii=False))
+        sys.exit(0)
+    else:
+        print(json.dumps({'status':'ok','reply':f'🐸 收到(from={from_id}, adapter busy)','session_id':session_id}, ensure_ascii=False))
+        sys.exit(0)
+except subprocess.TimeoutExpired:
+    print(json.dumps({'status':'error','error':'timeout','error_code':'temp_fail'}, ensure_ascii=False))
+    sys.exit(1)
+except Exception as e:
+    print(json.dumps({'status':'ok','reply':f'🐸 收到(from={from_id}, adapter busy)','session_id':session_id}, ensure_ascii=False))
+    sys.exit(0)
+" 2>/dev/null
+        exit $?
+    fi
+fi
+
 # ── health ──
 if [ "$MODE" = "health" ]; then
     # 直连 HTTP /health 端点，不走 openclaw CLI（避免 Gateway 单线程排队）

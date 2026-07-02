@@ -100,7 +100,7 @@ EXEC_MODEL = "$EXEC_MODEL"
 cfg = {
     "agent_id": AGENT_ID,
     "agent_name": AGENT_NAME,
-    "protocol_version": "1.0",
+    "protocol_version": "",
     "version": "1.5.0",
     "nats_server": "$NATS_SERVER",
     "creds_path": f"~/.aim/agents/{AGENT_ID}/aim.creds",

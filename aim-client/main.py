@@ -2012,8 +2012,9 @@ class AIMClient:
         _MIN_SDK = "1.3.0"
 
         def _ver_tuple(v: str):
-
-            return tuple(int(x) for x in v.strip().split("."))
+            # 剥离预发布标签 (eg "1.5.0-alpha" → "1.5.0")
+            v_clean = v.strip().split("-")[0]
+            return tuple(int(x) for x in v_clean.split("."))
 
         try:
 

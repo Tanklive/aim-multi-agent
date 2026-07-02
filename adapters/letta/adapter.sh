@@ -33,13 +33,14 @@ CONFIG_FILE="$SCRIPT_DIR/config.json"
 PYTHON_BIN="${PYTHON_BIN:-}"
 # 优先环境变量，回退到 config.json
 LETTA_BIN="${LETTA_BIN:-}"
+# v1.14: LETTA_AGENT_ID 不再从 config 懒加载，交给 _resolve_agent_id() 统一处理
+#        环境变量 LETTA_AGENT_ID 作为最高优先级显式覆盖
 LETTA_AGENT_ID="${LETTA_AGENT_ID:-}"
 
-if [ -z "$LETTA_BIN" ] || [ -z "$LETTA_AGENT_ID" ] || [ -z "$PYTHON_BIN" ]; then
+if [ -z "$LETTA_BIN" ] || [ -z "$PYTHON_BIN" ]; then
     if [ -f "$CONFIG_FILE" ]; then
         [ -z "$PYTHON_BIN" ] && PYTHON_BIN=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE')).get('python_bin',''))" 2>/dev/null || true)
         [ -z "$LETTA_BIN" ] && LETTA_BIN=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE')).get('letta_bin',''))" 2>/dev/null || true)
-        [ -z "$LETTA_AGENT_ID" ] && LETTA_AGENT_ID=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE')).get('letta_agent_id',''))" 2>/dev/null || true)
     fi
 fi
 
@@ -74,19 +75,72 @@ _detect_letta() {
     return 0
 }
 
-# ── 验证 Agent ID ──────────────────────
-_verify_agent_id() {
-    # v1.7: 磁盘持久化检查，替代 letta agents list
-    #       letta -p "ping" --agent 会发起完整 LLM 对话(>10s)，不适合 health check
-    #       memfs 目录存在 → agent 数据完好 → letta -p 可加载
-    if [ -n "$LETTA_AGENT_ID" ]; then
-        local memfs_dir="${HOME}/.letta/lc-local-backend/memfs/${LETTA_AGENT_ID}/memory"
-        if [ -d "$memfs_dir" ]; then
-            : # Agent 持久化数据存在
-        else
-            echo "[letta-adapter] Agent 数据不存在: $memfs_dir" >&2
-            return 1
+# ── v1.14: 运行时自动发现 agent_id ──────────────────────
+# 优先级: 环境变量 LETTA_AGENT_ID > 磁盘自动发现 > config.json 兜底
+_resolve_agent_id() {
+    # 1. 环境变量明确覆盖（兼容性）
+    if [ -n "${LETTA_AGENT_ID:-}" ]; then
+        echo "$LETTA_AGENT_ID"
+        return 0
+    fi
+
+    # 2. 磁盘自动发现（推荐）：找到 memfs 下最新 agent
+    local memfs_dir="${HOME}/.letta/lc-local-backend/memfs"
+    if [ -d "$memfs_dir" ]; then
+        # agent-local-<uuid> 目录，取最近修改的作为活跃 agent
+        local discovered
+        discovered=$(ls -dt "$memfs_dir"/agent-local-* 2>/dev/null | head -1 | xargs basename 2>/dev/null || echo "")
+        if [ -n "$discovered" ]; then
+            # 验证目录完整性：必须存在 memory/ 子目录
+            if [ -d "$memfs_dir/$discovered/memory" ]; then
+                echo "[letta-adapter] agent_id 磁盘发现: $discovered" >&2
+                echo "$discovered"
+                return 0
+            fi
         fi
+    fi
+
+    # 3. 回退：从 config.json 读取
+    if [ -f "$CONFIG_FILE" ]; then
+        local cfg_id
+        cfg_id=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE')).get('letta_agent_id',''))" 2>/dev/null || echo "")
+        if [ -n "$cfg_id" ]; then
+            echo "[letta-adapter] agent_id 从 config 回退: $cfg_id" >&2
+            echo "$cfg_id"
+            return 0
+        fi
+    fi
+
+    # 4. 全丢 — 无法恢复
+    echo "[letta-adapter] FATAL: 无法解析 letta_agent_id" >&2
+    return 1
+}
+
+# ── v1.14: 增强版 agent_id 验证（自动发现 + 自动修复）──
+_verify_agent_id() {
+    local resolved
+    resolved=$(_resolve_agent_id) || return 1
+
+    # 如果和 config 里不一致，自动更新 config.json
+    local cfg_id
+    cfg_id=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE')).get('letta_agent_id',''))" 2>/dev/null || echo "")
+    if [ "$resolved" != "$cfg_id" ] && [ -n "$cfg_id" ]; then
+        echo "[letta-adapter] agent_id 自动修复: $cfg_id → $resolved" >&2
+        python3 -c "
+import json
+cfg = json.load(open('$CONFIG_FILE'))
+cfg['letta_agent_id'] = '$resolved'
+json.dump(cfg, open('$CONFIG_FILE', 'w'), indent=2, ensure_ascii=False)
+" 2>/dev/null || true
+    fi
+
+    LETTA_AGENT_ID="$resolved"
+
+    # 验证磁盘数据存在
+    local memfs_dir="${HOME}/.letta/lc-local-backend/memfs/${LETTA_AGENT_ID}/memory"
+    if [ ! -d "$memfs_dir" ]; then
+        echo "[letta-adapter] Agent 数据不存在: $memfs_dir" >&2
+        return 1
     fi
     return 0
 }
@@ -113,6 +167,7 @@ fi
 # ═══════════════════════════════════════
 if [ "$MODE" = "info" ]; then
     _detect_letta || exit 2
+    _verify_agent_id || exit 4
 
     LETTA_VERSION=$("$LETTA_BIN" --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
 

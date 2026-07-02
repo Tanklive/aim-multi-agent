@@ -132,6 +132,10 @@ from aim_client.queue import MessageQueue
 
 from aim_client.scheduler import Scheduler
 
+from session import SessionManager       # ADAPTER-PROTOCOL v1.0
+
+from context import ContextManager       # ADAPTER-PROTOCOL v1.0
+
 from aim_client.health_probe import HealthProbe
 from aim_client.notification import NotificationHandler  # 624: 新消息提醒接口标准
 from aim_client.grp_policy import GroupPolicyManager  # 624: 群聊冷却机制
@@ -862,6 +866,17 @@ class AIMClient:
 
         self.adapter_cmd = adapter_cmd
 
+        # ADAPTER-PROTOCOL v1.0: Session + Context 管理
+        self._protocol_version = self.config.get("protocol_version", "")  # "1.0" = 新协议
+        self.session_mgr = SessionManager(
+            mode=self.config.get("adapter_mode", "cli"),
+            max_reuse=self.config.get("session_max_reuse", 5),
+        )
+        self.context_mgr = ContextManager(agent_id=self.agent_id)
+        self.logger.info(
+            f"Adapter Protocol: {'v'+self._protocol_version if self._protocol_version else 'legacy (CLI args)'}"
+            f", adapter_mode={self.session_mgr.mode}"
+        )
 
 
         # 619-20: 将 config 中 adapter 需要的变量注入子进程环境
@@ -3375,6 +3390,11 @@ class AIMClient:
 
 
 
+        # ADAPTER-PROTOCOL v1.0: JSON 协议优先
+        if self._protocol_version == "1.0":
+            return await self._call_adapter_v1(msg)
+
+        # 旧协议: CLI args（向后兼容）
         safe_content = msg.content.replace("'", "'\\''")
 
         cmd = f"bash {self.adapter_cmd} process --from '{msg.from_id}' --message '{safe_content}'"
@@ -3484,6 +3504,126 @@ class AIMClient:
 
             raise HumanInterventionError(f"unknown exit={rc}: {stderr_text[:100]}")
 
+
+
+
+
+    # ── ADAPTER-PROTOCOL v1.0: JSON stdin/stdout ──
+
+    async def _call_adapter_v1(self, msg: Message) -> Optional[str]:
+        """
+        走 ADAPTER-PROTOCOL v1.0 (JSON stdin/stdout)
+
+        Request JSON:
+          {"action":"process","session_id":"pool:ZS0002:3","from":"ZS0002",
+           "message":"...","timeout_ms":30000,"context":"...","msg_id":"abc123"}
+
+        Response JSON:
+          {"status":"ok","reply":"...","session_id":"pool:ZS0002:3","elapsed_ms":1234}
+          或 {"status":"error","error":"...","error_code":"timeout"}
+
+        退出码: 0=ok, 1=TEMP_FAIL(可重试), 2=DEGRADE, 3=FATAL, 4=UNREACHABLE
+        """
+        # 获取 session
+        session_id = self.session_mgr.get_session_id(msg.from_id)
+
+        # 组装上下文
+        context = self.context_mgr.assemble()
+
+        # 动态 timeout（按场景）
+        timeout_ms = self.scheduler.processing_timeout * 1000  # s→ms
+
+        # 构建请求
+        request = {
+            "version": "1.0",
+            "action": "process",
+            "session_id": session_id,
+            "from": msg.from_id,
+            "message": msg.content,
+            "timeout_ms": timeout_ms,
+            "context": context,
+            "msg_id": msg.msg_id or "",
+            "grp_id": msg.grp_id or "",
+        }
+
+        request_json = json.dumps(request, ensure_ascii=False)
+
+        # 调用 adapter（CLI 模式: stdin/stdout）
+        if self.session_mgr.mode == "cli":
+            proc = await asyncio.create_subprocess_exec(
+                self.adapter_cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=self.adapter_env,
+            )
+        else:
+            # API Server 模式: 保留为未来扩展，当前 fallback 走旧协议
+            self.logger.warning("_call_adapter_v1: API Server mode not implemented, falling back")
+            return await self._call_adapter(msg)
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(input=request_json.encode()),
+                timeout=self.scheduler.processing_timeout,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            self.logger.warning(f" [{msg.msg_id[:8]}] adapter v1.0 超时 ({self.scheduler.processing_timeout}s)")
+            raise RetryableError("adapter v1.0 超时")
+
+        rc = proc.returncode or 0
+        stderr_text = stderr.decode().strip() if stderr else ""
+        stdout_text = stdout.decode().strip() if stdout else ""
+
+        if stderr_text:
+            self.logger.debug(f" [{msg.msg_id[:8]}] adapter v1.0 stderr: {stderr_text[:100]}")
+
+        # 尝试解析 JSON 响应
+        reply = None
+        if stdout_text:
+            try:
+                response = json.loads(stdout_text)
+                status = response.get("status", "")
+
+                if status == "ok":
+                    reply = response.get("reply", "") or None
+                elif status == "error":
+                    error_code = response.get("error_code", "")
+                    error_msg = response.get("error", "")
+                    self.logger.info(f" [{msg.msg_id[:8]}] adapter v1.0 error: {error_code}={error_msg}")
+                    if error_code in ("temp_fail", "busy"):
+                        raise RetryableError(error_msg)
+                    elif error_code in ("degrade",):
+                        raise DegradeError(error_msg)
+                    else:
+                        reply = None  # 静默
+                else:
+                    # 非 JSON: 当纯文本回复
+                    reply = stdout_text
+            except json.JSONDecodeError:
+                # 纯文本回复（adapter 尚未切换 JSON 格式）
+                reply = stdout_text
+
+        # 退出码处理
+        if rc == 0:
+            if reply:
+                self.logger.debug(f" [{msg.msg_id[:8]}] adapter v1.0 OK, reply={reply[:60]}")
+            return reply
+        elif rc == 1:
+            raise RetryableError(stderr_text or "adapter v1.0 exit=1")
+        elif rc == 141:
+            raise RetryableError(stderr_text or "adapter v1.0 SIGPIPE")
+        elif rc == 2:
+            if self._should_degrade(2):
+                raise DegradeError(stderr_text or "adapter v1.0 exit=2")
+            raise RetryableError(stderr_text or "adapter v1.0 exit=2, under window")
+        elif rc == 3:
+            raise HumanInterventionError(stderr_text or "adapter v1.0 exit=3")
+        elif rc == 4:
+            raise DegradeError(f"[agent_unreachable] {stderr_text}" if stderr_text else "agent unreachable")
+        else:
+            raise HumanInterventionError(f"adapter v1.0 unknown exit={rc}: {stderr_text[:100]}")
 
 
     # -- NATS 回调 (SDK 签名: handler(envelope_dict, raw_msg)) --

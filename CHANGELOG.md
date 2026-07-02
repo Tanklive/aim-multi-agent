@@ -21,3 +21,20 @@
 
 ### Docs
 - `docs/ADAPTER-STANDARDIZATION.md` v1.2
+
+### 2026-07-02 变更 (同版本增量)
+
+#### Bug Fixes
+- B-021: ZS0001 adapter 路径未同步 — config 指向 `~/.aim/agents/ZS0001/adapter.sh` (旧版,无JSON), 但修改的是 `~/.aim/adapters/openclaw/adapter.sh` (新版)。MD5 不一致导致部分调用 "缺少 --message"。修复: 同步适配器 + 重启。
+
+#### Tested
+- 5轮会话模式测试全部通过 (DM往返/Session复用/Context注入/延迟容忍/三方群聊)
+
+#### Docs
+- `PROJECT-LOG.md` — 项目完整记录 (版本演替/功能矩阵/BUG修复/需求溯源/决策记录)
+- `AIM-SYSTEM-ARCHITECTURE.md` v2.0 — +OAS 扩展层定位, 四层架构全景
+
+#### Diff
+- `aim-client/adapter.sh` — ZS0001 adapter 路径同步
+- `docs/PROJECT-LOG.md` — 新建
+- `docs/AIM-SYSTEM-ARCHITECTURE.md` — +OAS 章节

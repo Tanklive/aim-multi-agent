@@ -1,33 +1,26 @@
-# AIM 即时上下文 2026-06-30
+# AIM 即时上下文 2026-07-03
 ## 当前阶段
-v1.4.0 稳定运行。四座大山已清零 ✅。Round 2 8/8 全链路闭环。
+v1.5.1 稳定运行。L1 熔断器 + dispatch 池回收已部署。
 
 ## 阻塞
 — 暂无
 
-## 今日修复 (6/30)
-- adapter timeout 25→45s（webchat 活跃时不超时）
-- fallback exit 1→0（不触发重试风暴）
-- `--agent aim-reply` 独立 agent（避免 main agent Gateway 竞争）
-- health probe `curl` 代替 `openclaw gateway status`（消灭假 OFFLINE）
-- 三方连通验证：群消息收发正常 ✅
+## 今日修复 (7/3)
+- L1 熔断器：三态 + 指数退避 (91ab110)
+- dispatch 池自动回收 (4fe100c)
+- QueuePersist 空壳 data 毒化防护 (b4da926)
+- adapter trim 池清理阈值收紧 (POOL_SIZE+2)
 
 ## 已关闭
-- U-002(Letta TUI) ✅ 架构上限，已确认
-- U-004(单点故障) ✅ 架构上限
-- U-106(adapter版本分裂) ✅
-- P0-004(归档) ✅
+- 四座大山 ✅
+- TOCTOU 竞态 (9fe8132) ✅
+- U-002/U-004/U-106/P0-004 ✅
 
 ## 待推进
-- T021 Agent SDK 化（P0，待分配）
-- T022 Advisor 模式（P0，待分配）
-- T023 工具参数级权限（P1，待分配）
-- Python 3.14 brew 残留（等大哥确认 uninstall）
-- ZS0002 偶发不稳定（macOS 网络栈瞬断，P2）
+- 并发 dispatch（呱呱，下一轮）
+- Python 3.14 brew 残留
 
 ## 最近决策
-- 6/30 adapter 4项优化：timeout+fallback+aim-reply+health-curl
-- 6/24 v1.4.0 版本管理整治
-- 6/23 context-card 两层注入上线
-- 6/23 任务闭环协议
-- 6/21 无效沟通三层防护 / Python 3.14清零
+- 7/3 分工明确：基础设施归呱呱，ZS0003 自身归火鸡儿
+- 7/2 adapter v1.14.1 双协议支持
+- 7/1 protocol v1.0 三方闭环

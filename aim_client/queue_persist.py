@@ -143,11 +143,17 @@ class QueuePersist:
         restored: List[Message] = []
         ack_count = 0
         nack_count = 0
+        empty_count = 0
         for msg_id, last_op in last_ops.items():
             if last_op["op"] == "enqueue":
                 data = last_op.get("data", {})
                 if not isinstance(data, dict):
                     logger.warning(f"QueuePersist restore 跳过非 dict data: {type(data).__name__}")
+                    continue
+                if not data or not data.get("msg_id"):
+                    # 空壳 data（TOCTOU 修复前重复入队 + 写入中断等场景）
+                    empty_count += 1
+                    logger.warning(f"QueuePersist restore 跳过空壳 data: msg_id={msg_id}")
                     continue
                 msg = _dict_to_message(data)
                 if msg is not None:
@@ -157,6 +163,8 @@ class QueuePersist:
             elif last_op["op"] == "nack":
                 nack_count += 1
 
+        if empty_count:
+            logger.warning(f"QueuePersist 恢复时丢弃 {empty_count} 条空壳消息")
         logger.info(
             f"QueuePersist 恢复完成: pending={len(restored)} ack={ack_count} nack={nack_count}"
         )
@@ -257,8 +265,11 @@ def _message_to_dict(msg: Message) -> dict:
     }
 
 
-def _dict_to_message(data: dict) -> Message:
+def _dict_to_message(data: dict) -> Optional[Message]:
     if not isinstance(data, dict):
+        return None
+    # 防御性校验：空壳 data 返回 None（防止毒化队列）
+    if not data.get("msg_id"):
         return None
     return Message(
         msg_id=data.get("msg_id", ""),

@@ -1250,6 +1250,7 @@ class AIMClient:
                         reply = await self._call_adapter(msg)
 
                         self.breaker.on_success()
+                        await self._evict_conv_pool()
 
                         if reply:
 
@@ -3260,6 +3261,37 @@ class AIMClient:
         except Exception: info = {"raw": stdout_text[:200] if stdout_text else ""}
 
         await self.transport.send_registry_event("trim", {"exit_code": rc, "result": info})
+
+    # ── P2: dispatch pool auto-recycler (2026-07-03 呱呱) ──
+    async def _evict_conv_pool(self) -> None:
+        """Enforce dispatch_conv_pool_size: evict oldest conv IDs when exceeding.
+
+        Adapter creates new convs via --new but never evicts old ones.
+        dispatch_conv_ids.txt grows unbounded → waste.
+        This ensures only the most recent pool_size convs are kept.
+        """
+        pool_size = self.config.get("dispatch_conv_pool_size", 2)
+        if pool_size <= 0:
+            return
+        adapter_dir = str(Path(self.adapter_cmd).parent)
+        ids_file = Path(adapter_dir) / "dispatch_conv_ids.txt"
+        if not ids_file.exists():
+            return
+        try:
+            lines = ids_file.read_text().strip().split("\n")
+            lines = [l.strip() for l in lines if l.strip()]
+            if len(lines) <= pool_size:
+                return
+            kept = lines[-pool_size:]
+            evicted = len(lines) - len(kept)
+            ids_file.write_text("\n".join(kept) + "\n")
+            self.logger.info(
+                f"🧹 conv pool evicted {evicted} old convs "
+                f"({len(lines)} → {len(kept)}, pool_size={pool_size})"
+            )
+        except Exception as e:
+            self.logger.debug(f"conv pool eviction skipped: {e}")
+
 
 
 

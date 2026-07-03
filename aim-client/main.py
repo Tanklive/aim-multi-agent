@@ -868,6 +868,16 @@ class AIMClient:
 
         # ADAPTER-PROTOCOL v1.0: Session + Context 管理
         self._protocol_version = self.config.get("protocol_version", "")  # "1.0" = 新协议
+        
+        # L1 熔断器：指数退避 + 三态 (CLOSED/OPEN/HALF_OPEN)
+        cb_cfg = self.config.get("circuit_breaker", {})
+        self.breaker = CircuitBreaker(
+            failure_threshold=cb_cfg.get("failure_threshold", 5),
+            base_cooldown=cb_cfg.get("base_cooldown", 10),
+            max_cooldown=cb_cfg.get("max_cooldown", 120),
+            half_open_max=cb_cfg.get("half_open_max", 1),
+            logger=self.logger,
+        )
         self.session_mgr = SessionManager(
             mode=self.config.get("adapter_mode", "cli"),
             max_reuse=self.config.get("session_max_reuse", 5),
@@ -1239,6 +1249,8 @@ class AIMClient:
 
                         reply = await self._call_adapter(msg)
 
+                        self.breaker.on_success()
+
                         if reply:
 
                             if msg.grp_id:
@@ -1290,7 +1302,23 @@ class AIMClient:
 
                         self._retry_tracker.pop(msg.msg_id, None)  # 退避跟踪清除
 
+                    except CircuitOpenError as e:
+
+                        # 熔断器 OPEN → 快速拒绝，nack 不重试
+
+                        self.scheduler.on_retry()
+
+                        self.queue.nack(msg.msg_id, f"breaker_open: {e}")
+
+                        self.logger.warning(f"🔌 [{msg.msg_id[:8]}] 熔断器拒绝: {e}")
+
+                        self._dispatch_event.set()
+
+
+
                     except DegradeError:
+
+                        self.breaker.on_failure("DegradeError")
 
                         self.scheduler.on_degrade()
 
@@ -1317,6 +1345,8 @@ class AIMClient:
 
 
                     except RetryableError:
+
+                        self.breaker.on_failure("RetryableError")
 
                         self.scheduler.on_retry()
 
@@ -1366,6 +1396,8 @@ class AIMClient:
 
                     except Exception as e:
 
+                        self.breaker.on_failure(type(e).__name__)
+
                         if "agent_unreachable" in str(e):
 
                             self.scheduler.on_degrade()
@@ -1393,6 +1425,8 @@ class AIMClient:
                         raise
 
                     except HumanInterventionError:
+
+                        self.breaker.on_failure("HumanInterventionError")
 
                         self.scheduler.on_human_intervention()
 
@@ -3112,6 +3146,7 @@ class AIMClient:
             self.logger.info(f"[recover] Success: {info}")
 
             self._repair_failures = 0  # L3: 成功后重置
+            self.breaker.force_reset()  # 熔断器复位
 
             # P1: report recover event
 
@@ -3206,6 +3241,7 @@ class AIMClient:
             self.logger.info(f"[trim] Done: {stdout_text[:200]}")
 
             self._repair_failures = 0  # L3: 成功后重置
+            self.breaker.force_reset()  # 熔断器复位
 
         else:
 
@@ -3390,6 +3426,11 @@ class AIMClient:
             return None
 
 
+
+        # L1 熔断器：入口校验
+        allowed, reason = self.breaker.allow_call()
+        if not allowed:
+            raise CircuitOpenError(reason)
 
         # ADAPTER-PROTOCOL v1.0: JSON 协议优先
         if self._protocol_version == "1.0":
@@ -3675,6 +3716,62 @@ class AIMClient:
         elif event == "failed":
             self.logger.warning(f"[NOTIFY] ❌ 消息处理失败: {content[:80]}")
 
+    def _signal_inbox(self, from_id: str, content: str, msg_type: str = "dm"):
+        """信号通知：收到新消息时写入 inbox 文件 + 设置提醒标志。
+
+        供 OpenClaw 主会话心跳检查用，确保重要讨论不被遗漏。
+        """
+        try:
+            from pathlib import Path as _P
+            from datetime import datetime, timezone, timedelta as _td
+
+            inbox_file = _P.home() / "shared" / "aim" / "guagua_inbox.md"
+            alert_file = _P.home() / "shared" / "aim" / ".new_message_alert"
+
+            tz = timezone(_td(hours=8))
+            ts = datetime.now(tz).strftime("%m-%d %H:%M")
+            prefix = "[群聊]" if msg_type == "grp" else ""
+            line = f"{ts} {prefix}{from_id}: {content[:200]}\n"
+
+            inbox_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(inbox_file, "a", encoding="utf-8") as f:
+                f.write(line)
+
+            # 触摸提醒标志（内容 = 最后一条消息摘要）
+            alert_file.write_text(f"{ts} {from_id}: {content[:100]}")
+
+            self.logger.debug(f"📬 inbox 已更新: {from_id}")
+        except Exception as e:
+            self.logger.debug(f"inbox 写入跳过: {e}")
+    async def _notify_nats(self, from_id: str, content: str, msg_type: str):
+        """发布 NATS 通知到 aim.notify.inbox.<agent_id> — 协议化通知服务 v1.0。
+        
+        alertd 订阅 aim.notify.inbox.> 并实时推送到 OpenClaw。
+        任何 Agent publish 到 aim.notify.inbox.<target> 即可接入通知体系。
+        """
+        try:
+            import json
+            from datetime import datetime, timezone as _tz
+            subject = f"aim.notify.inbox.{self.agent_id}"
+            envelope = {
+                "ver": "1.0",
+                "type": "notify.inbox",
+                "from": from_id,
+                "to": self.agent_id,
+                "msg_type": msg_type,
+                "content": content[:500],
+                "ts": datetime.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            }
+            payload = json.dumps(envelope, ensure_ascii=False).encode()
+            nc = getattr(self._sdk, 'nc', None)
+            if nc is None:
+                self.logger.warning(f"📡 NATS nc=None, 通知跳过")
+                return
+            await nc.publish(subject, payload)
+            self.logger.info(f"📡 NATS 通知已发布: {subject} from={from_id}")
+        except Exception as e:
+            self.logger.warning(f"📡 NATS 通知失败: {e}")
+
     async def _on_dm(self, envelope: dict, raw_msg):
 
         from_id = envelope.get("from", envelope.get("from_id", ""))
@@ -3690,6 +3787,19 @@ class AIMClient:
         if from_id == self.agent_id:
 
             return
+
+        # 📬 写入 inbox 文件 + NATS 协议通知（R-003: 消息提醒恢复）
+        content = envelope.get("content") or envelope.get("text") or envelope.get("payload", {}).get("text", "")
+        self._signal_inbox(from_id, content, msg_type="dm")
+        try:
+            import json as _json
+            nc = getattr(self.transport._sdk, 'nc', None) if hasattr(self, 'transport') and hasattr(self.transport, '_sdk') else None
+            if nc:
+                msg = _json.dumps({"ver":"1.0","type":"notify.inbox","from":from_id,"to":self.agent_id,"msg_type":"dm","content":content[:500]}).encode()
+                await nc.publish(f"aim.notify.inbox.{self.agent_id}", msg)
+                self.logger.info(f"📡 NATS 通知已发布: from={from_id}")
+        except Exception as _e:
+            self.logger.debug(f"NATS通知跳过: {_e}")
 
         detail = f"from={from_id}" + (f" text={obs_text}" if obs_text else "")
 
@@ -3714,6 +3824,21 @@ class AIMClient:
         if from_id == self.agent_id:
 
             return
+
+        # 📬 写入 inbox 文件 + NATS 协议通知（R-003: 消息提醒恢复）
+        content = envelope.get("content") or envelope.get("text") or envelope.get("payload", {}).get("text", "")
+        is_mentioned = f"@{self.agent_id}" in content or f"@{self.card.name}" in content
+        if is_mentioned:
+            self._signal_inbox(from_id, content, msg_type="grp")
+            try:
+                import json as _json
+                nc = getattr(self.transport._sdk, 'nc', None) if hasattr(self, 'transport') and hasattr(self.transport, '_sdk') else None
+                if nc:
+                    msg = _json.dumps({"ver":"1.0","type":"notify.inbox","from":from_id,"to":self.agent_id,"msg_type":"grp","content":content[:500]}).encode()
+                    await nc.publish(f"aim.notify.inbox.{self.agent_id}", msg)
+                    self.logger.info(f"📡 NATS 通知已发布: from={from_id}")
+            except Exception as _e:
+                self.logger.debug(f"NATS群聊通知跳过: {_e}")
 
         detail = f"from={from_id}" + (f" text={obs_text}" if obs_text else "")
 
@@ -4191,6 +4316,166 @@ class AIMClient:
 
 
 # -- 异常类 --
+
+# ═══════════════════════════════════════
+# L1 熔断器 (Circuit Breaker)
+# ═══════════════════════════════════════
+# 三态模型: CLOSED → OPEN → HALF_OPEN → CLOSED
+# 指数退避: cooldown = base * 2^n (max=120s)
+# JetStream 持久化: 熔断状态写入 queue.jsonl 旁路
+
+CIRCUIT_CLOSED = "closed"
+CIRCUIT_OPEN = "open"
+CIRCUIT_HALF_OPEN = "half_open"
+
+class CircuitBreaker:
+    """L1 适配器熔断器
+    
+    接入点: _call_adapter() 调用前校验
+    触发条件: 连续 N 次 RetryableError/DegradeError/HumanInterventionError
+    恢复路径: OPEN 冷却后 → HALF_OPEN 探测 → CLOSED
+    """
+    
+    def __init__(
+        self,
+        failure_threshold: int = 5,
+        base_cooldown: int = 10,
+        max_cooldown: int = 120,
+        half_open_max: int = 1,
+        logger=None,
+    ):
+        self.failure_threshold = failure_threshold
+        self.base_cooldown = base_cooldown
+        self.max_cooldown = max_cooldown
+        self.half_open_max = half_open_max
+        self.logger = logger or logging.getLogger("CircuitBreaker")
+        
+        self.state = CIRCUIT_CLOSED
+        self.failure_count = 0
+        self.trip_count = 0
+        self.last_failure_time: float = 0.0
+        self.opened_at: float = 0.0
+        self.half_open_count = 0
+        self.last_success_time: float = 0.0
+        self.total_trips = 0
+        self.total_successes = 0
+    
+    @property
+    def cooldown_sec(self) -> int:
+        """指数退避: base * 2^n, capped at max_cooldown"""
+        return min(self.base_cooldown * (2 ** self.trip_count), self.max_cooldown)
+    
+    @property
+    def remaining_cooldown(self) -> float:
+        """OPEN 态剩余冷却时间（秒）"""
+        if self.state != CIRCUIT_OPEN:
+            return 0.0
+        elapsed = time.time() - self.opened_at
+        return max(0.0, self.cooldown_sec - elapsed)
+    
+    # ── 入口校验：调用前判断是否允许通过 ──
+    
+    def allow_call(self) -> tuple[bool, str]:
+        """
+        Returns:
+            (allowed: bool, reason: str)
+        """
+        if self.state == CIRCUIT_CLOSED:
+            return True, ""
+        
+        if self.state == CIRCUIT_OPEN:
+            remaining = self.remaining_cooldown
+            if remaining > 0:
+                return False, f"breaker OPEN, cooldown {remaining:.0f}s/{self.cooldown_sec}s"
+            # Cooldown elapsed → transition to HALF_OPEN
+            self.state = CIRCUIT_HALF_OPEN
+            self.half_open_count = 0
+            if self.logger:
+                self.logger.info(
+                    f"🔌 熔断器 OPEN→HALF_OPEN (cooldown={self.cooldown_sec}s, trip=#{self.trip_count})"
+                )
+        
+        if self.state == CIRCUIT_HALF_OPEN:
+            if self.half_open_count >= self.half_open_max:
+                return False, f"breaker HALF_OPEN, probes exhausted ({self.half_open_max}/{self.half_open_max})"
+            self.half_open_count += 1
+            if self.logger:
+                self.logger.info(
+                    f"🔌 熔断器 HALF_OPEN 探测 #{self.half_open_count}/{self.half_open_max}"
+                )
+        
+        return True, ""
+    
+    # ── 结果反馈 ──
+    
+    def on_success(self):
+        """适配器调用成功 → 复位"""
+        prev = self.state
+        self.state = CIRCUIT_CLOSED
+        self.failure_count = 0
+        self.half_open_count = 0
+        self.last_success_time = time.time()
+        self.total_successes += 1
+        if prev != CIRCUIT_CLOSED and self.logger:
+            self.logger.info(f"🔌 熔断器 {prev}→CLOSED (success, {self.total_successes} total)")
+    
+    def on_failure(self, error_type: str = ""):
+        """适配器调用失败 → 累加"""
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+        
+        if self.state == CIRCUIT_HALF_OPEN:
+            # 探测失败 → 立即回 OPEN
+            self.state = CIRCUIT_OPEN
+            self.half_open_count = 0
+            self.trip_count += 1
+            self.total_trips += 1
+            if self.logger:
+                self.logger.warning(
+                    f"🔌 熔断器 HALF_OPEN→OPEN (probe failed, cooldown={self.cooldown_sec}s, trip=#{self.trip_count})"
+                )
+            return
+        
+        if self.failure_count >= self.failure_threshold:
+            self.state = CIRCUIT_OPEN
+            self.opened_at = time.time()
+            self.trip_count += 1
+            self.total_trips += 1
+            if self.logger:
+                self.logger.warning(
+                    f"🔌 熔断器 CLOSED→OPEN ({self.failure_count}/{self.failure_threshold} failures, "
+                    f"cooldown={self.cooldown_sec}s, trip=#{self.trip_count}, "
+                    f"last_error={error_type[:40]})"
+                )
+    
+    def force_reset(self):
+        """手动复位（recover 命令触发）"""
+        self.state = CIRCUIT_CLOSED
+        self.failure_count = 0
+        self.trip_count = 0
+        self.half_open_count = 0
+        if self.logger:
+            self.logger.info("🔌 熔断器手动复位 → CLOSED")
+    
+    def status_dict(self) -> dict:
+        """导出状态（用于 health check / JetStream 持久化）"""
+        return {
+            "state": self.state,
+            "failure_count": self.failure_count,
+            "trip_count": self.trip_count,
+            "cooldown_sec": self.cooldown_sec,
+            "remaining_cooldown": self.remaining_cooldown,
+            "total_trips": self.total_trips,
+            "total_successes": self.total_successes,
+            "last_failure_at": self.last_failure_time or None,
+            "last_success_at": self.last_success_time or None,
+        }
+
+
+class CircuitOpenError(Exception):
+    """熔断器 OPEN 时调用适配器 → 快速拒绝"""
+    pass
+
 
 class RetryableError(Exception):
 

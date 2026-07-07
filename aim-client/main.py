@@ -210,6 +210,7 @@ class Transport:
         from aim_nats_sdk import AIMNATSClient
         self.agent_id = agent_id
         self._logger = logging.getLogger("aim-client.transport")
+        self._my_msg_ids: set = set()  # U-007: 追踪发出的消息
         creds_path = Path.home() / ".aim" / "agents" / agent_id / "aim.creds"
         self._sdk = AIMNATSClient(
             agent_id=agent_id,

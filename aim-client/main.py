@@ -243,13 +243,22 @@ class SingleInstance:
 
 
     def acquire(self) -> bool:
+        """P0 #1: 三层单实例防护 — flock(L1) + PID检查(L2) + pgrep(L3)"""
 
         try:
 
-            self.fp = open(self.lock_file, "w")
+            # P0 #1: 使用 "r+" 而非 "w" 打开，防止 flock 失败时文件已被截断
+            # 旧 PID 保留在文件中供 _try_recover_stale 读取
+            if self.lock_file.exists():
+                self.fp = open(self.lock_file, "r+")
+            else:
+                self.fp = open(self.lock_file, "w")
 
             fcntl.flock(self.fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
+            # 获取锁成功后，截断并写入当前 PID
+            self.fp.seek(0)
+            self.fp.truncate()
             self.fp.write(str(os.getpid()))
 
             self.fp.flush()
@@ -270,6 +279,11 @@ class SingleInstance:
 
             old_pid_str = self.lock_file.read_text().strip()
 
+            if not old_pid_str:
+                # P0 #1: 空文件（旧 open("w") 截断遗留）→ 清理重试
+                self.lock_file.unlink(missing_ok=True)
+                return self.acquire()
+
             old_pid = int(old_pid_str)
 
             # os.kill(pid, 0) 不发送信号，只检查进程是否存在
@@ -283,10 +297,31 @@ class SingleInstance:
         except (ValueError, OSError):
 
             # PID 不存在或无效 → 僵尸锁，清理后重试
-
+            self._pgrep_kill_stale()
             self.lock_file.unlink(missing_ok=True)
 
             return self.acquire()  # 递归重试一次
+
+
+    def _pgrep_kill_stale(self):
+
+        """P0 #1 L3: pgrep 兜底 — 清理可能的幽灵进程"""
+        import subprocess as _sp
+        try:
+            agent_suffix = self.lock_file.stem.replace("aim-client-", "")
+            r = _sp.run(
+                ["pgrep", "-f", f"aim-client.*{agent_suffix}"],
+                capture_output=True, text=True, timeout=3
+            )
+            for pid_str in r.stdout.strip().split('\n'):
+                pid = pid_str.strip()
+                if pid and pid.isdigit():
+                    try:
+                        os.kill(int(pid), 15)
+                    except OSError:
+                        pass
+        except Exception:
+            pass
 
 
 
@@ -992,6 +1027,8 @@ class AIMClient:
 
         self._retry_tracker: dict[str, int] = {}  # P0: exit=1 退避, msg_id → retry_count
 
+        self._consecutive_empty: int = 0  # P0 #3: 连续空输出计数（≥3 → 熔断）
+
         self._last_recover_at: float = 0.0  # P0-L3: recover cooldown (60s)
 
         self._last_trim_at: float = 0.0  # P0-L3: trim cooldown (30s)
@@ -1268,8 +1305,17 @@ class AIMClient:
                         # P0-D: 空响应校验 — 空白/纯空格回复视为无回复
                         if reply and reply.strip():
                             reply = reply.strip()
+                            # P0 #3: 正常输出 → 清零连续空输出计数器
+                            self._consecutive_empty = 0
                         else:
                             reply = None
+                            # P0 #3: 连续空输出检测 → ≥3 次触发熔断
+                            self._consecutive_empty += 1
+                            if self._consecutive_empty >= 3:
+                                self.logger.warning(
+                                    f"⚠️ [P0#3] 连续 {self._consecutive_empty} 次空输出，触发熔断"
+                                )
+                                self.breaker.on_failure("EmptyOutput")
 
                         self.breaker.on_success()
                         await self._evict_conv_pool()
@@ -2377,9 +2423,13 @@ class AIMClient:
 
 
 
-    # 确认类关键词集
-
-    _ACK_CORE_WORDS = {"收到", "ok", "OK", "Ok", "好的", "明白", "了解", "知道", "1", "确认"}
+    # P0 #2: 确认类关键词集（扩展至20字覆盖）
+    _ACK_CORE_WORDS = {
+        "收到", "ok", "OK", "Ok", "好的", "明白", "了解", "知道", "1", "确认",
+        "行", "好", "嗯", "对", "可", "成", "done", "Done", "ack", "ACK", "Ack",
+        "没问题", "可以", "好嘞", "得嘞", "对的", "没错", "已阅", "看了",
+        "知道了", "明白了", "清楚了", "收到啦", "好滴", "OKK", "okk",
+    }
 
     # L1 反信号模式（吉量方案 §2）：确认循环/状态同步
 
@@ -2467,10 +2517,15 @@ class AIMClient:
 
             return True
 
+        # P0 #2: ACK 分类器 — ≤20字 + 关键词白名单 → 跳过 dispatch
+        # 优先级：先走 _has_substance 快速判定，再走 _is_ack_only 精确匹配
+        if len(text) <= 20:
+            if self._is_ack_only(text, core_only=True):
+                self.logger.debug(f" [ACK-SKIP] from={msg.from_id} text={text[:40]}")
+                return True
+
         # 短消息 + 纯确认 → 免 LLM（≤8字，交给 _has_substance 判定）
-
         if len(text) <= 8 and not self._has_substance(text):
-
             return True
 
 
@@ -2682,6 +2737,49 @@ class AIMClient:
         # 长消息但无上述任何具体信息 → 很可能是客套（AI 之间的礼貌循环）
 
         # 默认无效：AI 之间没有具体信息的交流就是无效沟通
+
+        return False
+
+
+    def _is_ack_only(self, text: str, core_only: bool = False) -> bool:
+
+        """P0 #2: ACK 分类器 — 判定消息是否为纯确认/已阅，无需 LLM 处理。
+
+        core_only=True: 只检查剥离后的核心内容（用于 _skip_adapter_for_operational）
+        core_only=False: 检查完整文本（用于群聊 INFO/ACK 分类）
+
+        判定逻辑:
+        1. ≤5字 纯ACK词 → True
+        2. ≤12字 + 核心ACK词 + 无问句/数字/任务词 → True
+        3. ≤20字 + 剥离率>0.4 + 核心匹配 → True
+        """
+        import re as _re
+
+        t = text.strip()
+        if not t:
+            return True  # 空消息视为ACK
+
+        core, ratio = self._strip_politeness(t)
+
+        # L1: 剥离后纯ACK核心词（≤5字）→ 直接判定
+        core_clean = _re.sub(r'[\s，,。.!！?？、：:；;…✅👍👌✨🐸🐴🐤🤝]', '', core)
+        if len(core_clean) <= 5:
+            for w in self._ACK_CORE_WORDS:
+                if w in core_clean or core_clean == w:
+                    return True
+
+        # L2: ≤12字 + 含ACK词 + 不含实质信号（问号/数字/任务动词）
+        if len(t) <= 12 and not _re.search(r'[？?\d]', t):
+            for w in self._ACK_CORE_WORDS:
+                if w in t and len(w) >= 2:
+                    return True
+
+        # L3: ≤20字 + 高剥离率 + 核心ACK匹配
+        if len(t) <= 20 and ratio > 0.4:
+            core_stripped = core.rstrip('，,。.!！?？✅👍👌✨🐸🐴🐤')
+            for w in self._ACK_CORE_WORDS:
+                if core_stripped == w or (len(w) >= 2 and core_stripped.startswith(w)):
+                    return True
 
         return False
 

@@ -110,6 +110,12 @@ class QueuePersist:
         await self._write_queue.put(entry)
         await self._maybe_compact()
 
+    async def write_retry(self, msg_id: str, retry_count: int):
+        """P0-D: 持久化 retry_count，重启后跳过死信"""
+        entry = {"op": "retry", "msg_id": msg_id, "ts": time.time(), "retry_count": retry_count}
+        await self._write_queue.put(entry)
+        await self._maybe_compact()
+
     # ── 恢复 ──────────────────────────────────────────────
 
     async def restore(self) -> List[Message]:
@@ -144,7 +150,18 @@ class QueuePersist:
         ack_count = 0
         nack_count = 0
         empty_count = 0
+        dead_count = 0
         for msg_id, last_op in last_ops.items():
+            # P0-D: retry op 覆盖 enqueue 中的 retry_count，用于死信判定
+            retry_count = 0
+            if last_op["op"] == "retry":
+                retry_count = last_op.get("retry_count", 0)
+                # retry 是中间态，找前一条 enqueue 的 data
+                enq_op = next((op for op in reversed(ops) if op.get("msg_id") == msg_id and op.get("op") == "enqueue"), None)
+                if enq_op:
+                    last_op = enq_op
+                    last_op["retry_count"] = retry_count
+
             if last_op["op"] == "enqueue":
                 data = last_op.get("data", {})
                 if not isinstance(data, dict):
@@ -154,6 +171,12 @@ class QueuePersist:
                     # 空壳 data（TOCTOU 修复前重复入队 + 写入中断等场景）
                     empty_count += 1
                     logger.warning(f"QueuePersist restore 跳过空壳 data: msg_id={msg_id}")
+                    continue
+                # P0-D: 死信过滤 — retry_count >= 3 的消息不恢复
+                rc = retry_count or data.get("retry_count", 0) or 0
+                if rc >= 3:
+                    dead_count += 1
+                    logger.warning(f"QueuePersist restore 跳过死信: msg_id={msg_id} retry_count={rc}")
                     continue
                 msg = _dict_to_message(data)
                 if msg is not None:
@@ -165,8 +188,10 @@ class QueuePersist:
 
         if empty_count:
             logger.warning(f"QueuePersist 恢复时丢弃 {empty_count} 条空壳消息")
+        if dead_count:
+            logger.warning(f"QueuePersist 恢复时跳过 {dead_count} 条死信")
         logger.info(
-            f"QueuePersist 恢复完成: pending={len(restored)} ack={ack_count} nack={nack_count}"
+            f"QueuePersist 恢复完成: pending={len(restored)} ack={ack_count} nack={nack_count} dead={dead_count}"
         )
         return restored
 

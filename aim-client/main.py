@@ -982,6 +982,9 @@ class AIMClient:
 
         self._last_dispatch_time: float = 0.0
 
+        # P0-007: 跟踪 dispatch 是否正在进行，独立看门狗在 dispatch 进行中使用更长的超时
+        self._dispatch_in_progress: bool = False
+
         self._stall_timeout_sec = self.config.get("stall_watchdog_sec", 30.0)
         self._max_msg_age_sec = self.config.get("max_msg_age_sec", 900)  # POST-05: 旧消息过期保护
 
@@ -1160,6 +1163,14 @@ class AIMClient:
 
                         break
 
+                    # P0-D: 死信跳过 — retry_count >= 3 的消息直接 ack 丢弃
+                    if msg.retry_count >= 3:
+                        self.logger.warning(f" [DEAD] msg_id={msg.msg_id[:8]} retry_count={msg.retry_count}, 跳过死信")
+                        if msg.msg_id:
+                            self._add_dispatched_id(msg.msg_id)
+                        self.queue.ack(msg.msg_id)
+                        continue
+
                     # U-006: 出队去重用独立 _dispatched_ids，不与接收时 L1 _processed_ids 冲突
 
                     if msg.msg_id and msg.msg_id in self._dispatched_ids:
@@ -1247,7 +1258,18 @@ class AIMClient:
                                 self.queue.ack(msg.msg_id)
                                 continue
 
-                        reply = await self._call_adapter(msg)
+                        # P0-007: 标记 dispatch 进行中，独立看门狗在此期间使用 processing_timeout 阈值
+                        self._dispatch_in_progress = True
+                        try:
+                            reply = await self._call_adapter(msg)
+                        finally:
+                            self._dispatch_in_progress = False
+
+                        # P0-D: 空响应校验 — 空白/纯空格回复视为无回复
+                        if reply and reply.strip():
+                            reply = reply.strip()
+                        else:
+                            reply = None
 
                         self.breaker.on_success()
                         await self._evict_conv_pool()
@@ -1294,14 +1316,16 @@ class AIMClient:
 
                         self._stall_recovery_count = 0  # 620-01: 成功投递才清零
 
+                        # P0-007: dispatch 完成后刷新时间戳（adapter 可能耗时 60-120s）
+                        # 防止独立看门狗在下轮检查时误判假死
+                        self._last_dispatch_time = time.time()
+
                         # 624: 通知 — message.processed
                         _elapsed = int((time.time() - msg.created_at) * 1000) if hasattr(msg, 'created_at') else 0
                         await self.notification.processed(
                             msg_id=msg.msg_id, from_id=msg.from_id,
                             reply_preview=reply or "", elapsed_ms=_elapsed,
                         )
-
-                        self._retry_tracker.pop(msg.msg_id, None)  # 退避跟踪清除
 
                     except CircuitOpenError as e:
 
@@ -1314,6 +1338,9 @@ class AIMClient:
                         self.logger.warning(f"🔌 [{msg.msg_id[:8]}] 熔断器拒绝: {e}")
 
                         self._dispatch_event.set()
+
+                        # P0-007: 刷新时间戳，防止独立看门狗误判
+                        self._last_dispatch_time = time.time()
 
 
 
@@ -1341,6 +1368,9 @@ class AIMClient:
 
                         self._dispatch_event.set()
 
+                        # P0-007: 刷新时间戳，防止独立看门狗误判
+                        self._last_dispatch_time = time.time()
+
                         break
 
 
@@ -1351,9 +1381,15 @@ class AIMClient:
 
                         self.scheduler.on_retry()
 
-                        rt = self._retry_tracker.get(msg.msg_id, 0) + 1
+                        rt = msg.retry_count + 1
 
-                        self._retry_tracker[msg.msg_id] = rt
+                        msg.retry_count = rt
+                        # P0-D: 持久化 retry_count，重启不丢失重试状态
+                        if self.queue._persist:
+                            try:
+                                self.queue._schedule_persist(lambda: self.queue._persist.write_retry(msg.msg_id, rt))
+                            except Exception:
+                                pass
 
                         if rt >= 3:
 
@@ -1371,13 +1407,14 @@ class AIMClient:
 
                                 self._add_dispatched_id(msg.msg_id)
 
-                            self._retry_tracker.pop(msg.msg_id, None)
-
                             self.scheduler.reset_to_idle()
 
                             self._dispatch_event.set()  # 立即触发下一轮
 
                             self._stall_recovery_count = 0  # 成功 discard 后重置计数
+
+                            # P0-007: 死信处理后刷新时间戳
+                            self._last_dispatch_time = time.time()
 
                             # P0-L3: backoff exhausted -> trim stuck session
 
@@ -1410,6 +1447,9 @@ class AIMClient:
                             await self.transport.emit_health("agent_unreachable", msg.msg_id[:8], "exit=4")
 
                             self._dispatch_event.set()
+
+                            # P0-007: 刷新时间戳，防止独立看门狗误判
+                            self._last_dispatch_time = time.time()
 
                             # P2: non-blocking recover
 
@@ -1496,7 +1536,15 @@ class AIMClient:
                 now = time.time()
                 stall_sec = now - self._last_dispatch_time if self._last_dispatch_time > 0 else 999
 
-                if stall_sec > self._stall_timeout_sec:
+                # P0-007: dispatch 进行中时使用 processing_timeout 作为阈值
+                # 避免慢 LLM 调用（60-120s）触发误判假死 → exit(4) 死亡循环
+                effective_timeout = (
+                    self.scheduler.processing_timeout + 10
+                    if self._dispatch_in_progress
+                    else self._stall_timeout_sec
+                )
+
+                if stall_sec > effective_timeout:
                     self._stall_recovery_count += 1
                     self.logger.warning(
                         f"⏰ StallWatchdog(独立): dispatch 假死 {stall_sec:.0f}s, "

@@ -1,12 +1,13 @@
 #!/bin/bash
-# Hermes AIM Adapter v2.1 — protocol v1.0 JSON stdin + CLI args + API Server
+# Hermes AIM Adapter v2.3 — API模式去CTX + alertd过滤 + ACK跳过 + 超时120s
 # 标准接口: process/health/info/cancel/trim
 # 退出码: 0=SUCCESS, 1=RETRY, 2=DEGRADE, 3=FATAL
 
 : ${AIM_API_URL:=""}
 : ${AIM_API_CREDENTIAL:=""}
 : ${AGENT_BIN:="$HOME/.local/bin/hermes"}
-: ${ADAPTER_TIMEOUT:=300}
+: ${ADAPTER_TIMEOUT:=120}
+: ${CTX_MAX_CHARS:=2000}
 
 RAW=""
 
@@ -56,8 +57,37 @@ case "$MODE" in
         # ── API Server 优先 ──
         if [ -n "$AIM_API_URL" ] && [ -n "$AIM_API_CREDENTIAL" ]; then
             if curl -s --max-time 3 "$AIM_API_URL/health" >/dev/null 2>&1; then
-                FULL_PROMPT="${CTX:+${CTX}
-}${MESSAGE}"
+                # ── 纯 ACK / alertd 状态消息检测：跳过 LLM 调用 ──
+                CLEAN_MSG=$(echo "$MESSAGE" | tr -d '[:space:]')
+                # alertd recovery 消息
+                if echo "$MESSAGE" | grep -qE '^\\(RECOVERY\\)'; then
+                    echo "[adapter] alertd通知跳过: ${MESSAGE:0:60}" >&2
+                    if [ -n "$RAW" ]; then
+                        printf '{"reply":"","status":"ok","skipped":"alertd"}\n'
+                    fi
+                    exit 0
+                fi
+                # 纯 ACK 消息
+                if echo "$CLEAN_MSG" | python3 -c "
+import sys, re
+msg = sys.stdin.read().strip()
+ack_re = re.compile(r'^([\U0001F442\U0001F44D\u2705\U0001F44C\U0001FAE1][\u6536\u5230\u77e5\u9053\u4e86\u597d\u7684\u660e\u767d\u4e86\u89e3]|\u6536\u5230|\u77e5\u9053\u4e86|\u597d\u7684|\u660e\u767d|\u4e86\u89e3|OK|ok|\+1|Roger|roger|\U0001F44D|\u2705|\U0001F44C|\U0001FAE1|\U0001F442\u6536\u5230)[.。!！]*$', re.UNICODE)
+if ack_re.match(msg):
+    sys.exit(0)
+else:
+    sys.exit(1)
+" 2>/dev/null; then
+                    echo "[adapter] 纯ACK跳过: ${CLEAN_MSG:0:50}" >&2
+                    if [ -n "$RAW" ]; then
+                        printf '{"reply":"","status":"ok","skipped":"ack"}\n'
+                    fi
+                    exit 0
+                fi
+
+                # API Server 模式：不拼 CTX（Hermes 系统 prompt 已有完整上下文）
+                # 只传 MESSAGE + 轻量 from 标记
+                FULL_PROMPT="[AIM from ${FROM_ID:-unknown}] ${MESSAGE}"
+
                 PAYLOAD=$(python3 -c "
 import json, sys
 print(json.dumps({
@@ -68,7 +98,7 @@ print(json.dumps({
 " "$FULL_PROMPT" 2>/dev/null)
 
                 if [ -n "$PAYLOAD" ]; then
-                    AUTH_HDR=$(printf 'Authorization: Bearer %s' "$AIM_API_CREDENTIAL")
+                    AUTH_HDR=$(python3 "$HOME/.aim/agents/ZS0002/auth_header.py")
                     REPLY=$(curl -s --max-time "$ADAPTER_TIMEOUT" \
                         -X POST "$AIM_API_URL/v1/chat/completions" \
                         -H "$AUTH_HDR" \
@@ -90,12 +120,32 @@ print(json.dumps({
         fi
 
         # ── CLI fallback ──
+        # ── 纯 ACK 检测（CLI 路径）──
+        CLEAN_MSG=$(echo "${MESSAGE}" | tr -d '[:space:]')
+        if [ -n "$CLEAN_MSG" ] && echo "$CLEAN_MSG" | python3 -c "
+import sys, re
+msg = sys.stdin.read().strip()
+ack_re = re.compile(r'^([\u{1F442}\u{1F44D}\u2705\u{1F44C}\u{1FAE1}][收到知道了好的明白了解]|收到|知道了|好的|明白|了解|OK|ok|+1|Roger|roger|👍|✅|👌|🫡|👂收到)[.。!！]*$', re.UNICODE)
+if ack_re.match(msg):
+    sys.exit(0)
+else:
+    sys.exit(1)
+" 2>/dev/null; then
+            echo "[adapter] 纯ACK跳过(CLI): ${CLEAN_MSG:0:50}" >&2
+            if [ -n "$RAW" ]; then
+                printf '{"reply":"👌","status":"ok","ack":true}\n'
+            else
+                echo "👌"
+            fi
+            exit 0
+        fi
+
         command -v "$AGENT_BIN" >/dev/null 2>&1 || { echo '{"error":"hermes CLI not found"}' >&2; exit 3; }
         PROMPT="回复以下内容，仅输出你对该消息的回复文本，不要加任何前缀后缀说明或操作描述：${FULL_PROMPT:-$MESSAGE}"
         output=$(timeout "$ADAPTER_TIMEOUT" "$AGENT_BIN" chat -q "$PROMPT" -Q --source aim-adapter 2>/dev/null)
         rc=$?
         [ $rc -eq 124 ] && { echo '{"error":"timeout"}' >&2; exit 1; }
-        [ $rc -ne 0 ] && { echo "{\"error\":\"cli exit=$rc\"}" >&2; exit 1; }
+        [ $rc -ne 0 ] && { printf '{"error":"cli exit=%s"}\n' "$rc" >&2; exit 1; }
         cleaned=$(echo "$output" | sed '/Normalized model/{N;d;}' | LC_ALL=en_US.UTF-8 grep -v '^session_id:' | grep -v '^Restored session:' | grep -v '^Saving session' | grep -v '^\.\.\.' | grep -v '^$')
         first_line=$(echo "$cleaned" | head -1)
         if [ -n "$first_line" ]; then

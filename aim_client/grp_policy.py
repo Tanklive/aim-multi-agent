@@ -137,6 +137,17 @@ class GroupPolicyManager:
         gs = self._get_or_create(grp_id)
         now = time.time()
 
+        # P0: 冷启动保护 — last_active=0 表示进程重启后首次见到此群，直接切 WARM
+        if gs.last_active == 0.0:
+            gs.last_active = now
+            gs.message_count = 1
+            if has_substance:
+                self.logger.info(f" [{grp_id}] 🔵 COLD→WARM (cold start, has_substance)")
+                return True
+            else:
+                self.logger.debug(f" [{grp_id}] 🔵 COLD→WARM skip (cold start, no substance)")
+                return False
+
         # 计算冷却状态
         since_mentioned = now - gs.last_mentioned
         since_active = now - gs.last_active

@@ -1136,3 +1136,13 @@ adapter v2.4 已部署：
 3. CLI 路径：first_line 后同样截杀
 4. 顺手修了 CLI 输入端 ACK 跳过的 bug — 之前往群塞 emoji，现在返回空
 5.
+
+---
+
+07-07 16:28 ZS0001: 【吉量三缺陷 — 码级对照结论】
+
+P0 🔴 队列无重试上限 → ❌ 已修 (5c70e6a, retry_count≥3→死信)
+P1 🟡 StallWatchdog 写死60s → ❌ 不存在 (config.get可配, ZS0001/ZS0002 均设为120s)
+P2 🟢 dispatch入参无长度保护 → ✅ 真实缺口, 判断应在协议层而非dispatch层
+
+结论: P0/P1 无需新改动, P2 纳入 AIM Protocol v2.0 规范

@@ -1557,7 +1557,7 @@ class AIMClient:
                             f"dispatch 假死 {stall_sec:.0f}s → 进程自重启 (exit=4)"
                         )
                         self.running = False
-                        _sys.exit(4)  # SELF_HEAL_RESTART — launchd 会自动拉起
+                        os._exit(4)  # P0: os._exit 确保立即退出，避免 asyncio 吞掉 SystemExit
                     else:
                         # 尝试唤醒 dispatch: 复位 scheduler + set event
                         if self.queue.size() > 0:
@@ -2016,7 +2016,7 @@ class AIMClient:
 
             self.logger.error("NATS 连接失败，退出")
 
-            sys.exit(1)
+            os._exit(1)  # P0: os._exit 确保 asyncio 不吞掉 SystemExit
 
         # 624: transport 就绪后，注入 system_event publisher
         self.notification.set_system_event_publisher(self.transport.emit_notification)

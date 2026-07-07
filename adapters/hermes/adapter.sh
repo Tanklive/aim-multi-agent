@@ -1,5 +1,5 @@
 #!/bin/bash
-# Hermes AIM Adapter v2.3 — API模式去CTX + alertd过滤 + ACK跳过 + 超时120s
+# Hermes AIM Adapter v2.4 — 输出端ACK过滤 + API模式去CTX + alertd过滤 + 超时120s
 # 标准接口: process/health/info/cancel/trim
 # 退出码: 0=SUCCESS, 1=RETRY, 2=DEGRADE, 3=FATAL
 
@@ -8,6 +8,28 @@
 : ${AGENT_BIN:="$HOME/.local/bin/hermes"}
 : ${ADAPTER_TIMEOUT:=120}
 : ${CTX_MAX_CHARS:=2000}
+
+# ── 输出端 ACK 过滤函数 ──
+# 返回 0 = 是纯ACK应跳过, 返回 1 = 不是纯ACK放行
+_is_pure_ack() {
+    local txt="$1"
+    # 快速长度预检：超过30字符肯定不是纯ACK
+    local clen
+    clen=$(echo "$txt" | tr -d '[:space:][:punct:]' | wc -c | tr -d ' ')
+    [ "$clen" -gt 30 ] && return 1
+    echo "$txt" | python3 -c "
+import sys, re
+msg = sys.stdin.read().strip()
+# 去空格/标点/emoji，保留中日韩文字+字母数字+加号
+clean = re.sub(r'[^\u4e00-\u9fff\w+]', '', msg)
+# 匹配 1~4 个确认短语的重复组合（「收到收到」「好的收到明白」等）
+ack_re = re.compile(r'^(\U0001F442?\U0001F44D?\u2705?\U0001F44C?\U0001FAE1?)?(收到了?|知道了?|好的|明白[了]?|了解[了]?|OK|ok|[Rr]oger|\+1)(\s*(收到了?|知道了?|好的|明白[了]?|了解[了]?|OK|ok|[Rr]oger|\+1)){0,3}[.。!！~～]*$')
+if ack_re.match(clean) and len(clean) <= 12:
+    sys.exit(0)
+else:
+    sys.exit(1)
+" 2>/dev/null
+}
 
 RAW=""
 
@@ -106,6 +128,14 @@ print(json.dumps({
                         -d "$PAYLOAD" 2>/dev/null)
                     TEXT=$(echo "$REPLY" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["choices"][0]["message"]["content"])' 2>/dev/null)
                     if [ -n "$TEXT" ]; then
+                        # ── 输出端 ACK 过滤：LLM 回复若为纯确认短语则截杀 ──
+                        if _is_pure_ack "$TEXT"; then
+                            echo "[adapter] 输出端ACK截杀: ${TEXT:0:50}" >&2
+                            if [ -n "$RAW" ]; then
+                                printf '{"reply":"","status":"ok","skipped":"output_ack"}\n'
+                            fi
+                            exit 0
+                        fi
                         if [ -n "$RAW" ]; then
                             ESCAPED=$(echo "$TEXT" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read().strip()))')
                             printf '{"reply":%s,"status":"ok"}\n' "$ESCAPED"
@@ -133,9 +163,7 @@ else:
 " 2>/dev/null; then
             echo "[adapter] 纯ACK跳过(CLI): ${CLEAN_MSG:0:50}" >&2
             if [ -n "$RAW" ]; then
-                printf '{"reply":"👌","status":"ok","ack":true}\n'
-            else
-                echo "👌"
+                printf '{"reply":"","status":"ok","ack":true}\n'
             fi
             exit 0
         fi
@@ -149,6 +177,14 @@ else:
         cleaned=$(echo "$output" | sed '/Normalized model/{N;d;}' | LC_ALL=en_US.UTF-8 grep -v '^session_id:' | grep -v '^Restored session:' | grep -v '^Saving session' | grep -v '^\.\.\.' | grep -v '^$')
         first_line=$(echo "$cleaned" | head -1)
         if [ -n "$first_line" ]; then
+            # ── 输出端 ACK 过滤：LLM 回复若为纯确认短语则截杀 ──
+            if _is_pure_ack "$first_line"; then
+                echo "[adapter] 输出端ACK截杀(CLI): ${first_line:0:50}" >&2
+                if [ -n "$RAW" ]; then
+                    printf '{"reply":"","status":"ok","skipped":"output_ack"}\n'
+                fi
+                exit 0
+            fi
             if [ -n "$RAW" ]; then
                 ESCAPED=$(echo "$first_line" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read().strip()))')
                 printf '{"reply":%s,"status":"ok"}\n' "$ESCAPED"

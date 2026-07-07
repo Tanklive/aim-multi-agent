@@ -1,10 +1,13 @@
 #!/bin/bash
 set -eu
-# v1.14.1: JSON stdin 双协议 + shlex.quote 安全注入
-# (历史: v1.12.0 移除 pipefail，管道全部改为临时文件/python3)
+# v1.14.2: 池会话接口契约固化 + Letta CLI 恢复 (npm 包冲突修复)
+# v1.14.1: JSON stdin 双协议 + shlex.quote 安全注入 + agent_id 磁盘自动发现
+# v1.14.0: agent_id 磁盘自动发现 (_resolve_agent_id)，不依赖 config.json
+# v1.13.2: +context-live L2 即时上下文注入
+# v1.13.1: --from 强制必填，移除 "unknown" 默认值回退
+# v1.12.0: 移除 pipefail，管道全部改为临时文件/python3
 # AIM Letta adapter — AIM Client v1.2 标准接口
-# VERSION: 1.13.2    [v1.13.2: +context-live L2 即时上下文注入]
-#                     [v1.13.1: --from 强制必填，移除 "unknown" 默认值回退]
+# 接口契约: shared/aim/PROJECT/ZS0003-pool-contract.md
 #
 # 6 个标准模式:
 #   adapter.sh process --message "..." --from "ZSxxxx"   处理消息
@@ -41,6 +44,12 @@ if [ -z "$LETTA_BIN" ] || [ -z "$PYTHON_BIN" ]; then
     if [ -f "$CONFIG_FILE" ]; then
         [ -z "$PYTHON_BIN" ] && PYTHON_BIN=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE')).get('python_bin',''))" 2>/dev/null || true)
         [ -z "$LETTA_BIN" ] && LETTA_BIN=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE')).get('letta_bin',''))" 2>/dev/null || true)
+    fi
+
+    # 池清理：trim 后保留最近 pool_size + 2 个 ID（v1.14.2: 从 ZS0003 收紧策略同步回模板）
+    _keep=$((POOL_SIZE + 2))
+    if [ -f "$DISPATCH_IDS_FILE" ] && [ "$(wc -l < "$DISPATCH_IDS_FILE" | tr -d ' ')" -gt "$_keep" ]; then
+        tail -n "$_keep" "$DISPATCH_IDS_FILE" > "${DISPATCH_IDS_FILE}.tmp" && mv "${DISPATCH_IDS_FILE}.tmp" "$DISPATCH_IDS_FILE"
     fi
 fi
 
@@ -402,8 +411,8 @@ _track_conv_id() {
     if ! grep -qxF "$conv_id" "$DISPATCH_IDS_FILE" 2>/dev/null; then
         echo "$conv_id" >> "$DISPATCH_IDS_FILE"
     fi
-    # LRU 淘汰: 保留最近 pool_size * 2 个 ID
-    local keep=$((POOL_SIZE * 2 + 5))
+    # LRU 淘汰: 保留最近 pool_size + 2 个 ID（缓冲防止抖动，v1.14.2: 从 pool_size*2+5 收紧）
+    local keep=$((POOL_SIZE + 2))
     if [ "$(wc -l < "$DISPATCH_IDS_FILE" | tr -d ' ')" -gt "$keep" ]; then
         tail -n "$keep" "$DISPATCH_IDS_FILE" > "${DISPATCH_IDS_FILE}.tmp" && mv "${DISPATCH_IDS_FILE}.tmp" "$DISPATCH_IDS_FILE"
     fi

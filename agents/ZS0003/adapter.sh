@@ -1,10 +1,13 @@
 #!/bin/bash
 set -eu
-# v1.14.1: JSON stdin 双协议 + shlex.quote 安全注入
-# (历史: v1.12.0 移除 pipefail，管道全部改为临时文件/python3)
+# v1.14.2: 池会话接口契约固化 + Letta CLI 恢复 (npm 包冲突修复) + PROBE_TIMEOUT 90s
+# v1.14.1: JSON stdin 双协议 + shlex.quote 安全注入 + agent_id 磁盘自动发现
+# v1.14.0: agent_id 磁盘自动发现 (_resolve_agent_id)，不依赖 config.json
+# v1.13.2: +context-live L2 即时上下文注入
+# v1.13.1: --from 强制必填，移除 "unknown" 默认值回退
+# v1.12.0: 移除 pipefail，管道全部改为临时文件/python3
 # AIM Letta adapter — AIM Client v1.2 标准接口
-# VERSION: 1.13.2    [v1.13.2: +context-live L2 即时上下文注入]
-#                     [v1.13.1: --from 强制必填，移除 "unknown" 默认值回退]
+# 接口契约: shared/aim/PROJECT/ZS0003-pool-contract.md
 #
 # 6 个标准模式:
 #   adapter.sh process --message "..." --from "ZSxxxx"   处理消息

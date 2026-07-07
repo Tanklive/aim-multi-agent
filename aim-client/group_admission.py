@@ -70,6 +70,7 @@ class GroupAdmission:
     SUBJ_CREATE  = "aim.groups.create"
     SUBJ_JOIN    = "aim.groups.join"
     SUBJ_APPROVE = "aim.groups.approve"
+    SUBJ_LEAVE   = "aim.groups.leave"
     SUBJ_MEMBERS = "aim.groups.members"
     SUBJ_LIST    = "aim.groups.list"
     SUBJ_MY      = "aim.groups.my"
@@ -139,6 +140,7 @@ class GroupAdmission:
         await self.nc.subscribe(self.SUBJ_CREATE, cb=self._handle_create)
         await self.nc.subscribe(self.SUBJ_JOIN, cb=self._handle_join)
         await self.nc.subscribe(self.SUBJ_APPROVE, cb=self._handle_approve)
+        await self.nc.subscribe(self.SUBJ_LEAVE, cb=self._handle_leave)
         await self.nc.subscribe(self.SUBJ_MEMBERS, cb=self._handle_members)
         await self.nc.subscribe(self.SUBJ_LIST, cb=self._handle_list)
         await self.nc.subscribe(self.SUBJ_MY, cb=self._handle_my)
@@ -333,6 +335,47 @@ class GroupAdmission:
         
         await self._save_to_kv(group_id, grp)
 
+    async def _handle_leave(self, msg):
+        """v2.0: 主动退群或被踢出"""
+        try:
+            req = json.loads(msg.data.decode())
+            group_id = req["group_id"]
+            agent_id = req["agent_id"]
+            requester = req.get("requester", agent_id)  # 谁操作的（群主踢人 vs 自己退）
+        except Exception:
+            self._respond(msg, {"status": "error", "error": "invalid"})
+            return
+
+        grp = self._groups.get(group_id)
+        if not grp:
+            self._respond(msg, {"status": "not_found"})
+            return
+
+        if agent_id not in grp.members:
+            self._respond(msg, {"status": "not_member"})
+            return
+
+        # 群主不能被踢（只能解散群，Phase 2+）
+        if requester != agent_id and agent_id == grp.owner:
+            self._respond(msg, {"status": "owner_cannot_be_removed"})
+            return
+
+        # 非群主的踢人操作需权限检查
+        if requester != agent_id and requester != grp.owner:
+            self._respond(msg, {"status": "unauthorized"})
+            return
+
+        grp.members.remove(agent_id)
+        grp.pending_joins.pop(agent_id, None)
+        await self._save_to_kv(group_id, grp)
+
+        # 通知被移除的 agent
+        self._notify_group_update(agent_id, group_id, "removed", grp.name)
+
+        action_desc = "退出" if requester == agent_id else f"被 {requester} 踢出"
+        logger.info(f"{agent_id} {action_desc} {group_id}")
+        self._respond(msg, {"status": "left", "group_id": group_id, "agent_id": agent_id, "action": action_desc})
+
     async def _handle_members(self, msg):
         try:
             req = json.loads(msg.data.decode())
@@ -405,6 +448,12 @@ class GroupAdmission:
         """v2.0: 查询某 Agent 所属的全部群"""
         return await self._client_request(self.SUBJ_MY, {
             "agent_id": agent_id,
+        })
+
+    async def leave_group(self, group_id: str, agent_id: str) -> dict:
+        """v2.0: Agent 主动退群"""
+        return await self._client_request(self.SUBJ_LEAVE, {
+            "group_id": group_id, "agent_id": agent_id,
         })
 
 

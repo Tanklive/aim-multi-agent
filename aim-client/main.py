@@ -247,6 +247,15 @@ class Transport:
         await self._sdk.subscribe_grp(group_id, handler)
         self._logger.info(f" 已订阅群聊: aim.grp.{group_id}")
 
+    async def unsubscribe_grp(self, group_id: str):
+        """v2.0: 退订群聊"""
+        await self._sdk.unsubscribe_grp(group_id)
+        self._logger.info(f" 退订群聊: aim.grp.{group_id}")
+
+    async def subscribe_notification(self, handler):
+        """v2.0: 订阅系统通知 (群变更等)"""
+        await self._sdk.subscribe_notification(handler)
+
     async def send_dm(self, to_id: str, text: str):
         """发送私聊消息 + 送达确认"""
         envelope = await self._sdk.send_dm(to_id, text)
@@ -646,6 +655,9 @@ class AIMClient:
         # 订阅（v2.0: 动态群发现，启动时从 KV 查所有群）
         await self.transport.subscribe_dm(self._on_dm)
         await self._resolve_and_subscribe_groups()
+
+        # v2.0: 订阅系统通知（群变更实时感知）= 群聊的"耳目"
+        await self.transport.subscribe_notification(self._on_notification)
 
         self.running = True
         self.logger.info(f" {self.agent_id} AIM Client v{_AIM_VERSION} 启动完成")
@@ -1267,6 +1279,30 @@ class AIMClient:
         self.logger.info(f"📋 KV 无群记录，订阅默认群 {default_grp}")
         for gid in default_grp.split(","):
             await self.transport.subscribe_grp(gid.strip(), self._on_grp)
+
+    async def _on_notification(self, payload: dict, _raw=None):
+        """v2.0: 处理系统通知 — 群变更实时感知
+
+        通知格式:
+          {"event": "group.update", "action": "added|removed|created",
+           "group_id": "grp_xxx", "group_name": "...", "timestamp": ...}
+        """
+        event = payload.get("event", "")
+        if event != "group.update":
+            return
+
+        action = payload.get("action", "")
+        group_id = payload.get("group_id", "")
+        group_name = payload.get("group_name", group_id)
+
+        if action == "added":
+            await self.transport.subscribe_grp(group_id, self._on_grp)
+            self.logger.info(f"🔔 被拉入群: {group_id} ({group_name})")
+        elif action == "removed":
+            await self.transport.unsubscribe_grp(group_id)
+            self.logger.info(f"🔔 退出群: {group_id} ({group_name})")
+        else:
+            self.logger.debug(f"🔔 群通知: {action} {group_id}")
 
     async def _register_with_registry(self):
         """向 Registry 注册本 Agent"""

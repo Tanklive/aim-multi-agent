@@ -1474,6 +1474,15 @@ class AIMNATSClient:
         self._grp_handlers[group_id] = handler
         log.info(f"📩 [{self.agent_id}] subscribed group: {subject}")
 
+    async def unsubscribe_grp(self, group_id: str):
+        """v2.0: 取消订阅群聊"""
+        subject = Subjects.grp(group_id)
+        if subject in self._subscriptions:
+            sub = self._subscriptions.pop(subject)
+            await sub.unsubscribe()
+        self._grp_handlers.pop(group_id, None)
+        log.info(f"📤 [{self.agent_id}] unsubscribed group: {subject}")
+
     async def subscribe_obs(self, handler: Callable, agent_id: str = ">"):
         subject = f"aim.obs.{agent_id}"
         async def _cb(msg):
@@ -1485,6 +1494,19 @@ class AIMNATSClient:
         sub = await self.nc.subscribe(subject, cb=_cb)
         self._subscriptions[subject] = sub
         log.info(f"👁️ [{self.agent_id}] subscribed observer: {subject}")
+
+    async def subscribe_notification(self, handler: Callable):
+        """v2.0: 订阅 aim.notification.<agent_id>，接收群变更等系统通知"""
+        subject = f"aim.notification.{self.agent_id}"
+        async def _cb(msg):
+            try:
+                parsed = parse_message(msg.data)
+                await handler(parsed, msg)
+            except Exception as e:
+                log.error(f"[{self.agent_id}] notification handler error: {e}")
+        sub = await self.nc.subscribe(subject, cb=_cb)
+        self._subscriptions[subject] = sub
+        log.info(f"🔔 [{self.agent_id}] subscribed notification: {subject}")
 
     async def subscribe_sys(self, handler: Callable):
         async def _cb(msg):

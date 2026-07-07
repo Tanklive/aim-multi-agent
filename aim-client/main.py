@@ -1,5230 +1,1392 @@
 #!/usr/bin/env python3.13
-
 """AIM Client — 统一通信终端
 
-
-
 OAS 基础设施核心组件。
-
 取代 nats-agent-v3.py 成为三方标准通信入口。
 
-
-
 架构:
-
   aim-client (本进程)
-
     ├── Transport (NATS -> 可插拔，基于 SDK AIMNATSClient)
-
     ├── Identity (AgentCard + JWT)
-
     ├── Security (白名单 + 限流 + 认证链)
-
     ├── Queue+Scheduler+HealthProbe (Phase 0 内嵌)
-
     └── Adapter (call adapter.sh)
 
-
-
-Phase 2 (当前):
-
-  - 自托管进程：daemonize + auto-restart，不依赖系统 launchd
-
-  - 每 Agent 一个独立进程，由 agent_id 标识
-
-  - 安装即服务：aim-client/main.py --agent-id ZS0001 --config ... 直接后台运行
-
+Phase 1 (当前):
+  - 独立进程，launchd 保活
   - Transport 7 方法接口
-
   - Agent Card v1
-
   - Message/Task 分层 (AIMChat + AIMTask)
-
 启动:
-
     python3 aim-client/main.py --agent-id ZS0001 --config ~/.aim/agents/ZS0001/config.json
 
-    # 默认 daemonize（后台），--foreground 前台调试
-
-
-
-守护进程标准:
-
-  - pidfile: ~/.aim/run/aim-client-{agent_id}.pid
-
-  - lock:    ~/.aim/run/aim-client-{agent_id}.lock (SingleInstance)
-
-  - auto-restart: 异常退出自动重拉（指数退避 max 60s）
-
-
-
 依赖:
-
     - ~/.aim/bin/aim_nats_sdk.py (SDK)
-
     - ~/.openclaw/workspace/aim_client/ (types, queue, scheduler)
-
 """
-
-
 
 from __future__ import annotations
 
-
-
 import argparse
-
 import asyncio
-
 import atexit
-
 import fcntl
-
 import json
-
 import logging
-
 import os
-
 import signal
-
 import sys
-
 import time
-
 from collections import deque
-
 import uuid
-
 from logging.handlers import RotatingFileHandler
-
 from pathlib import Path
-
 from typing import Optional
 
-
-
 # -- 路径注入 --
-
 SHARED_AIM = Path.home() / "shared" / "aim"
-
 SDK_DIR = Path.home() / ".aim" / "bin"
 
-
-
 for p in [SDK_DIR, SHARED_AIM]:
-
     if p.exists() and str(p) not in sys.path:
-
         sys.path.insert(0, str(p))
 
-
-
 from aim_client.types import (
-
     AIMChat, AIMTask, TaskStatus, AgentCard,
-
     AgentState, StateReport, DeliveryMode, Message,
-
 )
-
 from aim_client.queue import MessageQueue
-
 from aim_client.scheduler import Scheduler
-
-from session import SessionManager       # ADAPTER-PROTOCOL v1.0
-
-from context import ContextManager       # ADAPTER-PROTOCOL v1.0
-
 from aim_client.health_probe import HealthProbe
-from aim_client.notification import NotificationHandler  # 624: 新消息提醒接口标准
-from aim_client.grp_policy import GroupPolicyManager  # 624: 群聊冷却机制
-
 from aim_nats_sdk import load_global_config
 
-
-
 # 619-06: 读取全局 VERSION 文件，不再写死
-
 VERSION_FILE = SHARED_AIM / "VERSION"
-
 try:
-
     _AIM_VERSION = VERSION_FILE.read_text().strip() if VERSION_FILE.exists() else "unknown"
-
 except Exception:
-
     _AIM_VERSION = "unknown"
 
-
-
 # AIM Client 内部模块（绝对导入）
-
 import sys
-
 import importlib.util
 
-
-
 # 先设置 sys.path
-
 sys.path.insert(0, str(Path.home() / 'shared' / 'aim' / 'aim-client'))
 
-
-
 # 动态导入 security
-
 security_path = Path.home() / 'shared' / 'aim' / 'aim-client' / 'security.py'
-
 security_spec = importlib.util.spec_from_file_location('security', security_path)
-
 security_module = importlib.util.module_from_spec(security_spec)
-
 sys.modules['security'] = security_module
-
 security_spec.loader.exec_module(security_module)
-
 SecurityManager = security_module.SecurityManager
 
-
-
 # 动态导入 registry
-
 registry_path = Path.home() / 'shared' / 'aim' / 'aim-client' / 'registry.py'
-
 registry_spec = importlib.util.spec_from_file_location('registry', registry_path)
-
 registry_module = importlib.util.module_from_spec(registry_spec)
-
 sys.modules['registry'] = registry_module
-
 registry_spec.loader.exec_module(registry_module)
-
 Registry = registry_module.Registry
 
-
-
 # -- 单实例互斥 --
-
 LOCK_DIR = Path.home() / ".aim" / "run"
-
 LOCK_DIR.mkdir(parents=True, exist_ok=True)
 
 
-
-
-
 class SingleInstance:
-
     """文件锁 + PID 存活检查，防止僵尸锁残留。
 
-
-
     两层防护：
-
     1. fcntl.flock (L295): OS 进程退出时自动释放
-
     2. PID 存活检查 (L312): flock 失败时，检查锁文件中的 PID 是否存活
-
        → 存活 → 真冲突，拒绝启动
-
        → 已死 → 僵尸锁，清理后重试
-
     """
 
-
-
     def __init__(self, agent_id: str):
-
         self.lock_file = LOCK_DIR / f"aim-client-{agent_id}.lock"
-
         self.fp: Optional[object] = None
 
-
-
     def acquire(self) -> bool:
-        """P0 #1: 三层单实例防护 — flock(L1) + PID检查(L2) + pgrep(L3)"""
-
         try:
-
-            # P0 #1: 使用 "r+" 而非 "w" 打开，防止 flock 失败时文件已被截断
-            # 旧 PID 保留在文件中供 _try_recover_stale 读取
-            if self.lock_file.exists():
-                self.fp = open(self.lock_file, "r+")
-            else:
-                self.fp = open(self.lock_file, "w")
-
+            self.fp = open(self.lock_file, "w")
             fcntl.flock(self.fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-            # 获取锁成功后，截断并写入当前 PID
-            self.fp.seek(0)
-            self.fp.truncate()
             self.fp.write(str(os.getpid()))
-
             self.fp.flush()
-
             return True
-
         except (IOError, OSError):
-
             return self._try_recover_stale()
 
-
-
     def _try_recover_stale(self) -> bool:
-
         """检查锁文件中 PID 是否存活，清理僵尸锁"""
-
         try:
-
             old_pid_str = self.lock_file.read_text().strip()
-
-            if not old_pid_str:
-                # P0 #1: 空文件（旧 open("w") 截断遗留）→ 清理重试
-                self.lock_file.unlink(missing_ok=True)
-                return self.acquire()
-
             old_pid = int(old_pid_str)
-
             # os.kill(pid, 0) 不发送信号，只检查进程是否存在
-
             os.kill(old_pid, 0)
-
             # PID 存活 → 真冲突
-
             return False
-
         except (ValueError, OSError):
-
             # PID 不存在或无效 → 僵尸锁，清理后重试
-            self._pgrep_kill_stale()
             self.lock_file.unlink(missing_ok=True)
-
             return self.acquire()  # 递归重试一次
 
-
-    def _pgrep_kill_stale(self):
-
-        """P0 #1 L3: pgrep 兜底 — 清理可能的幽灵进程"""
-        import subprocess as _sp
-        try:
-            agent_suffix = self.lock_file.stem.replace("aim-client-", "")
-            r = _sp.run(
-                ["pgrep", "-f", f"aim-client.*{agent_suffix}"],
-                capture_output=True, text=True, timeout=3
-            )
-            for pid_str in r.stdout.strip().split('\n'):
-                pid = pid_str.strip()
-                if pid and pid.isdigit():
-                    try:
-                        os.kill(int(pid), 15)
-                    except OSError:
-                        pass
-        except Exception:
-            pass
-
-
-
     def release(self):
-
         if self.fp:
-
             try:
-
                 fcntl.flock(self.fp.fileno(), fcntl.LOCK_UN)
-
                 self.fp.close()
-
             except Exception:
-
                 pass
-
             self.fp = None
-
             self.lock_file.unlink(missing_ok=True)
-
-
-
 
 
 # -- 日志 --
-
 def setup_logging(agent_id: str) -> logging.Logger:
-
     log_dir = Path.home() / ".aim" / "logs"
-
     log_dir.mkdir(parents=True, exist_ok=True)
-
     log_file = log_dir / f"aim-client-{agent_id}.log"
-
     logger = logging.getLogger("aim-client")
-
     logger.setLevel(logging.DEBUG)
 
-
-
     fh = RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=3)
-
     fh.setLevel(logging.DEBUG)
-
     fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)-5s] %(message)s", datefmt="%H:%M:%S"))
-
     # 只保留 FileHandler；StreamHandler 已移除（shell 用 2>&1 捕获 stderr，
-
     # 同时保留 StreamHandler 会导致每行日志在文件中出现两次）
-
     logger.addHandler(fh)
-
     # Debug 输出走 stdout（不双写，shell 不重定向时不丢调试信息）
-
     dh = logging.StreamHandler(sys.stdout)
-
     dh.setLevel(logging.DEBUG)
-
     dh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)-5s] %(message)s", datefmt="%H:%M:%S"))
-
     if os.environ.get("AIM_LOG_NO_CONSOLE"):
-
         dh.setLevel(logging.CRITICAL)  # 静默
-
     return logger
 
 
-
-
-
 # -- Identity --
-
 def load_identity(agent_id: str) -> AgentCard:
-
     identity_path = Path.home() / ".aim" / "agents" / agent_id / "identity.json"
-
     config_path = Path.home() / ".aim" / "agents" / agent_id / "config.json"
-
     card = AgentCard()
-
     if identity_path.exists():
-
         id_data = json.loads(identity_path.read_text())
-
         card.global_id = id_data.get("global_id", "")
-
         card.serial = id_data.get("serial", id_data.get("agent_id", agent_id))
-
         card.name = id_data.get("name", agent_id)
-
         exec_model = id_data.get("execution_model", "deferred")
-
         card.execution_model = exec_model if isinstance(exec_model, str) else exec_model.get("type", "deferred")
-
     if config_path.exists():
-
         cfg = json.loads(config_path.read_text())
-
         card.execution_model = cfg.get("execution_model", card.execution_model)
-
         # 619-01: 启动前 config schema 校验 (A/B 层)
-
         try:
-
             import subprocess as _sp
-
             _schema_script = str(Path.home() / "shared/aim/aim-client/config_schema_check.py")
-
             if Path(_schema_script).exists():
-
                 _r = _sp.run([sys.executable, _schema_script, str(config_path)], capture_output=True, timeout=10)
-
                 if _r.returncode == 1:
-
                     print(f"❌ Config schema A 层校验失败:\n{_r.stderr.decode()}", file=sys.stderr)
-
                     # 不退出，输出 warning 后继续（给修复机会）
-
                 elif _r.returncode == 0:
-
                     print(f"✅ [619-01] Config schema v0.2 校验通过")
-
         except Exception:
-
             pass  # schema 不可用不阻塞启动
-
     return card
 
 
-
-
-
 # -- Transport --
-
 class Transport:
-
     """Transport 抽象层 -- 基于 SDK AIMNATSClient
 
-
-
     Phase 1: 包装 SDK 客户端
-
     Phase 2+: 可插拔协议 (HTTP/WS/GRPC)
-
     """
 
-
-
     def __init__(self, agent_id: str, nats_url: str = "nats://127.0.0.1:4222"):
-
         from aim_nats_sdk import AIMNATSClient
-
         self.agent_id = agent_id
-
         self._logger = logging.getLogger("aim-client.transport")
-
-        self._my_msg_ids: set = set()  # U-007: 追踪本 Agent 发出的消息 ID
-
         creds_path = Path.home() / ".aim" / "agents" / agent_id / "aim.creds"
-
         self._sdk = AIMNATSClient(
-
             agent_id=agent_id,
-
             server=nats_url,
-
             credentials=str(creds_path) if creds_path.exists() else "",
-
         )
 
-
-
     @property
-
     def client(self):
-
         return self._sdk
 
-
-
     async def connect(self) -> bool:
-
         try:
-
             await self._sdk.connect()
-
             return True
-
         except Exception as e:
-
             self._logger.error(f"NATS 连接失败: {e}")
-
             return False
 
-
-
     async def disconnect(self):
-
         try:
-
             await asyncio.wait_for(self._sdk.close(), timeout=5.0)
-
         except asyncio.TimeoutError:
-
             self._logger.warning("NATS disconnect timeout, forcing close")
 
-
-
     async def subscribe_dm(self, handler):
-
         await self._sdk.subscribe_dm(handler)
-
         self._logger.info(f" 已订阅私聊: aim.dm.{self.agent_id}")
 
-
+    def get_nc(self):
+        """暴露底层 NATS 连接，用于直接 KV 操作"""
+        return self._sdk.nc
 
     async def subscribe_grp(self, group_id: str, handler):
-
         await self._sdk.subscribe_grp(group_id, handler)
-
         self._logger.info(f" 已订阅群聊: aim.grp.{group_id}")
 
-
-
-    async def subscribe_notification(self, handler):
-
-        """625: 订阅 aim.notification.<agent_id> — 通知消费侧实时推送
-
-        R-001 修复：NATS 推送通道已就绪但无人订阅，导致 @提醒等通知
-
-        只能通过心跳轮询 JSONL 文件（最长 30s 延迟）。
-
-        此方法订阅后，通知实时推送到 handler 回调。
-
-        """
-
-        subject = f"aim.notification.{self.agent_id}"
-
-
-
-        async def _cb(msg):
-
-            try:
-
-                import json
-
-                data = json.loads(msg.data.decode())
-
-                self._logger.debug(f"[notification] 收到实时通知: {data.get('event', '?')} from={data.get('from_id', '?')}")
-
-                await handler(data)
-
-            except Exception as e:
-
-                self._logger.warning(f"[notification] 处理通知异常: {e}")
-
-
-
-        try:
-
-            sub = await self._sdk.nc.subscribe(subject, cb=_cb)
-
-            self._logger.info(f"🔔 已订阅通知: {subject}")
-
-        except Exception as e:
-
-            self._logger.error(f"[notification] 订阅 {subject} 失败: {e}")
-
-
-
     async def send_dm(self, to_id: str, text: str):
-
         """发送私聊消息 + 送达确认"""
-
         envelope = await self._sdk.send_dm(to_id, text)
-
         if isinstance(envelope, dict) and "id" in envelope:
-
             self._my_msg_ids.add(envelope["id"])  # U-007: 追踪发出的消息
-
             await self.emit_delivery(to_id, envelope["id"], via="dm")
-
         return envelope
 
-
-
     async def send_grp(self, group_id: str, text: str):
-
         """发送群聊消息 + 送达确认"""
-
         result = await self._sdk.send_grp(group_id, text)
-
         if isinstance(result, dict) and "id" in result:
-
             self._my_msg_ids.add(result["id"])  # U-007: 追踪发出的消息
-
             await self.emit_delivery(group_id, result["id"], via="grp")
-
         return result
 
-
-
     async def authenticate(self) -> bool:
-
         return True
 
-
-
     async def emit_obs(self, status: str, msg_id: str = "", detail: str = ""):
-
         """发布 Observer 状态事件（委托给 SDK）"""
-
         try:
-
             await self._sdk.emit_obs(status, msg_id, detail)
-
         except Exception as e:
-
             self._logger.debug(f"emit_obs 失败: {e}")
 
-
-
     async def emit_health(self, status: str, msg_id: str = "", detail: str = ""):
-
         """发布健康监控事件到 aim.health.>（healthd 消费，不耗 token）"""
-
         try:
-
             import json, time, uuid
-
             event = {
-
                 "agent_id": self.agent_id,
-
                 "status": status,
-
                 "msg_id": msg_id,
-
                 "detail": detail,
-
                 "ts": time.time(),
-
                 "nonce": uuid.uuid4().hex[:8],
-
             }
-
             await self._sdk.nc.publish(f"aim.health.{self.agent_id}", json.dumps(event).encode())
-
         except Exception as e:
-
             self._logger.debug(f"emit_health 失败: {e}")
 
-
-
     async def emit_delivery(self, to_id: str, envelope_id: str, via: str = "dm"):
-
         """推送送达确认事件（observer 可见但不进 dispatch）
-
         U-006 fix: detail 人可读不丢 JSON，observer 格式干净
-
         """
-
         import time
-
         mid = envelope_id[:8] if len(envelope_id) >= 8 else envelope_id
-
         # await self._sdk.emit_obs("delivered", mid, f"→ {to_id} via {via}")  # 2026-06-21 禁用以省带宽
 
-    async def emit_notification(self, envelope: dict) -> None:
-        """624: 发布通知事件到 NATS system_event 通道
-
-        发布到 aim.notification.<agent_id>，供 Gateway/OpenClaw 订阅后注入会话。
-        与 emit_health 走不同的 subject 空间，互不干扰。
-        """
-        try:
-            import json
-            subject = f"aim.notification.{self.agent_id}"
-            payload = json.dumps(envelope, ensure_ascii=False).encode()
-            await self._sdk.nc.publish(subject, payload)
-        except Exception as e:
-            self._logger.debug(f"emit_notification 失败: {e}")
-
-
-
     async def send_registry_health_report(self, health: dict):
-
         return await self.request("aim.registry.health_report", {
-
             "agent_id": self.agent_id, "health": health,
-
         }, timeout=3)
-
-
 
     async def send_registry_event(self, event_type: str, detail: dict = None):
-
         return await self.request("aim.registry.event", {
-
             "agent_id": self.agent_id, "event_type": event_type, "detail": detail or {},
-
         }, timeout=3)
-
-
 
     async def query_registry_health(self, agent_id: str) -> dict:
-
         return await self.request("aim.registry.health_query", {
-
             "agent_id": agent_id,
-
         }, timeout=3)
-
-
 
     async def query_registry_events(self, agent_id: str = "", event_type: str = "",
-
                                      limit: int = 20) -> dict:
-
         return await self.request("aim.registry.event_query", {
-
             "agent_id": agent_id, "event_type": event_type, "limit": limit,
-
         }, timeout=3)
 
-
-
     async def send_registry_heartbeat(self):
-
         """向 Registry 发送心跳，更新 last_seen"""
-
         try:
-
             if self._sdk.nc and self._sdk.nc.is_connected:
-
                 import json as _json, time as _time
-
                 payload = _json.dumps({
-
                     "agent_id": self.agent_id,
-
                     "ts": _time.time(),
-
                 }).encode()
-
                 await self._sdk.nc.publish("aim.registry.heartbeat", payload)
-
         except Exception as e:
-
             self._logger.debug(f"Registry 心跳失败: {e}")
 
-
-
     async def verify_peer(self, peer_id: str) -> bool:
-
         cfg = load_global_config()
-
         peers = cfg.get("trusted_peers", [])
-
         return peer_id in peers
 
-
-
     async def request(self, subject: str, payload: dict, timeout: float = 5.0) -> dict:
-
         """Transport.request() — NATS request-reply 统一入口
 
-
-
         Phase 1 协议要求 7 方法之一。封装 SDK 的 request-reply，
-
         所有 Registry 交互 (register/health/event/query) 通过此方法。
-
         失败时返回 {"status": "error", "detail": str(e)}，调用方不需 try/except。
-
         """
-
         import json as _json
-
         try:
-
             if not self._sdk.nc or not self._sdk.nc.is_connected:
-
                 return {"status": "error", "detail": "NATS not connected"}
-
             data = _json.dumps(payload).encode()
-
             resp = await self._sdk.nc.request(subject, data, timeout=timeout)
-
             return _json.loads(resp.data)
-
         except Exception as e:
-
             self._logger.debug(f"request({subject}) failed: {e}")
-
             return {"status": "error", "detail": str(e)}
 
 
-
-
-
 # -- AIMClient 主类 --
-
 class AIMClient:
-
     """AIM Client 主进程 -- Phase 1"""
 
-
-
     def __init__(self, config_path: str):
-
         self.config_path = config_path = Path(config_path).expanduser()
-
         self.config = json.loads(config_path.read_text())
-
         self.agent_id = self.config["agent_id"]
-
         global_cfg = load_global_config()
-
         self._default_group = global_cfg.get("default_group", "grp_trio")
-
         self.logger = setup_logging(self.agent_id)
-
         self.lock = SingleInstance(self.agent_id)
 
-
-
         # Identity
-
         self.card = load_identity(self.agent_id)
-
         self.logger.info(f"Identity: {self.card.serial} ({self.card.name}) execution_model={self.card.execution_model}")
 
-
-
         # Transport
-
         nats_url = self.config.get("nats_server", "nats://127.0.0.1:4222")
-
         self.transport = Transport(self.agent_id, nats_url)
 
-
-
         # Security v1
-
         self.security = SecurityManager(self.config)
-
         creds_path = Path.home() / ".aim" / "agents" / self.agent_id / "aim.creds"
-
         self.registry_client = Registry(nats_url, credentials=str(creds_path) if creds_path.exists() else "")
 
-
-
         # Phase 0: Queue + Scheduler + HealthProbe
-
         self.queue = MessageQueue(capacity=self.config.get("queue_capacity", 1000))
-
         # 619-14: heartbeat/probe 间隔从 config 统一
-
         hb_cfg = self.config.get("heartbeat", {})
-
         probe_interval = hb_cfg.get("interval_ms", 30000) / 1000.0  # ms→s
-
         self.scheduler = Scheduler(
-
             processing_timeout=self.config.get("adapter_timeout", 120),
-
             health_probe_interval=probe_interval,
-
         )
-
         adapter_cmd = self.config.get("adapter_cmd", "")
-
         if adapter_cmd:
-
             adapter_cmd = str(Path(adapter_cmd).expanduser())
-
         self.adapter_cmd = adapter_cmd
 
-        # ADAPTER-PROTOCOL v1.0: Session + Context 管理
-        self._protocol_version = self.config.get("protocol_version", "")  # "1.0" = 新协议
-        
-        # L1 熔断器：指数退避 + 三态 (CLOSED/OPEN/HALF_OPEN)
-        cb_cfg = self.config.get("circuit_breaker", {})
-        self.breaker = CircuitBreaker(
-            failure_threshold=cb_cfg.get("failure_threshold", 5),
-            base_cooldown=cb_cfg.get("base_cooldown", 10),
-            max_cooldown=cb_cfg.get("max_cooldown", 120),
-            half_open_max=cb_cfg.get("half_open_max", 1),
-            logger=self.logger,
-        )
-        self.session_mgr = SessionManager(
-            mode=self.config.get("adapter_mode", "cli"),
-            max_reuse=self.config.get("session_max_reuse", 5),
-        )
-        self.context_mgr = ContextManager(agent_id=self.agent_id)
-        self.logger.info(
-            f"Adapter Protocol: {'v'+self._protocol_version if self._protocol_version else 'legacy (CLI args)'}"
-            f", adapter_mode={self.session_mgr.mode}"
-        )
-
-
         # 619-20: 将 config 中 adapter 需要的变量注入子进程环境
-
         #   adapter.sh 优先级: env → config.json → 硬编码
-
         #   注入后 adapter 不再依赖 config.json fallback
-
         # 以父进程环境打底（必须！空 dict 会清空 PATH/HOME 等）
-
         self.adapter_env: dict[str, str] = dict(os.environ)
-
         self._degrade_history = deque(maxlen=100)  # P1-2: (ts, exit_code) 窗口
-
         self._init_loop_state()  # 循环检测追踪
-
-        self._init_fatigue_state()  # U-107: 群聊疲劳检测
-
-        # 注入 config.json 中声明的环境变量（三框架通用）
-        # L1: adapter_env（框架专属变量，如 HERMES_API_KEY）
-        adapter_env_cfg = self.config.get("adapter_env", {})
-        if isinstance(adapter_env_cfg, dict):
-            for k, v in adapter_env_cfg.items():
-                self.adapter_env[str(k)] = str(v)
-
-        # L2: env（通用环境变量，如 HERMES_BIN / OPENCLAW_BIN）
-        env_cfg = self.config.get("env", {})
-        if isinstance(env_cfg, dict):
-            for k, v in env_cfg.items():
-                self.adapter_env[str(k)] = str(v)
-
-        # L3: 旧格式兼容（letta_bin / letta_agent_id 作为顶层的旧写法）
         for config_key in ("letta_bin", "letta_agent_id"):
             val = self.config.get(config_key)
-            if val and config_key.upper() not in self.adapter_env:
+            if val:
                 self.adapter_env[config_key.upper()] = str(val)
 
-        # L4: 服务发现 — services.api → 通用 AIM_API_* 变量（624 吉量提出）
-        #      扩展口：services.tts / services.vision 同模式追加
-        services = self.config.get("services", {})
-        api_svc = services.get("api", {})
-        if isinstance(api_svc, dict) and api_svc.get("url"):
-            self.adapter_env["AIM_API_URL"] = str(api_svc["url"])
-            auth = api_svc.get("auth", {})
-            if isinstance(auth, dict):
-                cred_ref = auth.get("credential", "")
-                if isinstance(cred_ref, str):
-                    if cred_ref.startswith("${") and cred_ref.endswith("}"):
-                        env_var = cred_ref[2:-1]
-                        self.adapter_env["AIM_API_CREDENTIAL"] = os.getenv(env_var, "") or self.adapter_env.get(env_var, "")
-                    else:
-                        self.adapter_env["AIM_API_CREDENTIAL"] = cred_ref
-
-
-
         self.health_probe = HealthProbe(
-
             health_cmd=f"bash {self.adapter_cmd} health",
-
             timeout=self.config.get("health_probe_timeout", 25.0),
-
             env=self.adapter_env,
-
         )
-
-
 
         self.running = False
-
         self._dispatch_event = asyncio.Event()
-
         # 619-18: 群聊回路防护冷却（从 config 读取，默认30s）
-
         self._grp_cooldown_sec = self.config.get("grp_reply_cooldown_sec", 30.0)
-
         self._last_grp_reply: dict[str, float] = {}
-
         self._seen_msg_keys: dict[str, float] = {}  # 内容去重 (from_id:content[:200]→timestamp)
-
         self._processed_ids: set = set()  # U-005: msg_id L1 去重（接收时）
-
         self._dispatched_ids: set = set()  # U-006: 已 dispatch 去重（发送 adapter 后）
-
-        # R-002: 去重集持久化，防重启丢失（120s 幻觉窗口）
-        self._dedup_persist_path: Optional[Path] = None
-
         self._my_msg_ids: set = set()  # U-007: 本 Agent 发出的消息 ID，用于群聊 reply_to 过滤
-
-        # R-002: 恢复持久化去重集
-        self._init_dedup_persist()
-
         # 619-20: StallWatchdog — 检测 dispatch_loop 假死
-
         self._last_dispatch_time: float = 0.0
-
-        # P0-007: 跟踪 dispatch 是否正在进行，独立看门狗在 dispatch 进行中使用更长的超时
-        self._dispatch_in_progress: bool = False
-
         self._stall_timeout_sec = self.config.get("stall_watchdog_sec", 30.0)
-        self._max_msg_age_sec = self.config.get("max_msg_age_sec", 900)  # POST-05: 旧消息过期保护
-
         self._stall_recovery_count: int = 0  # 619-20: 连续自愈计数（>3 次则丢弃卡死消息）
-
         self._retry_tracker: dict[str, int] = {}  # P0: exit=1 退避, msg_id → retry_count
-
-        self._consecutive_empty: int = 0  # P0 #3: 连续空输出计数（≥3 → 熔断）
-
+        self._retry_persist_path = (Path.home() / ".aim" / "agents" / self.agent_id / "retry.json")  # P0-D: 持久化
+        self._load_retry_counts()  # P0-D: 启动时恢复
         self._last_recover_at: float = 0.0  # P0-L3: recover cooldown (60s)
-
         self._last_trim_at: float = 0.0  # P0-L3: trim cooldown (30s)
-
         # 620: 自适应 stalled 阈值 (基于 queue depth)
-
         self._stall_base_sec = self.config.get("stall_watchdog_sec", 30.0)
-
         self._stall_min_sec = self.config.get("stall_watchdog_min_sec", 10.0)
-
         self._recover_task: Optional[asyncio.Task] = None  # P2: non-blocking recover handle
-
-        # 624: 群聊冷却机制 — server 端统一配置
-        self.grp_policy = GroupPolicyManager(logger=self.logger)
-
-        # 624: 新消息提醒 Notification API（类似微信红点）
-        _notify_cfg = self.config.get("notification", {})
-        _notify_channels = _notify_cfg.get("channel", ["file"])
-        # 平台标准：system_event 通道强制开启（NATS 推送），不受 config 控制
-        if "system_event" not in _notify_channels:
-            _notify_channels.append("system_event")
-        _notify_webhook = _notify_cfg.get("webhook_url", "")
-        self.notification = NotificationHandler(
-            agent_id=self.agent_id,
-            channels=_notify_channels,
-            webhook_url=_notify_webhook,
-            system_event_publisher=None,  # 延迟注入：等 transport 就绪后调用 set_system_event_publisher()
-            logger=self.logger,
-        )
-        # @mention 检测 — 本 Agent 的名称列表
-        self._mention_names: List[str] = self.config.get("mention_names", [self.agent_id])
-        # 从用户库（_registry.json）自动注入 nickname，新增Agent零代码改动
-        _registry_path = Path.home() / ".aim" / "agents" / "_registry.json"
-        try:
-            if _registry_path.exists():
-                _r = json.loads(_registry_path.read_text())
-                _me = _r.get(self.agent_id, {})
-                _nick = _me.get("nickname", "")
-                if _nick and _nick not in self._mention_names:
-                    self._mention_names.append(_nick)
-        except Exception as e:
-            self.logger.debug(f"读取 _registry.json 失败: {e}")
-
         # L3 护栏: N=3 次自修复失败 → 永久停止 + 告警
-
         self._repair_failures: int = 0
-
         self._repair_disabled: bool = False
-
         # 620: envelope 准入校验 (Phase 1: warn, Phase 2: reject)
-
         self._envelope_strict_mode = self.config.get("envelope_strict_mode", "warn")
-
         self._envelope_violations: int = 0  # 累计不合规消息数
-
         self._reject_hard_errors: bool = self._envelope_strict_mode == "reject"
-
         self.logger.info(f"Framework: {self.config.get('framework', 'unknown')}")
-
         self.logger.info(f"Adapter: {self.adapter_cmd}")
-
         self.logger.info(f"Queue+Scheduler 已嵌入 (capacity={self.queue.capacity})")
 
-
-
     def _calc_stall_timeout(self) -> float:
-
         """620: 自适应 stalled 阈值 — queue 越大超时越短"""
-
         qsize = self.queue.size()
-
         qcap = max(self.queue.capacity, 1)
-
         ratio = min(qsize / qcap, 1.0)
-
         # 线性缩放: 空队列→base, 满队列→max(base*0.5, min)
-
         dynamic = max(self._stall_min_sec, self._stall_base_sec * (1.0 - ratio * 0.5))
-
         return dynamic
 
-
-
     async def _dispatch_loop(self):
-
         """独立消息投递：Event驱动 + scheduler控制 + StallWatchdog 自愈"""
-
         while self.running:
-
             try:
-
                 # 619-20/620: StallWatchdog — 自适应超时替代永久等待
-
                 stall_timeout = self._calc_stall_timeout()
-
                 try:
-
                     await asyncio.wait_for(self._dispatch_event.wait(), timeout=stall_timeout)
-
                 except asyncio.TimeoutError:
-
                     pass
-
                 self._dispatch_event.clear()
 
-
-
                 # 619-20: 假死自检 — queue 有货但超时无投递 → 强制解锁 scheduler
-
                 import time as _t619_wd
-
                 now_wd = _t619_wd.time()
-
                 # 620: 使用计算后的自适应阈值
-
                 stall_timeout_check = max(self._stall_timeout_sec, stall_timeout)
-
                 if (self.queue.size() > 0 and
-
                     (self._last_dispatch_time == 0 or now_wd - self._last_dispatch_time > stall_timeout_check)):
-
                     if self.queue.size() > 0:
-
                         self._stall_recovery_count += 1
-
                         self.logger.warning(
-
                             f"⚠️ StallWatchdog: {self._stall_timeout_sec}s 无投递, queue={self.queue.size()}, 触发自愈 (#{self._stall_recovery_count})"
-
                         )
-
                         if self._stall_recovery_count >= 3:
-
                             # 连续 3 次自愈失败 → 丢弃队首消息，非正常消费
-
                             stuck = self.queue.dequeue()
-
                             if stuck:
-
                                 self.queue.ack(stuck.msg_id)  # 标记已处理，不再重试
-
                                 self.logger.error(
-
                                     f"❌ StallWatchdog: 连续 {self._stall_recovery_count} 次自愈失败，丢弃消息 {stuck.msg_id[:8]} from={stuck.from_id}"
-
                                 )
-
                             self._stall_recovery_count = 0
-
                         else:
-                            # 623: 只在队列非空时复位，避免空队列误报
-                            if self.queue.size() > 0:
-                                self.scheduler.reset_to_idle()
-
+                            self.scheduler.reset_to_idle()
                         # 620: 修复 StallWatchdog 触发后 _dispatch_event 未 set 致 dispatch 永久阻塞
-                        # 620: 修复 StallWatchdog 触发后 _dispatch_event 未 set 致 dispatch 永久阻塞
-
                         self._dispatch_event.set()
-
                         self._last_dispatch_time = now_wd  # 只触发一次
 
-
-
                 while self.scheduler.should_dispatch() and self.queue.size() > 0:
-
                     msg = self.queue.dequeue()
-
                     if not msg:
-
                         break
-
-                    # P0-D: 死信跳过 — retry_count >= 3 的消息直接 ack 丢弃
-                    if msg.retry_count >= 3:
-                        self.logger.warning(f" [DEAD] msg_id={msg.msg_id[:8]} retry_count={msg.retry_count}, 跳过死信")
-                        if msg.msg_id:
-                            self._add_dispatched_id(msg.msg_id)
-                        self.queue.ack(msg.msg_id)
-                        continue
-
                     # U-006: 出队去重用独立 _dispatched_ids，不与接收时 L1 _processed_ids 冲突
-
                     if msg.msg_id and msg.msg_id in self._dispatched_ids:
-
                         self.logger.debug(f" [DEDUP DEQUEUE] msg_id={msg.msg_id[:8]} 已 dispatch, ack跳过")
-
                         self.queue.ack(msg.msg_id)
-
                         continue
-
-                    # POST-05: 旧消息过期保护 — 重启后跳过超时消息，防毒化循环
-
-                    import time as _t_post5
-
-                    msg_ts = getattr(msg, 'ts', None)
-                    if msg_ts is None:
-                        msg_ts = getattr(msg, 'received_at', 0)
-                    if msg_ts and msg_ts > 0:
-                        msg_age = _t_post5.time() - msg_ts
-                        if msg_age > self._max_msg_age_sec:
-                            self.logger.info(f" [{msg.msg_id[:8]}] 过期消息 ({msg_age:.0f}s>{self._max_msg_age_sec}s)，skip+ack")
-                            self.queue.ack(msg.msg_id)
-
-                            # 不阻塞: 通知发件人消息已过期丢弃（避免无限重传）
-
-                            try:
-
-                                await self.transport.send_ack(msg.from_id, msg.msg_id)
-
-                            except Exception:
-
-                                pass
-
-                            continue
-
-                    self._last_dispatch_time = _t619_wd.time()  # 记录最近投递时间
-
-                    self.scheduler.on_dispatch_started()
-
-                    self.logger.info(f"投递: {msg.msg_id[:8]} from={msg.from_id}")
-
-                    try:
-
-                        await self.transport.send_ack(msg.from_id, msg.msg_id)
-
-                    except Exception:
-
-                        pass
-
-                    try:
-
-                        # ── 免 LLM 消息：系统通知和确认消息不烧 token ──
-
-                        if self._skip_adapter_for_operational(msg):
-
-                            self.logger.debug(f" [{msg.msg_id[:8]}] 免LLM跳过: from={msg.from_id}")
-
-                            self.queue.ack(msg.msg_id)
-
-                            continue
-
-                        # U-107: 群聊 mute 检测 — 疲劳期不发 adapter
-
-                        if msg.grp_id and self._is_group_muted(msg.grp_id):
-
-                            self.logger.debug(f" [{msg.msg_id[:8]}] 🔇 群聊 mute 跳过: {msg.grp_id}")
-
-                            self._dispatch_event.set()  # 不阻塞后续消息
-
-                            self.scheduler.on_processing_done()
-
-                            self.queue.ack(msg.msg_id)
-
-                            continue
-
-                        # 624: 群聊冷却机制 — 三级热状态 (grp_policy)
-                        if msg.grp_id:
-                            if not self.grp_policy.should_process(
-                                msg.grp_id,
-                                is_mentioned=msg.is_mentioned,
-                                has_substance=self._has_substance(msg.content),
-                            ):
-                                self._dispatch_event.set()
-                                self.scheduler.on_processing_done()
-                                self.queue.ack(msg.msg_id)
-                                continue
-
-                        # P0-007: 标记 dispatch 进行中，独立看门狗在此期间使用 processing_timeout 阈值
-                        self._dispatch_in_progress = True
-                        try:
-                            reply = await self._call_adapter(msg)
-                        finally:
-                            self._dispatch_in_progress = False
-
-                        # P0-D: 空响应校验 — 空白/纯空格回复视为无回复
-                        if reply and reply.strip():
-                            reply = reply.strip()
-                            # P0 #3: 正常输出 → 清零连续空输出计数器
-                            self._consecutive_empty = 0
-                        else:
-                            reply = None
-                            # P0 #3: 连续空输出检测 → ≥3 次触发熔断
-                            self._consecutive_empty += 1
-                            if self._consecutive_empty >= 3:
-                                self.logger.warning(
-                                    f"⚠️ [P0#3] 连续 {self._consecutive_empty} 次空输出，触发熔断"
-                                )
-                                self.breaker.on_failure("EmptyOutput")
-
-                        self.breaker.on_success()
-                        await self._evict_conv_pool()
-
-                        if reply:
-
-                            if msg.grp_id:
-
-                                # 619-18: 群聊回路防护（30s 冷却，防回复风暴）
-
-                                import time as _t619
-
-                                now = _t619.time()
-
-                                last = self._last_grp_reply.get(msg.grp_id, 0)
-
-                                if now - last < self._grp_cooldown_sec:
-
-                                    self.logger.debug(f" [{msg.msg_id[:8]}] 群聊回复跳过（冷却 {now-last:.0f}s/{self._grp_cooldown_sec}s）")
-
-                                elif self._is_confirm_loop(msg, reply):
-
-                                    self.logger.info(f" [{msg.msg_id[:8]}] 群聊确认循环跳过: in={msg.content[:20]} out={reply[:20]}")
-
-                                else:
-
-                                    self._last_grp_reply[msg.grp_id] = now
-
-                                    await self.transport.send_grp(msg.grp_id, reply)
-
-                            else:
-
-                                await self.transport.send_dm(msg.from_id, reply)
-
-                        self.scheduler.on_processing_done()
-
-                        # U-006: 标记已 dispatch，防止回队重复处理
-
-                        if msg.msg_id:
-
-                            self._add_dispatched_id(msg.msg_id)
-
+                    # P0-D: 毒消息跳过（retry>=3 持久化，重启后跳过）
+                    if msg.msg_id and self._retry_tracker.get(msg.msg_id, 0) >= 3:
+                        self.logger.warning(f" [{msg.msg_id[:8]}] 毒消息 retry={self._retry_tracker[msg.msg_id]}, skip→死信")
                         self.queue.ack(msg.msg_id)
-
+                        if msg.msg_id:
+                            self._dispatched_ids.add(msg.msg_id)
+                        self._dispatch_event.set()
+                        continue
+                    self._last_dispatch_time = _t619_wd.time()  # 记录最近投递时间
+                    self.scheduler.on_dispatch_started()
+                    self.logger.info(f"投递: {msg.msg_id[:8]} from={msg.from_id}")
+                    try:
+                        await self.transport.send_ack(msg.from_id, msg.msg_id)
+                    except Exception:
+                        pass
+                    try:
+                        # ── 免 LLM 消息：系统通知和确认消息不烧 token ──
+                        if self._skip_adapter_for_operational(msg):
+                            self.logger.debug(f" [{msg.msg_id[:8]}] 免LLM跳过: from={msg.from_id}")
+                            self.queue.ack(msg.msg_id)
+                            continue
+                        reply = await self._call_adapter(msg)
+                        if reply:
+                            if msg.grp_id:
+                                # 619-18: 群聊回路防护（30s 冷却，防回复风暴）
+                                import time as _t619
+                                now = _t619.time()
+                                last = self._last_grp_reply.get(msg.grp_id, 0)
+                                if now - last < self._grp_cooldown_sec:
+                                    self.logger.debug(f" [{msg.msg_id[:8]}] 群聊回复跳过（冷却 {now-last:.0f}s/{self._grp_cooldown_sec}s）")
+                                elif self._is_confirm_loop(msg, reply):
+                                    self.logger.info(f" [{msg.msg_id[:8]}] 群聊确认循环跳过: in={msg.text[:20]} out={reply[:20]}")
+                                else:
+                                    self._last_grp_reply[msg.grp_id] = now
+                                    await self.transport.send_grp(msg.grp_id, reply)
+                            else:
+                                await self.transport.send_dm(msg.from_id, reply)
+                        else:
+                            # P0-D: 空响应校验 — adapter rc=0 但空回复 = 疑似假成功
+                            self.logger.warning(f" [{msg.msg_id[:8]}] 空响应: adapter rc=0 但无输出, 视为可重试")
+                            raise RetryableError("adapter 空响应")
+                        self.scheduler.on_processing_done()
+                        # U-006: 标记已 dispatch，防止回队重复处理
+                        if msg.msg_id:
+                            self._dispatched_ids.add(msg.msg_id)
+                        self.queue.ack(msg.msg_id)
                         self._stall_recovery_count = 0  # 620-01: 成功投递才清零
-
-                        # P0-007: dispatch 完成后刷新时间戳（adapter 可能耗时 60-120s）
-                        # 防止独立看门狗在下轮检查时误判假死
-                        self._last_dispatch_time = time.time()
-
-                        # 624: 通知 — message.processed
-                        _elapsed = int((time.time() - msg.created_at) * 1000) if hasattr(msg, 'created_at') else 0
-                        await self.notification.processed(
-                            msg_id=msg.msg_id, from_id=msg.from_id,
-                            reply_preview=reply or "", elapsed_ms=_elapsed,
-                        )
-
-                    except CircuitOpenError as e:
-
-                        # 熔断器 OPEN → 快速拒绝，nack 不重试
-
-                        self.scheduler.on_retry()
-
-                        self.queue.nack(msg.msg_id, f"breaker_open: {e}")
-
-                        self.logger.warning(f"🔌 [{msg.msg_id[:8]}] 熔断器拒绝: {e}")
-
-                        self._dispatch_event.set()
-
-                        # P0-007: 刷新时间戳，防止独立看门狗误判
-                        self._last_dispatch_time = time.time()
-
-
-
+                        self._retry_tracker.pop(msg.msg_id, None)  # 退避跟踪清除
                     except DegradeError:
-
-                        self.breaker.on_failure("DegradeError")
-
                         self.scheduler.on_degrade()
-
                         self.queue.nack(msg.msg_id, "degrade")
-
                         # 619-11: 降级告警
-
                         self.logger.warning(f"⚠️  [{self.agent_id}] adapter 降级，停止投递")
-
-                        # 624: 通知 — message.failed (degrade)
-                        await self.notification.failed(
-                            msg_id=msg.msg_id, from_id=msg.from_id,
-                            reason="degrade", retries=0,
-                        )
-
                         await self.transport.emit_health("degrade", msg.msg_id[:8], "adapter DEGRADE")
-
                         # FIX(2026-06-19): break 后必须重置事件，否则永久阻塞（火鸡儿发现）
-
                         self._dispatch_event.set()
-
-                        # P0-007: 刷新时间戳，防止独立看门狗误判
-                        self._last_dispatch_time = time.time()
-
                         break
-
-
 
                     except RetryableError:
-
-                        self.breaker.on_failure("RetryableError")
-
                         self.scheduler.on_retry()
-
-                        rt = msg.retry_count + 1
-
-                        msg.retry_count = rt
-                        # P0-D: 持久化 retry_count，重启不丢失重试状态
-                        if self.queue._persist:
-                            try:
-                                self.queue._schedule_persist(lambda: self.queue._persist.write_retry(msg.msg_id, rt))
-                            except Exception:
-                                pass
-
+                        rt = self._retry_tracker.get(msg.msg_id, 0) + 1
+                        self._retry_tracker[msg.msg_id] = rt
+                        self._save_retry_counts()  # P0-D: 持久化 retry_count
                         if rt >= 3:
-
                             self.logger.warning(f" [{msg.msg_id[:8]}] 退避耗尽 ({rt}次)，入死信")
-
-                            # 624: 通知 — message.failed (retries_exhausted)
-                            await self.notification.failed(
-                                msg_id=msg.msg_id, from_id=msg.from_id,
-                                reason="retries_exhausted", retries=rt,
-                            )
-
                             self.queue.ack(msg.msg_id)  # ack 移除，不 requeue
-
                             if msg.msg_id:
-
-                                self._add_dispatched_id(msg.msg_id)
-
+                                self._dispatched_ids.add(msg.msg_id)
+                            self._retry_tracker.pop(msg.msg_id, None)
                             self.scheduler.reset_to_idle()
-
                             self._dispatch_event.set()  # 立即触发下一轮
-
                             self._stall_recovery_count = 0  # 成功 discard 后重置计数
-
-                            # P0-007: 死信处理后刷新时间戳
-                            self._last_dispatch_time = time.time()
-
                             # P0-L3: backoff exhausted -> trim stuck session
-
                             await self._call_adapter_trim()
-
                         else:
-
                             delay = [2, 4, 8][rt - 1]
-
                             self.logger.info(f" [{msg.msg_id[:8]}] 退避 {rt}/3, delay={delay}s")
-
                             self.queue.nack(msg.msg_id, "retry")
-
                             await asyncio.sleep(delay)
 
-
-
                     except Exception as e:
-
-                        self.breaker.on_failure(type(e).__name__)
-
                         if "agent_unreachable" in str(e):
-
                             self.scheduler.on_degrade()
-
                             self.queue.nack(msg.msg_id, "agent_unreachable")
-
                             self.logger.warning(f"🔌 [{self.agent_id}] Agent 不可达（exit=4），暂停投递")
-
                             await self.transport.emit_health("agent_unreachable", msg.msg_id[:8], "exit=4")
-
                             self._dispatch_event.set()
-
-                            # P0-007: 刷新时间戳，防止独立看门狗误判
-                            self._last_dispatch_time = time.time()
-
                             # P2: non-blocking recover
-
                             if self._recover_task and not self._recover_task.done():
-
                                 self.logger.debug(f"[{self.agent_id}] recover already in progress, skipping")
-
                             else:
-
                                 self._recover_task = asyncio.create_task(self._call_adapter_recover())
-
                             break
-
                         raise
-
                     except HumanInterventionError:
-
-                        self.breaker.on_failure("HumanInterventionError")
-
                         self.scheduler.on_human_intervention()
-
                         self.queue.nack(msg.msg_id, "human_intervention")
-
                         self.logger.error(f"💀 [{self.agent_id}] FATAL exit=3, 永久停止 dispatch")
-
-                        # 624: 通知 — message.failed (fatal)
-                        await self.notification.failed(
-                            msg_id=msg.msg_id, from_id=msg.from_id,
-                            reason="fatal", retries=0,
-                        )
-
                         await self.transport.emit_health("fatal", msg.msg_id[:8], "exit=3")
-
                         self._dispatch_event.set()
-
                         break
-
                     except Exception as e:
-
                         self.logger.error(f"投递异常 [{msg.msg_id[:8]}]: {e}")
-
             except Exception as e:
-
                 self.logger.error(f"投递循环异常: {e}")
-
                 await asyncio.sleep(5)
-
             # 619-09: SIGHUP 重载检查（每轮循环检测）
-
             if self._reload_flag:
-
                 self._reload_flag = False
-
                 self._reload_config()
 
-
-
-    async def _stall_watchdog_loop(self):
-        """625: 独立看门狗循环 — 与 dispatch_loop 解耦的假死检测 + 自愈
-
-        原 inline StallWatchdog（在 _dispatch_loop 内）无法检测 dispatch 真死锁：
-        dispatch 卡在阻塞 await 时，inline 代码永远不执行。
-
-        此独立 asyncio Task 周期性检查 _last_dispatch_time，
-        dispatch 假死时：
-          1-2 次 → set _dispatch_event + reset_to_idle 尝试唤醒
-          ≥3 次 → sys.exit(4) 让 launchd 重启进程
-        """
-        import time
-        import sys as _sys
-
-        self.logger.info("🔍 StallWatchdog (独立) 启动, timeout={}s".format(self._stall_timeout_sec))
-
-        while self.running:
-            try:
-                await asyncio.sleep(5)
-
-                # 队列空 → 一切正常，重置计数
-                if self.queue.size() == 0:
-                    if self._stall_recovery_count > 0:
-                        self._stall_recovery_count = 0
-                    continue
-
-                now = time.time()
-                stall_sec = now - self._last_dispatch_time if self._last_dispatch_time > 0 else 999
-
-                # P0-007: dispatch 进行中时使用 processing_timeout 作为阈值
-                # 避免慢 LLM 调用（60-120s）触发误判假死 → exit(4) 死亡循环
-                effective_timeout = (
-                    self.scheduler.processing_timeout + 10
-                    if self._dispatch_in_progress
-                    else self._stall_timeout_sec
-                )
-
-                if stall_sec > effective_timeout:
-                    self._stall_recovery_count += 1
-                    self.logger.warning(
-                        f"⏰ StallWatchdog(独立): dispatch 假死 {stall_sec:.0f}s, "
-                        f"queue={self.queue.size()}, 自愈 #{self._stall_recovery_count}"
-                    )
-
-                    if self._stall_recovery_count >= 3:
-                        self.logger.critical(
-                            f"⛔ StallWatchdog: 连续 {self._stall_recovery_count} 次自愈失败, "
-                            f"dispatch 假死 {stall_sec:.0f}s → 进程自重启 (exit=4)"
-                        )
-                        self.running = False
-                        os._exit(4)  # P0: os._exit 确保立即退出，避免 asyncio 吞掉 SystemExit
-                    else:
-                        # 尝试唤醒 dispatch: 复位 scheduler + set event
-                        if self.queue.size() > 0:
-                            self.scheduler.reset_to_idle()
-                        self._dispatch_event.set()
-                else:
-                    if self._stall_recovery_count > 0:
-                        self.logger.info(
-                            f"✅ StallWatchdog: dispatch 恢复正常, stall={stall_sec:.1f}s"
-                        )
-                        self._stall_recovery_count = 0
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                self.logger.error(f"StallWatchdog(独立) 异常: {e}")
-                await asyncio.sleep(5)
-
-    # ── 系统自举：launchd + healthd 自动管理 ──────────────────
-
-    def _ensure_launchd(self):
-        """确保当前 agent 的 launchd plist 存在且已 loaded。
-
-        这是 AIM 系统内置的进程生命周期管理，零外部 cron 依赖。
-        由 config.launchd.auto_manage 控制（默认 true）。
-        """
-        cfg = (self.config or {}).get("launchd", {})
-        if not cfg.get("auto_manage", True):
-            self.logger.debug("launchd auto_manage 已关闭，跳过自举")
-            return
-
-        import plistlib, shutil
-
-        label = f"com.aim.agent.{self.agent_id}"
-        plist_path = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
-        python_bin = shutil.which("python3.13") or sys.executable
-        main_py = str(Path.home() / "shared" / "aim" / "aim-client" / "main.py")
-        config_abs = str(self.config_path.resolve())
-        log_path = str(Path.home() / "Library" / "Logs" / f"aim-client-{self.agent_id}.log")
-
-        expected_plist = {
-            "Label": label,
-            "Disabled": False,
-            "ProgramArguments": [
-                python_bin, "-u", main_py,
-                "--agent-id", self.agent_id,
-                "--config", config_abs,
-                "--mode", "direct",
-                "--foreground",
-            ],
-            "RunAtLoad": True,
-            "KeepAlive": {"SuccessfulExit": False},
-            "StandardOutPath": log_path,
-            "StandardErrorPath": log_path,
-            "ThrottleInterval": 10,
-            "EnvironmentVariables": {
-                "PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
-                "HOME": str(Path.home()),
-            },
-        }
-
-        need_write = False
-        if plist_path.exists():
-            try:
-                with open(plist_path, "rb") as pf:
-                    existing = plistlib.load(pf)
-                # 检查关键字段是否需要更新
-                if (existing.get("Label") != label
-                        or existing.get("KeepAlive") != {"SuccessfulExit": False}
-                        or existing.get("Disabled") is not False
-                        or existing.get("ProgramArguments") != expected_plist["ProgramArguments"]):
-                    self.logger.info(f"launchd plist 内容过期，自动更新")
-                    need_write = True
-            except Exception:
-                self.logger.warning(f"launchd plist 读取失败，重新生成")
-                need_write = True
-        else:
-            self.logger.info(f"launchd plist 不存在，自动创建")
-            need_write = True
-
-        if need_write:
-            plist_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(plist_path, "wb") as pf:
-                plistlib.dump(expected_plist, pf)
-            self.logger.info(f"✅ launchd plist 已写入: {plist_path}")
-
-        # 检查是否已 loaded
-        try:
-            result = __import__("subprocess").run(
-                ["launchctl", "list"], capture_output=True, text=True, timeout=5)
-            loaded = any(label in ln for ln in result.stdout.split("\n"))
-        except Exception:
-            loaded = False
-
-        if not loaded:
-            self.logger.info(f"launchd 未管理此 agent，触发 bootstrap...")
-            try:
-                rc = os.system(
-                    f"launchctl bootstrap gui/{os.getuid()} {plist_path} 2>/dev/null")
-                if rc == 0:
-                    self.logger.info(f"✅ launchd bootstrap 成功")
-                else:
-                    # 619-01: bootstrap 失败可能是 launchd 已禁用此 label
-                    # （比如之前 plist 指向不存在的路径导致反复崩溃被 throttle）
-                    self.logger.warning(f"⚠️ bootstrap 失败 (rc={rc})，检查是否被 launchd disabled...")
-                    try:
-                        import subprocess as _sp
-                        disabled_info = _sp.run(
-                            ["launchctl", "print-disabled", f"gui/{os.getuid()}"],
-                            capture_output=True, text=True, timeout=5)
-                        if f'"{label}" => disabled' in disabled_info.stdout:
-                            self.logger.info(f"🔧 {label} 被 launchd disabled，执行 enable...")
-                            os.system(
-                                f"launchctl enable gui/{os.getuid()}/{label}")
-                            # 重试 bootstrap
-                            rc = os.system(
-                                f"launchctl bootstrap gui/{os.getuid()} {plist_path} 2>/dev/null")
-                            if rc == 0:
-                                self.logger.info(f"✅ launchd bootstrap 成功（enable 后重试）")
-                            else:
-                                self.logger.warning(f"⚠️ enable 后 bootstrap 仍失败 (rc={rc})")
-                    except Exception:
-                        pass
-                    # 如果仍失败，尝试 legacy load
-                    if rc != 0:
-                        rc2 = os.system(f"launchctl load {plist_path} 2>/dev/null")
-                        if rc2 == 0:
-                            self.logger.info(f"✅ launchd load 成功（legacy）")
-                        else:
-                            self.logger.warning(f"⚠️ launchd bootstrap/load 均失败，当前进程继续运行")
-            except Exception as e:
-                self.logger.warning(f"⚠️ launchd bootstrap 异常: {e}")
-        else:
-            self.logger.debug(f"launchd 已管理此 agent")
-
-    async def _ensure_healthd(self):
-        """确保 healthd 守护进程正在运行。
-
-        检查 healthd plist 是否存在且 loaded；否则自动创建并 bootstrap。
-        同时启动后台协程周期性检查 healthd 存活。
-        """
-        cfg = (self.config or {}).get("healthd", {})
-        if not cfg.get("auto_ensure", True):
-            self.logger.debug("healthd auto_ensure 已关闭，跳过")
-            return
-
-        import plistlib, shutil
-
-        label = "com.aim.healthd"
-        plist_path = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
-        healthd_py = str(Path.home() / ".aim" / "bin" / "aim_healthd.py")
-        log_path = str(Path.home() / "Library" / "Logs" / "aim-healthd.log")
-
-        # 检查 healthd 脚本是否存在
-        if not Path(healthd_py).exists():
-            self.logger.warning(f"healthd 脚本不存在: {healthd_py}，跳过")
-            return
-
-        expected_plist = {
-            "Label": label,
-            "Disabled": False,
-            "ProgramArguments": [
-                shutil.which("python3.13") or sys.executable,
-                healthd_py,
-            ],
-            "RunAtLoad": True,
-            "KeepAlive": {"SuccessfulExit": False},
-            "StandardOutPath": log_path,
-            "StandardErrorPath": log_path,
-            "ThrottleInterval": 30,
-            "EnvironmentVariables": {
-                "PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
-            },
-        }
-
-        need_write = False
-        if plist_path.exists():
-            try:
-                with open(plist_path, "rb") as pf:
-                    existing = plistlib.load(pf)
-                if (existing.get("KeepAlive") != {"SuccessfulExit": False}
-                        or existing.get("ProgramArguments") != expected_plist["ProgramArguments"]):
-                    need_write = True
-            except Exception:
-                need_write = True
-        else:
-            need_write = True
-
-        if need_write:
-            plist_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(plist_path, "wb") as pf:
-                plistlib.dump(expected_plist, pf)
-            self.logger.info(f"✅ healthd plist 已写入: {plist_path}")
-
-        # 检查并启动 healthd
-        try:
-            result = __import__("subprocess").run(
-                ["launchctl", "list"], capture_output=True, text=True, timeout=5)
-            loaded = any(label in ln for ln in result.stdout.split("\n"))
-        except Exception:
-            loaded = False
-
-        if not loaded:
-            self.logger.info(f"healthd 未运行，触发 bootstrap...")
-            try:
-                rc = os.system(
-                    f"launchctl bootstrap gui/{os.getuid()} {plist_path} 2>/dev/null")
-                if rc == 0:
-                    self.logger.info(f"✅ healthd bootstrap 成功")
-                else:
-                    rc2 = os.system(f"launchctl load {plist_path} 2>/dev/null")
-                    if rc2 == 0:
-                        self.logger.info(f"✅ healthd load 成功（legacy）")
-            except Exception as e:
-                self.logger.warning(f"⚠️ healthd bootstrap 异常: {e}")
-        else:
-            self.logger.debug(f"healthd 已运行")
-
-        # 启动后台监控协程
-        interval = cfg.get("check_interval_s", 30)
-        asyncio.create_task(self._monitor_healthd(interval))
-
-    async def _monitor_healthd(self, interval_s: int = 30):
-        """后台协程：周期性检查 healthd 存活，挂了自动拉起"""
-        db_path = Path.home() / ".aim" / "system" / "health.db"
-        plist_path = Path.home() / "Library" / "LaunchAgents" / "com.aim.healthd.plist"
-
-        await asyncio.sleep(interval_s)  # 启动后等一会再检查
-
-        while self.running:
-            try:
-                need_recovery = False
-
-                # 检查1: launchctl 是否管理
-                result = __import__("subprocess").run(
-                    ["launchctl", "list"], capture_output=True, text=True, timeout=5)
-                if "com.aim.healthd" not in result.stdout:
-                    need_recovery = True
-                    self.logger.warning("⚠️ healthd 不在 launchd 列表中")
-
-                # 检查2: health.db 最后写入时间
-                if not need_recovery and db_path.exists():
-                    try:
-                        import sqlite3, time
-                        conn = sqlite3.connect(str(db_path))
-                        cur = conn.execute(
-                            "SELECT MAX(ts) FROM health_events")
-                        row = cur.fetchone()
-                        conn.close()
-                        if row and row[0]:
-                            age = time.time() - row[0]
-                            if age > 120:
-                                self.logger.warning(
-                                    f"⚠️ health.db {age:.0f}s 未更新，可能僵死")
-                                need_recovery = True
-                    except Exception:
-                        pass
-
-                # 恢复操作
-                if need_recovery:
-                    self.logger.info("🔄 尝试恢复 healthd...")
-                    try:
-                        os.system(
-                            f"launchctl bootstrap gui/{os.getuid()} {plist_path} 2>/dev/null")
-                        self.logger.info("✅ healthd 已重新 bootstrap")
-                    except Exception as e:
-                        self.logger.error(f"healthd 恢复失败: {e}")
-
-            except Exception as e:
-                self.logger.debug(f"healthd 监控异常: {e}")
-
-            await asyncio.sleep(interval_s)
-
-    async def _ensure_registry(self):
-        """确保 Registry 服务正在运行（launchd 托管，零 cron 依赖）。
-
-        检查 com.aim.registry plist 是否存在且 loaded；否则自动创建并 bootstrap。
-        同时启动后台协程周期性检查 Registry 存活。
-        """
-        cfg = (self.config or {}).get("registry", {})
-        if not cfg.get("auto_ensure", True):
-            self.logger.debug("registry auto_ensure 已关闭，跳过")
-            return
-
-        import plistlib, shutil
-        from pathlib import Path as _Path
-
-        label = "com.aim.registry"
-        plist_path = _Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
-        registry_py = str(_Path.home() / "shared" / "aim" / "aim-client" / "registry.py")
-        log_path = str(_Path.home() / "Library" / "Logs" / "aim-registry.log")
-        creds_path = str(_Path.home() / ".aim" / "registry.creds")
-
-        # 检查 Registry 脚本是否存在
-        if not _Path(registry_py).exists():
-            self.logger.warning(f"Registry 脚本不存在: {registry_py}，跳过")
-            return
-
-        python_path = shutil.which("python3.13") or sys.executable
-        nats_url = cfg.get("nats_url", "nats://127.0.0.1:4222")
-        creds = cfg.get("credentials", str(_Path.home() / ".aim" / "registry.creds"))
-
-        expected_plist = {
-            "Label": label,
-            "Disabled": False,
-            "ProgramArguments": [
-                python_path,
-                "-u",
-                registry_py,
-                "--nats-url", nats_url,
-                "--credentials", creds,
-            ],
-            "RunAtLoad": True,
-            "KeepAlive": {"SuccessfulExit": False},
-            "StandardOutPath": log_path,
-            "StandardErrorPath": log_path,
-            "ThrottleInterval": 10,
-            "EnvironmentVariables": {
-                "PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
-            },
-        }
-
-        need_write = False
-        if plist_path.exists():
-            try:
-                with open(plist_path, "rb") as pf:
-                    existing = plistlib.load(pf)
-                if (existing.get("KeepAlive") != {"SuccessfulExit": False}
-                        or existing.get("ProgramArguments") != expected_plist["ProgramArguments"]):
-                    need_write = True
-            except Exception:
-                need_write = True
-        else:
-            need_write = True
-
-        if need_write:
-            plist_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(plist_path, "wb") as pf:
-                plistlib.dump(expected_plist, pf)
-            self.logger.info(f"✅ Registry plist 已写入: {plist_path}")
-
-        # 检查并启动 Registry
-        try:
-            result = __import__("subprocess").run(
-                ["launchctl", "list"], capture_output=True, text=True, timeout=5)
-            loaded = any(label in ln for ln in result.stdout.split("\n"))
-        except Exception:
-            loaded = False
-
-        if not loaded:
-            self.logger.info(f"Registry 未运行，触发 bootstrap...")
-            try:
-                rc = os.system(
-                    f"launchctl bootstrap gui/{os.getuid()} {plist_path} 2>/dev/null")
-                if rc == 0:
-                    self.logger.info(f"✅ Registry bootstrap 成功")
-                else:
-                    rc2 = os.system(f"launchctl load {plist_path} 2>/dev/null")
-                    if rc2 == 0:
-                        self.logger.info(f"✅ Registry load 成功（legacy）")
-                    else:
-                        self.logger.warning(f"⚠️ Registry bootstrap/load 均失败")
-            except Exception as e:
-                self.logger.warning(f"⚠️ Registry bootstrap 异常: {e}")
-        else:
-            self.logger.debug(f"Registry 已运行")
-
-        # 启动后台健康监控协程
-        check_interval = cfg.get("check_interval_s", 30)
-        asyncio.create_task(self._monitor_registry(check_interval))
-
-    async def _monitor_registry(self, interval_s: int = 30):
-        """后台协程：周期性检查 Registry 存活，挂了自动拉起"""
-        plist_path = Path.home() / "Library" / "LaunchAgents" / "com.aim.registry.plist"
-
-        await asyncio.sleep(interval_s)  # 启动后等一会再检查
-
-        while self.running:
-            try:
-                need_recovery = False
-
-                # 检查1: launchctl 是否管理
-                result = __import__("subprocess").run(
-                    ["launchctl", "list"], capture_output=True, text=True, timeout=5)
-                if "com.aim.registry" not in result.stdout:
-                    need_recovery = True
-                    self.logger.warning("⚠️ Registry 不在 launchd 列表中")
-
-                # 检查2: NATS health probe — 尝试请求 Registry 健康端点
-                if not need_recovery and hasattr(self, 'transport'):
-                    try:
-                        # Transport 封装层，直接用 request 方法
-                        resp = await self.transport.request(
-                            "aim.registry.health_query",
-                            {"agent_id": self.agent_id, "ts": __import__("time").time(), "fields": ["status"]},
-                            timeout=3
-                        )
-                    except Exception:
-                        self.logger.warning("⚠️ Registry NATS 健康查询无响应")
-                        need_recovery = True
-
-                # 恢复操作
-                if need_recovery:
-                    self.logger.info("🔄 尝试恢复 Registry...")
-                    try:
-                        os.system(
-                            f"launchctl kickstart -k gui/{os.getuid()}/{plist_path.name.replace('.plist','')} 2>/dev/null")
-                    except Exception as e:
-                        # kickstart 可能失败，尝试 bootstrap
-                        os.system(
-                            f"launchctl bootstrap gui/{os.getuid()} {plist_path} 2>/dev/null")
-                    self.logger.info("✅ Registry 恢复已触发")
-
-            except Exception as e:
-                self.logger.debug(f"Registry 监控异常: {e}")
-
-            await asyncio.sleep(interval_s)
-
     async def start(self):
-
         if not self.lock.acquire():
-
             self.logger.error("另一个 aim-client 已在运行")
-
-            raise SystemExit(1)
-
-
+            sys.exit(1)
 
         atexit.register(self.lock.release)
-
-        signal.signal(signal.SIGINT, lambda *_: self._shutdown())
-
-        signal.signal(signal.SIGTERM, self._handle_sigterm)
-
+        signal.signal(signal.SIGTERM, lambda *_: self._shutdown())
         signal.signal(signal.SIGALRM, lambda *_: os._exit(0))  # P2: drain timeout 兜底
-
         self._reload_flag = False
-
         signal.signal(signal.SIGHUP, lambda *_: setattr(self, '_reload_flag', True))  # 619-09
 
-
-
         # NATS 连接重试（最多3次）
-
         for attempt in range(3):
-
             if await self.transport.connect():
-
                 break
-
             self.logger.warning(f"NATS 连接失败 (attempt {attempt+1}/3)")
-
             await asyncio.sleep(3)
-
         else:
-
             self.logger.error("NATS 连接失败，退出")
-
-            os._exit(1)  # P0: os._exit 确保 asyncio 不吞掉 SystemExit
-
-        # 624: transport 就绪后，注入 system_event publisher
-        self.notification.set_system_event_publisher(self.transport.emit_notification)
-
-
+            sys.exit(1)
 
         await self.transport.authenticate()
 
-
-
         # 自动向 Registry 注册
-
         await self._register_with_registry()
 
-
-
         self.logger.info("等待 NATS 稳定 (5s)...")
-
         await asyncio.sleep(5)
 
-
-
-        # 订阅
-
+        # 订阅（v2.0: 动态群发现，启动时从 KV 查所有群）
         await self.transport.subscribe_dm(self._on_dm)
-
-        cfg = load_global_config()
-
-        default_grp = cfg.get("default_group", "grp_trio")
-
-        for gid in default_grp.split(","):
-
-            await self.transport.subscribe_grp(gid.strip(), self._on_grp)
-
-
-
-        # 625: 订阅 NATS 通知通道（R-001 修复 — 通知消费侧实时推送）
-
-        try:
-
-            await self.transport.subscribe_notification(self._on_notification)
-
-        except Exception as e:
-
-            self.logger.warning(f"通知订阅跳过: {e}")
-
-
+        await self._resolve_and_subscribe_groups()
 
         self.running = True
-
         self.logger.info(f" {self.agent_id} AIM Client v{_AIM_VERSION} 启动完成")
 
-        # 625: observer 事件恢复 — aim-watch 可见的启动事件
-
-        await self.transport.emit_obs("online", "", f"v{_AIM_VERSION} started")
-
-
-
-        # ── 系统自举：launchd plist + healthd（零 cron 依赖）──
-        try:
-            self._ensure_launchd()
-        except Exception as e:
-            self.logger.warning(f"launchd 自举跳过: {e}")
-        try:
-            await self._ensure_healthd()
-        except Exception as e:
-            self.logger.warning(f"healthd 自举跳过: {e}")
-        try:
-            await self._ensure_registry()
-        except Exception as e:
-            self.logger.warning(f"registry 自举跳过: {e}")
-
-
         # NOTICE 1.3.0: 运行时版本检查（拒绝低于最低要求的 SDK）
-
         _MIN_SDK = "1.3.0"
-
         def _ver_tuple(v: str):
-            # 剥离预发布标签 (eg "1.5.0-alpha" → "1.5.0")
-            v_clean = v.strip().split("-")[0]
-            return tuple(int(x) for x in v_clean.split("."))
-
+            return tuple(int(x) for x in v.strip().split("."))
         try:
-
             from packaging.version import Version
-
             _ver_ok = Version(_AIM_VERSION) >= Version(_MIN_SDK)
-
         except ImportError:
-
             _ver_ok = _ver_tuple(_AIM_VERSION) >= _ver_tuple(_MIN_SDK)
-
         if not _ver_ok:
-
             self.logger.error(f"SDK version {_AIM_VERSION} < {_MIN_SDK}，启动中止")
-
             self.running = False
-
             return
 
-
-
         # 初始化持久化队列（恢复未 ack 消息）
-
         # 按 agent_id 分文件，避免三方 Agent 互踩（v1.3.0 bug 修复 2026-06-19）
-
         persist_path = self.config.get("queue_persist_path")
-
         if persist_path:
-
             persist_path = str(Path(persist_path).expanduser())
-
         else:
-
             persist_path = str(Path.home() / ".aim" / "agents" / self.agent_id / "queue.jsonl")
-
         await self.queue.init_persist(persist_path)
-
         self.logger.info(f"Queue 持久化: {persist_path}")
 
-
-
         # 健康探针循环
-
         asyncio.create_task(self._health_probe_loop())
-
         asyncio.create_task(self._dispatch_loop())
-
-        # 625: 独立 StallWatchdog — 与 dispatch_loop 解耦的假死检测
-
-        asyncio.create_task(self._stall_watchdog_loop())
-
         self._dispatch_event.set()
 
-
-
         # 主循环保持
-
         while self.running:
-
             await asyncio.sleep(5)
 
-
-
     async def _health_probe_loop(self):
-
         """Phase 0: 健康探针 -> 更新 Scheduler -> 触发投递"""
-
         _last_state = "OK"  # 619-11: 状态变迁追踪
-
         while self.running:
-
             try:
-
                 report = await self.health_probe.probe()
-
                 prev_can = self.scheduler.should_dispatch()
-
                 self.scheduler.update_state(report)
-
                 # 619-11: 状态变迁检测 + 告警
-
                 new_state = report.status.name if hasattr(report, 'status') else str(report.status)
-
                 if new_state != _last_state and new_state in ("BUSY", "DEGRADE", "OFFLINE"):
-
                     self.logger.warning(f"⚠️  [{self.agent_id}] adapter {_last_state}→{new_state}")
-
                     await self.transport.emit_health("state_change", "", f"{_last_state}→{new_state}")
 
-                    # 625: observer 事件恢复 — aim-watch 可见的状态变迁
-
-                    await self.transport.emit_obs("state_change", "", f"{_last_state}→{new_state}")
-
-
-
-                # POST-04: exit 3 永久停止告警（CLI不存在/配置错误）
-
-                if getattr(report, 'exit_code', 0) == 3:
-
-                    self.logger.error(f"🛑 [{self.agent_id}] health exit=3 (CLI不存在/配置错误)，需人工介入")
-
-                    await self.transport.emit_health("fatal", "", "exit=3 CLI unavailable")
-
-
-
                 _last_state = new_state
-
                 if not prev_can and self.scheduler.should_dispatch():
-
                     self._dispatch_event.set()
-
                 # ── 0-ack 告警（项6）：队列堆积但无处理进展 → observer 事件 ──
-
                 qsize = self.queue.size()
-
                 prev_qsize = getattr(self, '_prev_queue_size', 0)
-
                 self._prev_queue_size = qsize
-
                 # 队列有货 且 数量未减少（无 ack 消化）
-
                 if qsize > 0 and qsize >= prev_qsize:
-
                     zs = getattr(self, '_zero_ack_streak', 0) + 1
-
                     self._zero_ack_streak = zs
-
                 else:
-
                     self._zero_ack_streak = 0
-
                 if self._zero_ack_streak >= 3 and qsize > 0:
-
                     self.logger.warning(f"⚠️ 0-ack: queue={qsize} pending, {self._zero_ack_streak} 周期未消化")
-
                     now = time.time()
-
                     last_emit = getattr(self, '_last_0ack_emit', 0)
-
                     if now - last_emit > 300:
-
                         self._last_0ack_emit = now
-
                         await self.transport.emit_health("0-ack", "", f"queue={qsize} streak={self._zero_ack_streak}")
 
-
-
                 # Registry 心跳：更新 last_seen
-
                 await self.transport.send_registry_heartbeat()
-
                 # 健康心跳（推送到 healthd，不耗 token）
-
                 await self.transport.emit_health("heartbeat", "", "alive")
-
                 # P1: 上报健康快照到 Registry KV
-
                 h = {
-
                     'adapter_ok': report.status.name != 'OFFLINE',
-
                     'status': report.status.name,
-
                 }
-
                 if hasattr(self, 'queue'):
-
                     h['queue_size'] = self.queue.size()
-
                 await self.transport.send_registry_health_report(h)
-
             except Exception as e:
-
                 self.logger.error(f"健康探针异常: {e}")
-
             interval = self.scheduler.get_probe_interval()
-
             await asyncio.sleep(interval)
 
 
-
-
-
     # P1-2: 滑动窗口 DEGRADE 检查
-
     def _should_degrade(self, exit_code: int) -> bool:
-
         """30s 内 >=2 次 exit=2 → True，否则只记录不触发"""
-
         now = time.time()
-
         self._degrade_history.append((now, exit_code))
-
         while self._degrade_history and self._degrade_history[0][0] < now - DEGRADE_WINDOW_S:
-
             self._degrade_history.popleft()
-
         count = sum(1 for _, ec in self._degrade_history if ec == 2)
-
         return count >= DEGRADE_WINDOW_COUNT
 
-
-
-    # ── 群聊无效沟通检测 ──────────────────────────
-
-    # 原则：不看字数/关键词，看信息增量。
-
-    # 无效沟通 = 无新信息 + 无决策/行动 + 无状态变化
-
-    # 三层判定：L0 礼貌剥离 → L1 内容新意 → L2 连续计数器
-
-    GRP_FATIGUE_WINDOW = 300      # 追踪窗口（秒），窗口外自动复位
-
-    GRP_FATIGUE_MAX_EMPTY = 3     # 连续 N 轮无效 → 触发 mute
-
-    GRP_FATIGUE_MUTE = 60         # mute 时长（秒）
-
-
-
-    # L0 礼貌用语剥离表
-
-    _POLITENESS_STRIP = [
-
-        # 前缀：确认/收到类
-
-        r'^(收到|收到了|好的|明白|明白了|了解|了解了|知道|知道了|确认|已收到|已确认|已了解|已阅|收到|OK|ok|Ok)\s*',
-
-        r'^(收到|看到了)\s*[\u4e00-\u9fff]{1,6}的\s*(反馈|消息|回复|通知|建议|方案|分析|总结|意见|进度|报告|代码)\s*',
-
-        # 前缀：赞同类
-
-        r'^[\u4e00-\u9fff]{1,6}的\s*(方案|思路|方向|做法|设计|代码|修复)\s*(很好|不错|可以|没问题)\s*',
-
-        # 后缀：客气话
-
-        r'\s*(辛苦了|谢谢|感谢|多谢|没问题|继续保持|随时联系|随时沟通|一起加油|共同努力|我们继续|继续保持|有进展再同步)\s*$',
-
-        r'\s*[，,][，,\s]*(看起来没问题|感觉没问题|应该没问题|没毛病|可以|行的|👌|✅|👍)\s*$',
-
-        # 后缀：展望类废话
-
-        r'\s*[，,]\s*(我们继续|继续保持|再接再厉|稳步推进|有序推进|按计划推进|照计划执行|后续跟进|有问题再沟通)\s*$',
-
-    ]
-
-
-
-    # 技术/行动关键词：出现这些词的消息必定有效
-
-    # 注意：不含常见于客套语中的词（adapter/修复/方案/设计/架构/Queue/L1/P0等）
-
-    # 这些词让信息密度检查 + 连续计数器处理
-
-    _SUBSTANCE_MARKERS = [
-
-        "http", "P0-", "U-", "T0", "msg_id", "pid", "exit=",
-
-        "代码", "config", ".py", ".sh", ".md", "shared/", "~/", "NATS",
-
-        "修改", "部署", "测试", "重启", "联调", "上线", "发布", "推送",
-
-        "BUG", "bug", "报错", "日志", "log", "错误", "error",
-
-        "通知", "提交", "commit", "git", "commit:",
-
-        "版本", "version", "VERSION", "CHANGELOG",
-
-        "`", "→", "⚠", "🔴", "🟡", "🟢",
-
-    ]
-
-
-
-    # 问题/请求标记：带问号或请求语气的消息有效
-
-    _REQUEST_MARKERS = ["？", "?", "请", "帮我", "需要", "麻烦", "能否"]
-
-
-
-    # P0 #2: 确认类关键词集（扩展至20字覆盖）
-    _ACK_CORE_WORDS = {
-        "收到", "ok", "OK", "Ok", "好的", "明白", "了解", "知道", "1", "确认",
-        "行", "好", "嗯", "对", "可", "成", "done", "Done", "ack", "ACK", "Ack",
-        "没问题", "可以", "好嘞", "得嘞", "对的", "没错", "已阅", "看了",
-        "知道了", "明白了", "清楚了", "收到啦", "好滴", "OKK", "okk",
-    }
-
-    # L1 反信号模式（吉量方案 §2）：确认循环/状态同步
-
-    _ANTI_SIGNAL_PATTERNS = [
-
-        r'收到.*确认',
-
-        r'都(在|跑|齐|到位)了',
-
-        r'(继续干活|随时待命|状态正常|一切正常|待命中?|等指令)',
-
-        r'(三兄弟|三(方|向)).*(齐|通|正常|到位)',
-
-        r'有(活|任务|需要).*(喊|叫|招呼|同步)',
-
-    ]
-
-    # L3 消息分类（吉量方案 §3.2）
-
-    _INFO_PATTERNS = [
-
-        r'^(收到|看到了).*(确认|状态|情况|报告)',
-
-        r'(一切|状态|系统|链路|通道).*(正常|畅通|恢复|OK|ok)',
-
-        r'都(在|跑|齐|到位|上线)了',
-
-        r'(待命中?|等指令|随时待命|继续干活)',
-
-        r'(三兄弟|三方).*(齐|通|正常|到位)',
-
-        r'(没有|暂无|没).*(任务|工作|问题|异常)',
-
-        r'有(活|任务|需要).*(喊|叫|招呼|同步)',
-
-    ]
-
-    _INFO_CORE_WORDS = {
-
-        "收到", "确认", "待命", "待命中", "正常", "畅通", "没问题",
-
-        "没问题了", "没任务", "暂无", "暂时没有", "没有",
-
-    }
-
-
-
+    # ── 确认循环检测 ───────────────────────────────
+    CONFIRM_WORDS = {"收到", "1", "✅", "👍", "👂", "收到 ✅", "收到 👍", "ok", "OK", "Ok", "done", "Done", "好", "嗯", "哦", "✓", "✔"}
+    CONFIRM_MAX_LEN = 20
     # U-006: 信号/测试消息关键词 — 不调 adapter，零 token 消耗
-
-    SIGNAL_PATTERNS = {"TEST-", "TEST_", "LOG-FIX-", "INVOKE-", "STACKTRACE-", "LOCK-TEST", "DEDUP-", "PING", "通信正常", "通道打通", "回执确认", "通道确认", "PONG"}
-
+    SIGNAL_PATTERNS = {"TEST-", "TEST_", "LOG-FIX-", "INVOKE-", "STACKTRACE-", "LOCK-TEST", "DEDUP-", "PING", "通信正常", "通道打通", "回执确认", "通道确认"}
     # 系统发送者：消息不应经过 LLM
-
     SYSTEM_SENDERS_SET = {"alertd", "registry", "aim-watch", "observer"}
-
     # 社交结束语：纯礼貌用语，不需 LLM 处理
-
     SOCIAL_CLOSE = {"晚安", "再见", "拜拜", "明天见", "辛苦", "好梦", "早点休息", "养足精神"}
 
-
-
     def _skip_adapter_for_operational(self, msg) -> bool:
-
-        """免 LLM：系统通知/确认消息/测试信号不调 adapter，零 token 消耗"""
-
+        """免 LLM：系统通知/确认消息/测试信号/群聊 ACK 不调 adapter，零 token 消耗"""
+        # 系统发送者
         if msg.from_id in self.SYSTEM_SENDERS_SET:
-
             return True
-
         text = (msg.content or "").strip()
-
-        if not text:
-
+        # 纯确认消息（扩宽到 20 字）
+        if len(text) <= self.CONFIRM_MAX_LEN and (
+            text in self.CONFIRM_WORDS or any(w in text for w in self.CONFIRM_WORDS if len(w) > 1)
+        ):
             return True
-
         # 信号/测试消息（零 token）
-
         if any(p in text for p in self.SIGNAL_PATTERNS):
-
             return True
-
+        # 群聊特殊: 以 🐤 或 ✨🐴✨ 开头的短消息 = Agent ACK
+        if msg.grp_id and len(text) <= 60:
+            if text.startswith("🐤") or text.startswith("✨🐴✨") or text.startswith("🐸"):
+                # 检查是否是纯 ACK（不含实质请求）
+                if text in self.CONFIRM_WORDS or any(w in text for w in ("收到", "ok", "OK", "Ok", "1")):
+                    return True
         # 社交结束语（短 + 含结束词）
-
         if len(text) <= 50 and any(w in text for w in self.SOCIAL_CLOSE):
-
             return True
-
-        # P0 #2: ACK 分类器 — ≤20字 + 关键词白名单 → 跳过 dispatch
-        # 优先级：先走 _has_substance 快速判定，再走 _is_ack_only 精确匹配
-        if len(text) <= 20:
-            if self._is_ack_only(text, core_only=True):
-                self.logger.debug(f" [ACK-SKIP] from={msg.from_id} text={text[:40]}")
-                return True
-
-        # 短消息 + 纯确认 → 免 LLM（≤8字，交给 _has_substance 判定）
-        if len(text) <= 8 and not self._has_substance(text):
-            return True
-
-
-
-        # L3 前置分类（吉量方案 §3.2 + 火鸡儿 P0）：群聊 INFO/ACK 不进 adapter
-
-        if msg.grp_id:
-
-            msg_type = self._classify_msg_type(text)
-
-            if msg_type in ('INFO', 'ACK'):
-
-                self.logger.debug(
-
-                    f" [L3-{msg_type}] from={msg.from_id} text={text[:40]}"
-
-                )
-
-                return True
-
-
-
         return False
-
-
-
-    def _init_fatigue_state(self):
-
-        """U-107: 初始化群聊疲劳检测状态"""
-
-        import collections
-
-        self._grp_fatigue: dict = collections.defaultdict(list)  # grp_id → [(ts, is_effective), ...]
-
-        self._group_muted_until: dict[str, float] = {}  # grp_id → mute_expiry_ts
-
-        self._ineffective_rounds: dict[str, int] = collections.defaultdict(int)  # grp_id → 连续无效轮数
-
-        self._grp_recent_texts: dict[str, collections.deque] = collections.defaultdict(
-
-            lambda: collections.deque(maxlen=5)  # 最近 5 条群聊消息（用于内容新意检查）
-
-        )
-
-
-
-    def _strip_politeness(self, text: str) -> tuple[str, float]:
-
-        """L0: 剥离礼貌用语，返回 (核心内容, 剥离率)
-
-        
-
-        剥离率 = 被移除字符数 / 原始长度。>0.5 表示大部分是客套。
-
-        """
-
-        import re as _re
-
-        t = text.strip()
-
-        orig_len = len(t)
-
-        if orig_len == 0:
-
-            return "", 1.0
-
-        # 移除 emoji 前缀装饰
-
-        t = _re.sub(r'^[🐸🐴🐤✨👂🤝🦊🤖📋📊📡🛡️🔧⚙️🎯💡\s]+', '', t)
-
-        # 逐条应用剥离规则
-
-        for pat in self._POLITENESS_STRIP:
-
-            t = _re.sub(pat, '', t).strip()
-
-        stripped_len = len(t)
-
-        ratio = (orig_len - stripped_len) / orig_len if orig_len > 0 else 1.0
-
-        return t, ratio
-
-
-
-    def _has_substance(self, text: str) -> bool:
-
-        """判定消息是否有实质内容。
-
-        
-
-        原则（大哥 2026-06-21）：不看字数，看信息增量。
-
-        默认无效 — 只有包含具体信息的才算有效。
-
-        30字 "收到你的反馈，我们继续推进" = 无效。
-
-        15字 "P0-005 死锁，exit=2" = 有效。
-
-        """
-
-        import re as _re
-
-        t = text.strip()
-
-        if not t:
-
-            return False
-
-
-
-        # ── 正向信号：包含任一则有效 ──
-
-        # 1) 具体技术标记（ID/路径/代码/版本）
-
-        for marker in self._SUBSTANCE_MARKERS:
-
-            if marker in t:
-
-                return True
-
-        # 2) 含数字（15项、3轮、v1.3）
-
-        if _re.search(r'\d+', t):
-
-            return True
-
-        # 3) 含问句/请求
-
-        for marker in self._REQUEST_MARKERS:
-
-            if marker in t:
-
-                return True
-
-        if _re.search(r'[？?]', t):
-
-            return True
-
-        # 4) 含决策/行动动词（在具体语境中）
-
-        if _re.search(r'(采用|确定|选择|改为|按照|决定|分配|认领|负责|指派|修改|部署|重启|提交|推送|联调|上线|发布)', t):
-
-            return True
-
-        # 5) 含完成/状态变化
-
-        if _re.search(r'(完成|✅|通过|交付|验证|修了|修好|改好|调通|OK|OK了|好了|搞定了)', t):
-
-            return True
-
-        # 6) 含错误/异常
-
-        if _re.search(r'(BUG|bug|error|Error|报错|错误|异常|失败|超时|死锁|卡住|挂了)', t):
-
-            return True
-
-
-
-        # ── 负向信号：明确无效的模式 ──
-
-        # 短确认词
-
-        if len(t) <= 4:
-
-            stripped = t.rstrip('，,。.!！?？✅👍👌✨，。')
-
-            if stripped in self._ACK_CORE_WORDS:
-
-                return False
-
-
-
-        # 剥离礼貌用语
-
-        core, ratio = self._strip_politeness(t)
-
-
-
-        # 剥离率很高的 → 几乎全是客套
-
-        if ratio > 0.5 and len(core) < 20:
-
-            return False
-
-
-
-        # 剥离后是纯确认词
-
-        if core in self._ACK_CORE_WORDS:
-
-            return False
-
-        if len(core) <= 6 and any(w in core for w in self._ACK_CORE_WORDS if len(w) > 1):
-
-            return False
-
-
-
-        # 剥离后纯标点/空白 → 无效
-
-        core_no_punct = _re.sub(r'[\s，,。.!！?？、：:；;…\.\-－—─~～·•]', '', core)
-
-        if len(core_no_punct) < 4:
-
-            return False
-
-
-
-        # 长消息但无上述任何具体信息 → 很可能是客套（AI 之间的礼貌循环）
-
-        # 默认无效：AI 之间没有具体信息的交流就是无效沟通
-
-        return False
-
-
-    def _is_ack_only(self, text: str, core_only: bool = False) -> bool:
-
-        """P0 #2: ACK 分类器 — 判定消息是否为纯确认/已阅，无需 LLM 处理。
-
-        core_only=True: 只检查剥离后的核心内容（用于 _skip_adapter_for_operational）
-        core_only=False: 检查完整文本（用于群聊 INFO/ACK 分类）
-
-        判定逻辑:
-        1. ≤5字 纯ACK词 → True
-        2. ≤12字 + 核心ACK词 + 无问句/数字/任务词 → True
-        3. ≤20字 + 剥离率>0.4 + 核心匹配 → True
-        """
-        import re as _re
-
-        t = text.strip()
-        if not t:
-            return True  # 空消息视为ACK
-
-        core, ratio = self._strip_politeness(t)
-
-        # L1: 剥离后纯ACK核心词（≤5字）→ 直接判定
-        core_clean = _re.sub(r'[\s，,。.!！?？、：:；;…✅👍👌✨🐸🐴🐤🤝]', '', core)
-        if len(core_clean) <= 5:
-            for w in self._ACK_CORE_WORDS:
-                if w in core_clean or core_clean == w:
-                    return True
-
-        # L2: ≤12字 + 含ACK词 + 不含实质信号（问号/数字/任务动词）
-        if len(t) <= 12 and not _re.search(r'[？?\d]', t):
-            for w in self._ACK_CORE_WORDS:
-                if w in t and len(w) >= 2:
-                    return True
-
-        # L3: ≤20字 + 高剥离率 + 核心ACK匹配
-        if len(t) <= 20 and ratio > 0.4:
-            core_stripped = core.rstrip('，,。.!！?？✅👍👌✨🐸🐴🐤')
-            for w in self._ACK_CORE_WORDS:
-                if core_stripped == w or (len(w) >= 2 and core_stripped.startswith(w)):
-                    return True
-
-        return False
-
-
-
-    def _content_novelty(self, grp_id: str, text: str) -> float:
-
-        """L1: 内容新意检查。返回 0.0~1.0，值越高越有新意。
-
-        
-
-        与群聊最近消息做 trigram 相似度对比。
-
-        < 0.3 = 高度重复（回声/鹦鹉），>0.6 = 有新意。
-
-        """
-
-        import re as _re
-
-        t = _re.sub(r'[🐸🐴🐤✨👂🤝\s]', '', text.strip())
-
-        if len(t) < 6:
-
-            return 0.5  # 太短无法判断，中性
-
-        recent = list(self._grp_recent_texts.get(grp_id, []))
-
-        if not recent:
-
-            return 1.0  # 没有历史，视为新
-
-        # trigram 集合
-
-        def _trigrams(s):
-
-            return {s[i:i+3] for i in range(len(s)-2)}
-
-        t_tri = _trigrams(t)
-
-        if not t_tri:
-
-            return 1.0
-
-        max_sim = 0.0
-
-        for past in recent:
-
-            p_tri = _trigrams(_re.sub(r'[🐸🐴🐤✨👂🤝\s]', '', past.strip()))
-
-            if not p_tri:
-
-                continue
-
-            overlap = len(t_tri & p_tri)
-
-            union = len(t_tri | p_tri)
-
-            sim = overlap / union if union > 0 else 0.0
-
-            if sim > max_sim:
-
-                max_sim = sim
-
-        return 1.0 - max_sim  # 新意 = 1 - 最大相似度
-
-
-
-    def _match_anti_signal(self, text: str) -> bool:
-
-        """检测是否匹配反信号模式（确认循环/状态同步）。
-
-        
-
-        火鸡儿反馈：反信号不判死，降权使用。
-
-        匹配反信号 → _is_ineffective 要求更强正向信号才能通过。
-
-        """
-
-        import re as _re
-
-        for pat in self._ANTI_SIGNAL_PATTERNS:
-
-            if _re.search(pat, text):
-
-                return True
-
-        return False
-
-
-
-    def _has_strong_substance(self, text: str) -> bool:
-
-        """检查是否有强正向信号（数字/错误/TASK/问句/决策动词）。
-
-        
-
-        用于反信号降权：匹配反信号的消息需要强信号才能通过。
-
-        强信号包括：数字、错误关键词、明确TASK动词、问句。
-
-        """
-
-        import re as _re
-
-        if _re.search(r'\d+', text):
-
-            return True
-
-        if _re.search(r'(BUG|bug|error|Error|报错|错误|异常|失败|超时|死锁|卡住|挂了)', text):
-
-            return True
-
-        if _re.search(r'(分配|认领|负责|指派|修改|部署|重启|提交|推送|联调|上线|发布|修了|修好|改好|调通)', text):
-
-            return True
-
-        if _re.search(r'[？?]', text):
-
-            return True
-
-        if _re.search(r'(采用|确定|选择|改为|按照|决定)', text):
-
-            return True
-
-        return False
-
-
-
-    def _classify_msg_type(self, text: str) -> str:
-
-        """L3 消息分类：TASK / DISCUSSION / INFO / ACK
-
-        
-
-        吉量方案 §3.2：用于 _skip_adapter_for_operational 前置拦截。
-
-        INFO/ACK → 跳过 adapter；TASK/DISCUSSION → 正常处理。
-
-        """
-
-        import re as _re
-
-        core, ratio = self._strip_politeness(text)
-
-
-
-        # ACK: 剥离后纯确认词
-
-        core_stripped = core.rstrip('，,。.!！?？✅👍👌✨🐸🐴🐤')
-
-        if len(core_stripped) <= 8 and core_stripped in self._ACK_CORE_WORDS:
-
-            return 'ACK'
-
-        if len(core_stripped) <= 6:
-
-            stripped = _re.sub(r'[\s，,。.!！?？、：:；;…]', '', core_stripped)
-
-            if stripped in self._INFO_CORE_WORDS:
-
-                return 'ACK'
-
-
-
-        # INFO: 匹配状态同步模式 → 二次校验有实质内容不拦截
-
-        # 吉量反馈：例「一切正常但有个 bug」← pattern 命中但有实质 → 不归 INFO
-
-        for pat in self._INFO_PATTERNS:
-
-            if _re.search(pat, core):
-
-                if not self._has_substance(text):
-
-                    return 'INFO'
-
-                break  # 有实质 → 跳出，让后续 TASK/DISCUSSION 判断
-
-
-
-        # 高礼貌剥离率 + 无实质 → INFO
-
-        if ratio > 0.4 and not self._has_substance(text):
-
-            return 'INFO'
-
-
-
-        # TASK: 有具体待办
-
-        if _re.search(r'(请|帮我|需要|能否|麻烦).*(做|处理|修|查|部署|提交|测试|联调)', core):
-
-            return 'TASK'
-
-        if _re.search(r'TODO|FIXME|待办|任务|分配', core):
-
-            return 'TASK'
-
-
-
-        # DISCUSSION: 需要讨论
-
-        if _re.search(r'[？?]', core) or _re.search(r'(怎么|如何|为什么|能不能|要不要)', core):
-
-            return 'DISCUSSION'
-
-
-
-        # 默认
-
-        if self._has_substance(text):
-
-            return 'DISCUSSION'
-
-        return 'INFO'
-
-
-
-    def _is_ineffective(self, grp_id: str, text: str) -> bool:
-
-        """群聊消息无效判定
-
-        
-
-        原则：不看字数/关键词，看信息增量。
-
-        _has_substance 是主判定。反信号降权（火鸡儿反馈）。
-
-        """
-
-        if not text or not text.strip():
-
-            return True
-
-
-
-        has_subs = self._has_substance(text)
-
-        anti_hit = self._match_anti_signal(text)
-
-
-
-        # 有实质 + 无反信号 → 有效
-
-        if has_subs and not anti_hit:
-
-            return False
-
-
-
-        # 有实质 + 反信号降权 → 需要强信号验证
-
-        # 例："收到，3 项 P0 全部通过 ✅" → 有数字+完成 → 通过
-
-        # 例："收到确认，三方互通正常 ✨" → 无强信号 → 无效
-
-        if has_subs and anti_hit:
-
-            if self._has_strong_substance(text):
-
-                return False
-
-            self.logger.debug(f" [INEFFECTIVE] 反信号降权: {text[:60]}")
-
-            return True
-
-
-
-        # 无实质 → 无效
-
-        if len(text.strip()) <= 4:
-
-            return False
-
-        self.logger.debug(f" [INEFFECTIVE] 无实质内容: {text[:60]}")
-
-        return True
-
-
-
-    def _record_grp_msg(self, grp_id: str, text: str):
-
-        """记录群聊消息（用于内容新意对比）"""
-
-        self._grp_recent_texts[grp_id].append(text.strip())
-
-
-
-    def _record_grp_reply(self, group_id: str, reply: str, is_effective: bool):
-
-        """U-107: 记录群聊回复，追踪连续无效轮数"""
-
-        now = time.time()
-
-        self._grp_fatigue[group_id].append((now, is_effective))
-
-        # 清理过期记录
-
-        cutoff = now - self.GRP_FATIGUE_WINDOW
-
-        self._grp_fatigue[group_id] = [
-
-            (ts, eff) for ts, eff in self._grp_fatigue[group_id] if ts > cutoff
-
-        ]
-
-        if len(self._grp_fatigue[group_id]) > 50:
-
-            self._grp_fatigue[group_id] = self._grp_fatigue[group_id][-30:]
-
-        # 更新连续无效计数
-
-        if not is_effective:
-
-            self._ineffective_rounds[group_id] = self._ineffective_rounds.get(group_id, 0) + 1
-
-        else:
-
-            self._ineffective_rounds[group_id] = 0  # 有效回复 → 归零
-
-
-
-    def _grp_is_fatigued(self, group_id: str) -> bool:
-
-        """U-107: 群聊是否已进入无效沟通循环 → 应 mute"""
-
-        rounds = self._ineffective_rounds.get(group_id, 0)
-
-        if rounds < self.GRP_FATIGUE_MAX_EMPTY:
-
-            return False
-
-        # 检查 mute 冷却
-
-        now = time.time()
-
-        muted_until = self._group_muted_until.get(group_id, 0)
-
-        if now < muted_until:
-
-            return True  # 仍在 mute
-
-        # 触发 mute
-
-        self._group_muted_until[group_id] = now + self.GRP_FATIGUE_MUTE
-
-        self._ineffective_rounds[group_id] = 0
-
-        self.logger.warning(
-
-            f"⛔ 群聊无效沟通 mute: {group_id} "
-
-            f"(连续 {rounds} 轮无效 → mute {self.GRP_FATIGUE_MUTE}s, 到 {now + self.GRP_FATIGUE_MUTE:.0f})"
-
-        )
-
-        return True
-
-
-
-    def _is_group_muted(self, group_id: str) -> bool:
-
-        """检查群聊是否在 mute 中"""
-
-        muted_until = self._group_muted_until.get(group_id, 0)
-
-        if time.time() < muted_until:
-
-            return True
-
-        # mute 过期自动清理
-
-        if muted_until > 0:
-
-            del self._group_muted_until[group_id]
-
-            self.logger.info(f"🔇 群聊 mute 到期: {group_id}")
-
-        return False
-
-
 
     def _is_confirm_loop(self, msg, reply: str) -> bool:
-        """P0-004 合并双检测器：L3 ACK/INFO 拦截 + 疲劳检测 → mute 60s
-
-        统一 _classify_msg_type（L3 分类）为入口，呱呱 ACK skip 与吉量疲劳
-        检测共享同一判定逻辑。两步走：
-          1. L3 快速拦截：AI 回复是 ACK/INFO → 直接 skip，不进疲劳计数
-          2. 疲劳检测：连续 N 轮无效 → mute 60s（安全网）
-        """
-        if not msg.grp_id:
-            return False
+        """检测群聊确认死锁：入站是简短确认 + 出站也是简短确认 → 跳过回复"""
         in_text = (msg.content or "").strip()
         out_text = reply.strip()
-        # 入站消息记录到内容历史
-        self._record_grp_msg(msg.grp_id, in_text)
-        # P0-004: L3 快速 ACK/INFO 拦截 — 与 _skip_adapter_for_operational 共享判定
-        reply_type = self._classify_msg_type(out_text)
-        if reply_type in ('ACK', 'INFO'):
-            self._record_grp_reply(msg.grp_id, out_text, False)
-            self.logger.debug(
-                f" [{msg.msg_id[:8]}] 群聊回复拦截 (L3-{reply_type}): {out_text[:40]}"
-            )
-            return True
-        # 疲劳检测路径（安全网）
-        is_effective = not self._is_ineffective(msg.grp_id, out_text)
-        self._record_grp_reply(msg.grp_id, out_text, is_effective)
-        if self._grp_is_fatigued(msg.grp_id):
-            self.logger.info(
-                f" [{msg.msg_id[:8]}] ⛔ 群聊疲劳 mute: {msg.grp_id} "
-                f"(连续 {self.GRP_FATIGUE_MAX_EMPTY} 轮无效, mute {self.GRP_FATIGUE_MUTE}s)"
-            )
-            return True
-        return False
-
-
+        # 入站和出站都是确认
+        in_confirm = len(in_text) <= self.CONFIRM_MAX_LEN and (
+            in_text in self.CONFIRM_WORDS or any(w in in_text for w in self.CONFIRM_WORDS if len(w) > 1)
+        )
+        out_confirm = len(out_text) <= self.CONFIRM_MAX_LEN and (
+            out_text in self.CONFIRM_WORDS or any(w in out_text for w in self.CONFIRM_WORDS if len(w) > 1)
+        )
+        return in_confirm and out_confirm
 
     async def _call_adapter_recover(self) -> bool:
-
         """Call adapter.sh recover, returns True if backend recovered.
 
-
-
         exit=0 + JSON -> success
-
         exit!=0 -> failure, log stderr
-
         60s cooldown to prevent recover storms
-
         L3 护栏: >=3 次连续失败 → agent_stalled 告警 + 永久停止自修复
-
         """
-
         if self._repair_disabled:
-
             return False
-
-
 
         _now = __import__("time").time()
-
         if _now - self._last_recover_at < 60:
-
             self.logger.debug(f"recover cooldown ({_now - self._last_recover_at:.0f}s/60s)")
-
             return False
-
         self._last_recover_at = _now
 
-
-
         self.logger.info("[recover] Calling adapter recover ...")
-
         cmd = f"bash {self.adapter_cmd} recover"
-
         try:
-
             proc = await asyncio.create_subprocess_shell(
-
                 cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-
                 env=self.adapter_env,
-
             )
-
             stdout, stderr = await asyncio.wait_for(
-
                 proc.communicate(), timeout=60.0  # L3: adapter recover 多轮重试（匹配降配后的≈68s）
-
             )
-
         except asyncio.TimeoutError:
-
             proc.kill()
-
             self.logger.warning("[recover] Timeout (30s)")
-
             self._record_repair_failure("recover_timeout")
-
             return False
-
         except Exception as exc:
-
             self.logger.warning(f"[recover] Exception: {exc}")
-
             self._record_repair_failure(f"recover_exception:{exc}")
-
             return False
-
-
 
         rc = proc.returncode or 0
-
         stderr_text = stderr.decode().strip() if stderr else ""
-
         stdout_text = stdout.decode().strip() if stdout else ""
 
-
-
         if rc == 0:
-
             try:
-
                 info = __import__("json").loads(stdout_text)
-
             except Exception:
-
                 info = {"raw": stdout_text[:200]}
-
             self.logger.info(f"[recover] Success: {info}")
-
             self._repair_failures = 0  # L3: 成功后重置
-            self.breaker.force_reset()  # 熔断器复位
-
             # P1: report recover event
-
             await self.transport.send_registry_event("recover", {"exit_code": rc, "result": info})
-
             return True
-
         else:
-
             self.logger.warning(f"[recover] Failed (exit={rc}): {stderr_text[:120]}")
-
             self._record_repair_failure(f"recover_exit={rc}")
-
             # P1: report recover failure
-
             await self.transport.send_registry_event("recover", {"exit_code": rc, "error": stderr_text[:200]})
-
             return False
-
-
 
     async def _call_adapter_trim(self) -> None:
-
         """Call adapter.sh trim, clear stuck session/messages.
 
-
-
         30s cooldown.
-
         L3 护栏: repair_disabled 时跳过
-
         """
-
         if self._repair_disabled:
-
             return
-
         _now = __import__("time").time()
-
         if _now - self._last_trim_at < 30:
-
             self.logger.debug(f"trim cooldown ({_now - self._last_trim_at:.0f}s/30s)")
-
             return
-
         self._last_trim_at = _now
 
-
-
         self.logger.info("[trim] Calling adapter trim ...")
-
         cmd = f"bash {self.adapter_cmd} trim"
-
         try:
-
             proc = await asyncio.create_subprocess_shell(
-
                 cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-
                 env=self.adapter_env,
-
             )
-
             stdout, stderr = await asyncio.wait_for(
-
                 proc.communicate(), timeout=15.0
-
             )
-
         except asyncio.TimeoutError:
-
             proc.kill()
-
             self.logger.warning("[trim] Timeout (15s)")
-
             return
-
         except Exception as exc:
-
             self.logger.warning(f"[trim] Exception: {exc}")
-
             return
-
-
 
         rc = proc.returncode or 0
-
         stdout_text = stdout.decode().strip() if stdout else ""
-
         if rc == 0:
-
             self.logger.info(f"[trim] Done: {stdout_text[:200]}")
-
             self._repair_failures = 0  # L3: 成功后重置
-            self.breaker.force_reset()  # 熔断器复位
-
         else:
-
             stderr_text = stderr.decode().strip() if stderr else ""
-
             self.logger.warning(f"[trim] Failed (exit={rc}): {(stdout_text + stderr_text)[:120]}")
-
             self._record_repair_failure(f"trim_exit={rc}")
-
         # P1: report trim event
-
         import json as _pj1
-
         try: info = _pj1.loads(stdout_text) if stdout_text else {}
-
         except Exception: info = {"raw": stdout_text[:200] if stdout_text else ""}
-
         await self.transport.send_registry_event("trim", {"exit_code": rc, "result": info})
 
-    # ── P2: dispatch pool auto-recycler (2026-07-03 呱呱) ──
-    async def _evict_conv_pool(self) -> None:
-        """Enforce dispatch_conv_pool_size: evict oldest conv IDs when exceeding.
-
-        Adapter creates new convs via --new but never evicts old ones.
-        dispatch_conv_ids.txt grows unbounded → waste.
-        This ensures only the most recent pool_size convs are kept.
-        """
-        pool_size = self.config.get("dispatch_conv_pool_size", 2)
-        if pool_size <= 0:
-            return
-        adapter_dir = str(Path(self.adapter_cmd).parent)
-        ids_file = Path(adapter_dir) / "dispatch_conv_ids.txt"
-        if not ids_file.exists():
-            return
-        try:
-            lines = ids_file.read_text().strip().split("\n")
-            lines = [l.strip() for l in lines if l.strip()]
-            if len(lines) <= pool_size:
-                return
-            kept = lines[-pool_size:]
-            evicted = len(lines) - len(kept)
-            ids_file.write_text("\n".join(kept) + "\n")
-            self.logger.info(
-                f"🧹 conv pool evicted {evicted} old convs "
-                f"({len(lines)} → {len(kept)}, pool_size={pool_size})"
-            )
-        except Exception as e:
-            self.logger.debug(f"conv pool eviction skipped: {e}")
-
-
-
-
     def _record_repair_failure(self, reason: str = ""):
-
         """L3 护栏: 记录自修复失败，N=3 触发 agent_stalled 告警并永久停止"""
-
         self._repair_failures += 1
-
         n = self._repair_failures
-
         self.logger.warning(f"[L3] 自修复失败 #{n}/3: {reason}")
-
         if n >= 3:
-
             self._repair_disabled = True
-
             self.logger.error(
-
                 f"💀 [L3] {self.agent_id} 自修复连续 {n} 次失败，永久停止自修复"
-
             )
-
             # 通过 health 通道发布 stalled 告警
-
             asyncio.ensure_future(
-
                 self.transport.emit_health(
-
                     "stalled",
-
                     "",
-
                     f"自修复连续{n}次失败，已停止。最后原因: {reason}"
-
                 )
-
             )
-
-
 
     # ── 循环检测（行为模式，非关键词）──
-
     _LOOP_WINDOW_SEC = 60
-
     _LOOP_REPEAT_THRESHOLD = 3        # 同一 (from_id, 短内容) 窗口内 ≥3 次 → 视为循环
-
     _LOOP_CONTENT_MAX_LEN = 20        # 只有短消息参与循环检测
 
-
-
     def _init_loop_state(self):
-
         """初始化循环追踪状态（在 __init__ 中调用）"""
-
         # {(from_id, content_fingerprint): deque[timestamp]}
-
         self._loop_tracker: dict = {}
 
-
-
     def _check_loop(self, from_id: str, content: str, msg_id: str) -> bool:
-
         """检测消息是否处于循环中（行为模式：同发送者+同短内容高频重复）
 
-
-
         大哥原则：不看固定词汇，看行为——同一来源反复发同样的短消息。
-
         真正的对话（如"收到，确认我的归属项：…"）不会重复，不会被误杀。
-
         """
-
         import time as _time
-
         now = _time.time()
-
         text = content.strip()
 
-
-
         # 只追踪短消息（长消息几乎不可能进入循环）
-
         if len(text) > self._LOOP_CONTENT_MAX_LEN:
-
             return False
 
-
-
         # 指纹：from_id + 内容前 20 字
-
         key = (from_id, text[:20])
-
         dq = self._loop_tracker.get(key)
-
         if dq is None:
-
             dq = __import__("collections").deque(maxlen=50)
-
             self._loop_tracker[key] = dq
 
-
-
         # 清理过期
-
         cutoff = now - self._LOOP_WINDOW_SEC
-
         while dq and dq[0] < cutoff:
-
             dq.popleft()
 
-
-
         dq.append(now)
-
         count = len(dq)
 
-
-
         if count >= self._LOOP_REPEAT_THRESHOLD:
-
             self.logger.warning(
-
                 f" [{msg_id[:8]}] 🔁 循环检测: from={from_id} cnt={count}/{self._LOOP_WINDOW_SEC}s "
-
                 f"content={text[:30]!r}"
-
             )
-
             return True
-
         return False
 
-
-
     async def _call_adapter(self, msg: Message) -> Optional[str]:
-
         """调用 adapter.sh process，返回回复文本
 
-
-
         Returns:
-
             str: AI 回复文本（可能为空）
-
             None: 回复为空（静默）
 
-
-
         Raises:
-
             RetryableError: exit=1
-
             DegradeError: exit=2
-
             HumanInterventionError: exit=3
-
         """
-
         # ── 循环抑制：同来源同内容高频重复 → 静默跳过 ──
-
         if self._check_loop(msg.from_id, msg.content, msg.msg_id):
-
             return None
 
-
-
-        # L1 熔断器：入口校验
-        allowed, reason = self.breaker.allow_call()
-        if not allowed:
-            raise CircuitOpenError(reason)
-
-        # ADAPTER-PROTOCOL v1.0: JSON 协议优先
-        if self._protocol_version == "1.0":
-            return await self._call_adapter_v1(msg)
-
-        # 旧协议: CLI args（向后兼容）
         safe_content = msg.content.replace("'", "'\\''")
-
         cmd = f"bash {self.adapter_cmd} process --from '{msg.from_id}' --message '{safe_content}'"
-
         proc = await asyncio.create_subprocess_shell(
-
             cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-
             env=self.adapter_env,
-
         )
-
         try:
-
             stdout, stderr = await asyncio.wait_for(
-
                 proc.communicate(), timeout=self.scheduler.processing_timeout
-
             )
-
         except asyncio.TimeoutError:
-
             proc.kill()
-
             self.logger.warning(f" [{msg.msg_id[:8]}] adapter 超时 ({self.scheduler.processing_timeout}s)")
-
             raise RetryableError("adapter 超时")
 
-
-
         rc = proc.returncode or 0
-
         stderr_text = stderr.decode().strip() if stderr else ""
-
         stdout_text = stdout.decode().strip() if stdout else ""
 
-
-
         if stderr_text:
-
             self.logger.debug(f" [{msg.msg_id[:8]}] adapter stderr: {stderr_text[:100]}")
 
-
-
         if rc == 0:
-
             # 正常回复
-
             if stdout_text:
-
                 self.logger.debug(f" [{msg.msg_id[:8]}] adapter OK, reply={stdout_text[:60]}")
-
             else:
-
                 self.logger.debug(f" [{msg.msg_id[:8]}] adapter OK, 空回复")
-
             return stdout_text or None
 
-
-
         elif rc == 1:
-
             # 可重试（exit=1）：session 忙、排队中等
-
             raise RetryableError(stderr_text or f"adapter exit=1")
 
-        elif rc == 141:
-            # SIGPIPE (128+13): 管道被断（大输出/过早关闭）→ 退避重试，非真故障
-            # 不影响现有 timeout/exit=2/DEGRADE 语义
-            raise RetryableError(stderr_text or "adapter SIGPIPE (rc=141)")
-
         elif rc == 2:
-
             # P1-2: 滑动窗口检查，30s内>=2次exit=2才DEGRADE
-
             if self._should_degrade(2):
-
                 raise DegradeError(stderr_text or f"adapter exit=2")
-
             # 窗口未达标 → nack 重试
-
             self.logger.info(f"exit=2 滑动窗口未达标，nack 重试")
-
             raise RetryableError(stderr_text or "adapter exit=2, under window")
-
         elif rc == 3:
-
             # FATAL（exit=3）：配置错误、CLI不存在、环境问题 → 永久停止
-
             raise HumanInterventionError(stderr_text or f"adapter exit=3")
-
-        elif rc == 124:
-
-            # exit=124 = timeout 命令被杀 → 可重试（适配器内 124→1 映射可能因 set -e 未触发）
-
-            raise RetryableError(stderr_text or "adapter timeout (rc=124)")
-
         elif rc == 4:
-
             # AGENT_UNREACHABLE（exit=4）：agent数据不在磁盘/框架崩溃 → DEGRADE+可恢复
-
             raise DegradeError(f"[agent_unreachable] {stderr_text}" if stderr_text else "agent unreachable")
-
         else:
-
-            # 其他未知 exit code → 按 FATAL 处理（未知即不安全）
-
+            # 5+ UNKNOWN → 按 FATAL 处理（未知即不安全）
             raise HumanInterventionError(f"unknown exit={rc}: {stderr_text[:100]}")
-
-
-
-
-
-    # ── ADAPTER-PROTOCOL v1.0: JSON stdin/stdout ──
-
-    async def _call_adapter_v1(self, msg: Message) -> Optional[str]:
-        """
-        走 ADAPTER-PROTOCOL v1.0 (JSON stdin/stdout)
-
-        Request JSON:
-          {"action":"process","session_id":"pool:ZS0002:3","from":"ZS0002",
-           "message":"...","timeout_ms":30000,"context":"...","msg_id":"abc123"}
-
-        Response JSON:
-          {"status":"ok","reply":"...","session_id":"pool:ZS0002:3","elapsed_ms":1234}
-          或 {"status":"error","error":"...","error_code":"timeout"}
-
-        退出码: 0=ok, 1=TEMP_FAIL(可重试), 2=DEGRADE, 3=FATAL, 4=UNREACHABLE
-        """
-        # 获取 session
-        session_id = self.session_mgr.get_session_id(msg.from_id)
-
-        # 组装上下文
-        context = self.context_mgr.assemble()
-
-        # 动态 timeout（按场景）
-        timeout_ms = self.scheduler.processing_timeout * 1000  # s→ms
-
-        # 构建请求
-        request = {
-            "version": "1.0",
-            "action": "process",
-            "session_id": session_id,
-            "from": msg.from_id,
-            "message": msg.content,
-            "timeout_ms": timeout_ms,
-            "context": context,
-            "msg_id": msg.msg_id or "",
-            "grp_id": msg.grp_id or "",
-        }
-
-        request_json = json.dumps(request, ensure_ascii=False)
-
-        # 调用 adapter（CLI 模式: stdin/stdout）
-        if self.session_mgr.mode == "cli":
-            proc = await asyncio.create_subprocess_exec(
-                self.adapter_cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=self.adapter_env,
-            )
-        else:
-            # API Server 模式: 保留为未来扩展，当前 fallback 走旧协议
-            self.logger.warning("_call_adapter_v1: API Server mode not implemented, falling back")
-            return await self._call_adapter(msg)
-
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=request_json.encode()),
-                timeout=self.scheduler.processing_timeout,
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            self.logger.warning(f" [{msg.msg_id[:8]}] adapter v1.0 超时 ({self.scheduler.processing_timeout}s)")
-            raise RetryableError("adapter v1.0 超时")
-
-        rc = proc.returncode or 0
-        stderr_text = stderr.decode().strip() if stderr else ""
-        stdout_text = stdout.decode().strip() if stdout else ""
-
-        if stderr_text:
-            self.logger.debug(f" [{msg.msg_id[:8]}] adapter v1.0 stderr: {stderr_text[:100]}")
-
-        # 尝试解析 JSON 响应
-        reply = None
-        if stdout_text:
-            try:
-                response = json.loads(stdout_text)
-                status = response.get("status", "")
-
-                if status == "ok":
-                    reply = response.get("reply", "") or None
-                elif status == "error":
-                    error_code = response.get("error_code", "")
-                    error_msg = response.get("error", "")
-                    self.logger.info(f" [{msg.msg_id[:8]}] adapter v1.0 error: {error_code}={error_msg}")
-                    if error_code in ("temp_fail", "busy"):
-                        raise RetryableError(error_msg)
-                    elif error_code in ("degrade",):
-                        raise DegradeError(error_msg)
-                    else:
-                        reply = None  # 静默
-                else:
-                    # 非 JSON: 当纯文本回复
-                    reply = stdout_text
-            except json.JSONDecodeError:
-                # 纯文本回复（adapter 尚未切换 JSON 格式）
-                reply = stdout_text
-
-        # 退出码处理
-        if rc == 0:
-            if reply:
-                self.logger.debug(f" [{msg.msg_id[:8]}] adapter v1.0 OK, reply={reply[:60]}")
-            return reply
-        elif rc == 1:
-            raise RetryableError(stderr_text or "adapter v1.0 exit=1")
-        elif rc == 141:
-            raise RetryableError(stderr_text or "adapter v1.0 SIGPIPE")
-        elif rc == 2:
-            if self._should_degrade(2):
-                raise DegradeError(stderr_text or "adapter v1.0 exit=2")
-            raise RetryableError(stderr_text or "adapter v1.0 exit=2, under window")
-        elif rc == 3:
-            raise HumanInterventionError(stderr_text or "adapter v1.0 exit=3")
-        elif rc == 4:
-            raise DegradeError(f"[agent_unreachable] {stderr_text}" if stderr_text else "agent unreachable")
-        else:
-            raise HumanInterventionError(f"adapter v1.0 unknown exit={rc}: {stderr_text[:100]}")
-
 
     # -- NATS 回调 (SDK 签名: handler(envelope_dict, raw_msg)) --
 
+    # ── P0-D: retry_count 持久化 ──
+    def _load_retry_counts(self):
+        """启动时从文件恢复 retry_count，避免重启后毒消息无限循环"""
+        try:
+            if self._retry_persist_path.exists():
+                with open(self._retry_persist_path) as f:
+                    data = json.load(f)
+                self._retry_tracker = data.get("retry_counts", {})
+                stale_before = data.get("updated_at", 0)
+                # 超过 24h 的 retry count 过期清理
+                if time.time() - stale_before > 86400:
+                    self._retry_tracker = {}
+                    self.logger.info("retry_counts expired (>24h), cleared")
+                else:
+                    poison = [k[:8] for k, v in self._retry_tracker.items() if v >= 3]
+                    if poison:
+                        self.logger.warning(f"加载 {len(self._retry_tracker)} 条 retry_count, 毒消息: {poison}")
+                    else:
+                        self.logger.info(f"加载 {len(self._retry_tracker)} 条 retry_count")
+        except Exception as e:
+            self.logger.debug(f"加载 retry_counts 失败: {e}")
+            self._retry_tracker = {}
 
+    def _save_retry_counts(self):
+        """持久化 retry_count 到文件"""
+        try:
+            self._retry_persist_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._retry_persist_path, 'w') as f:
+                json.dump({"retry_counts": self._retry_tracker, "updated_at": time.time()}, f)
+        except Exception as e:
+            self.logger.warning(f"保存 retry_counts 失败: {e}")
 
     @staticmethod
-
     def _preview(envelope: dict, maxlen: int = 50) -> str:
-
         """提取消息内容截断预览"""
-
         text = envelope.get("payload", {}).get("text", "")
-
         if not text:
-
             return ""
-
         return text[:maxlen] + ("…" if len(text) > maxlen else "")
 
-
-
-    async def _on_notification(self, data: dict):
-        """625: NATS 通知通道消费端 — 实时处理 aim.notification.<id> 推送
-
-        R-001 修复：替代 JSONL 轮询（30s 延迟），实现实时通知触达。
-        事件类型: received / processed / failed / mentioned
-        """
-        event = data.get("event", "?")
-        content = data.get("content", "")
-        from_id = data.get("from_id", "?")
-        ts = data.get("ts", 0)
-
-        # mentioned 事件 — 高优先级，直接记录以便心跳感知
-        if event == "mentioned":
-            self.logger.info(f"🔔 [NOTIFY] @mentioned by {from_id}: {content[:80]}")
-            # 写入待处理标记，心跳检查时优先消费
-            notify_mark = Path.home() / ".aim" / "notifications" / ".mentioned_alert"
-            try:
-                import json as _json, time as _time
-                notify_mark.parent.mkdir(parents=True, exist_ok=True)
-                alert = {"from_id": from_id, "content": content, "ts": ts, "read_at": 0}
-                notify_mark.write_text(_json.dumps(alert, ensure_ascii=False))
-            except Exception:
-                pass
-        elif event in ("received", "processed"):
-            self.logger.debug(f"[NOTIFY] {event} from={from_id}")
-        elif event == "failed":
-            self.logger.warning(f"[NOTIFY] ❌ 消息处理失败: {content[:80]}")
-
-    def _signal_inbox(self, from_id: str, content: str, msg_type: str = "dm"):
-        """信号通知：收到新消息时写入 inbox 文件 + 设置提醒标志。
-
-        供 OpenClaw 主会话心跳检查用，确保重要讨论不被遗漏。
-        """
-        try:
-            from pathlib import Path as _P
-            from datetime import datetime, timezone, timedelta as _td
-
-            inbox_file = _P.home() / "shared" / "aim" / "guagua_inbox.md"
-            alert_file = _P.home() / "shared" / "aim" / ".new_message_alert"
-
-            tz = timezone(_td(hours=8))
-            ts = datetime.now(tz).strftime("%m-%d %H:%M")
-            prefix = "[群聊]" if msg_type == "grp" else ""
-            line = f"{ts} {prefix}{from_id}: {content[:200]}\n"
-
-            inbox_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(inbox_file, "a", encoding="utf-8") as f:
-                f.write(line)
-
-            # 触摸提醒标志（内容 = 最后一条消息摘要）
-            alert_file.write_text(f"{ts} {from_id}: {content[:100]}")
-
-            self.logger.debug(f"📬 inbox 已更新: {from_id}")
-        except Exception as e:
-            self.logger.debug(f"inbox 写入跳过: {e}")
-    async def _notify_nats(self, from_id: str, content: str, msg_type: str):
-        """发布 NATS 通知到 aim.notify.inbox.<agent_id> — 协议化通知服务 v1.0。
-        
-        alertd 订阅 aim.notify.inbox.> 并实时推送到 OpenClaw。
-        任何 Agent publish 到 aim.notify.inbox.<target> 即可接入通知体系。
-        """
-        try:
-            import json
-            from datetime import datetime, timezone as _tz
-            subject = f"aim.notify.inbox.{self.agent_id}"
-            envelope = {
-                "ver": "1.0",
-                "type": "notify.inbox",
-                "from": from_id,
-                "to": self.agent_id,
-                "msg_type": msg_type,
-                "content": content[:500],
-                "ts": datetime.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-            }
-            payload = json.dumps(envelope, ensure_ascii=False).encode()
-            nc = getattr(self._sdk, 'nc', None)
-            if nc is None:
-                self.logger.warning(f"📡 NATS nc=None, 通知跳过")
-                return
-            await nc.publish(subject, payload)
-            self.logger.info(f"📡 NATS 通知已发布: {subject} from={from_id}")
-        except Exception as e:
-            self.logger.warning(f"📡 NATS 通知失败: {e}")
-
     async def _on_dm(self, envelope: dict, raw_msg):
-
         from_id = envelope.get("from", envelope.get("from_id", ""))
-
         mid = str(envelope.get('id','?'))[:8]
-
         preview = self._preview(envelope, maxlen=50)
-
         obs_text = self._preview(envelope, maxlen=500)
-
         self.logger.info(f" DM收到: from={from_id} id={mid}")
-
         if from_id == self.agent_id:
-
             return
-
-        # 📬 写入 inbox 文件 + NATS 协议通知（R-003: 消息提醒恢复）
-        content = envelope.get("content") or envelope.get("text") or envelope.get("payload", {}).get("text", "")
-        self._signal_inbox(from_id, content, msg_type="dm")
-        try:
-            import json as _json
-            nc = getattr(self.transport._sdk, 'nc', None) if hasattr(self, 'transport') and hasattr(self.transport, '_sdk') else None
-            if nc:
-                msg = _json.dumps({"ver":"1.0","type":"notify.inbox","from":from_id,"to":self.agent_id,"msg_type":"dm","content":content[:500]}).encode()
-                await nc.publish(f"aim.notify.inbox.{self.agent_id}", msg)
-                self.logger.info(f"📡 NATS 通知已发布: from={from_id}")
-        except Exception as _e:
-            self.logger.debug(f"NATS通知跳过: {_e}")
-
         detail = f"from={from_id}" + (f" text={obs_text}" if obs_text else "")
-
-        await self.transport.emit_obs("received", mid, detail)
-
+        # await self.transport.emit_obs("received", mid, detail)  # 2026-06-21 禁用以省带宽
         await self._handle_message(envelope, is_dm=True)
 
-
-
     async def _on_grp(self, envelope: dict, raw_msg):
-
         from_id = envelope.get("from", envelope.get("from_id", ""))
-
         mid = str(envelope.get('id','?'))[:8]
-
         preview = self._preview(envelope, maxlen=50)
-
         obs_text = self._preview(envelope, maxlen=500)
-
         self.logger.info(f" GRP收到: from={from_id}")
-
         if from_id == self.agent_id:
-
             return
-
-        # 📬 写入 inbox 文件 + NATS 协议通知（R-003: 消息提醒恢复）
-        content = envelope.get("content") or envelope.get("text") or envelope.get("payload", {}).get("text", "")
-        is_mentioned = f"@{self.agent_id}" in content or f"@{self.card.name}" in content
-        if is_mentioned:
-            self._signal_inbox(from_id, content, msg_type="grp")
-            try:
-                import json as _json
-                nc = getattr(self.transport._sdk, 'nc', None) if hasattr(self, 'transport') and hasattr(self.transport, '_sdk') else None
-                if nc:
-                    msg = _json.dumps({"ver":"1.0","type":"notify.inbox","from":from_id,"to":self.agent_id,"msg_type":"grp","content":content[:500]}).encode()
-                    await nc.publish(f"aim.notify.inbox.{self.agent_id}", msg)
-                    self.logger.info(f"📡 NATS 通知已发布: from={from_id}")
-            except Exception as _e:
-                self.logger.debug(f"NATS群聊通知跳过: {_e}")
-
         detail = f"from={from_id}" + (f" text={obs_text}" if obs_text else "")
-
-        await self.transport.emit_obs("received", mid, detail)
-
+        # await self.transport.emit_obs("received", mid, detail)  # 2026-06-21 禁用以省带宽
         await self._handle_message(envelope, is_dm=False)
 
-
-
     async def _handle_message(self, envelope: dict, *, is_dm: bool):
-
         # ── 620: envelope 准入校验 (三方共识: 吉量SDK + 呱呱handler + 火鸡儿E2E) ──
-
         violation = self._validate_envelope(envelope)
-
         if violation:
-
             self._envelope_violations += 1
-
             sev, reason = violation
-
             detail = f"{sev} envelope from={envelope.get('from','?')} id={(envelope.get('id','?') or '?')[:8]}: {reason}"
-
             if sev == "hard" and self._reject_hard_errors:
-
                 self.logger.warning(f"🚫 [envelope] REJECT {detail}")
-
                 return
-
             else:
-
                 self.logger.warning(f"⚠️ [envelope] WARN {detail} (violations={self._envelope_violations})")
 
-
-
         payload = envelope.get("payload", {})
-
         content = payload.get("text", "")
-
         # 620: 移除 envelope.get("content") 容错回退，不合规格式已在上面告警
-
         if not content:
-
             return
-
-
 
         # ── 送达确认替代 ACK：短 ACK 不进 dispatch ──
-
         # 传输层 NATS publish ack 已保证送达，应用层 ACK 是冗余
-
         import re
-
         stripped = content.strip()
-
         # 去除 emoji/符号后提取纯文本
-
         _text_only = re.sub(r'[^\w\s\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]', '', stripped).strip()
-
         # 压缩空白后判断
-
         _compact = re.sub(r'\s+', '', _text_only)
-
         _ACK_PATTERNS = {"收到", "ok", "OK", "Ok", "done", "Done", "ack", "ACK", "Ack"}
-
         _ACK_REPEATS = {"收到收到", "okok", "donedone", "ackack"}
-
         if _text_only in _ACK_PATTERNS or (len(_compact) <= 10 and _compact in _ACK_REPEATS):
-
             eid = (envelope.get("id", "?"))[:8]
-
             self.logger.info(f" [{eid}] ACK skip: '{stripped[:20]}' (送达已由传输层确认)")
-
             return
-
-
 
         from_id = envelope.get("from", "")
-
         # 620: 移除 envelope.get("from_id") 容错回退
-
         if not from_id:
-
             return
-
         msg_id = envelope.get("id", str(uuid.uuid4()))
 
-
-
         # ── U-007: 群聊 reply_to 过滤 ──
-
         # 群聊消息若明确回复他人消息，而我方未发过该消息 → 跳过 dispatch（只 observe）
-
         if not is_dm:
-
             reply_to = (envelope.get("meta") or {}).get("reply_to", "")
-
             if reply_to and reply_to not in self._my_msg_ids:
-
                 self.logger.debug(f" [GRP-FILTER] reply_to={reply_to[:8]} 非我方消息, 跳过 dispatch")
-
                 return
-
-
 
         # 安全过滤 — 认证链
-
         if not await self.security.authenticate(from_id, token=payload.get("token", ""), msg_id=msg_id, envelope=envelope):
-
             return
-
-
 
         # ── U-005 双层去重 ──
-
         # L1: msg_id 级去重（精确，覆盖同一消息的重复投递）
-
         msg_id = envelope.get("id", "")
-
         if msg_id and msg_id in self._processed_ids:
-
             self.logger.debug(f" [DEDUP L1] msg_id={msg_id[:8]} 已处理, 跳过")
-
             return
-
         now_ts = time.time()
-
         # L2: 内容去重（StallWatchdog 重投会换 msg_id，内容查重兜底）
-
         dedup_key = f"{from_id}:{content[:200]}"
-
         if dedup_key in self._seen_msg_keys:
-
             age = now_ts - self._seen_msg_keys[dedup_key]
-
             if age < 120.0:  # U-005: 5s→120s，覆盖 StallWatchdog 30s 重试周期
-
                 self.logger.info(f" [DEDUP L2] from={from_id} content_dup age={age:.0f}s, 跳过")
-
                 return
-
         # 记录
-
         if msg_id:
-
-            self._add_processed_id(msg_id)
-
+            self._processed_ids.add(msg_id)
         self._seen_msg_keys[dedup_key] = now_ts
-
-        # 限制去重集合大小（_processed_ids/_dispatched_ids 在 add 方法内已处理）
-
-        if len(self._seen_msg_keys) > 500:
-
-            old_keys = sorted(self._seen_msg_keys, key=lambda k: self._seen_msg_keys[k])[:250]
-
-            for k in old_keys:
-
-                del self._seen_msg_keys[k]
-
-
-
-        # Phase 1: 识别 Task
-
-        is_task = payload.get("task") is not None or content.startswith("/task ")
-
-        if is_task:
-
-            task_id = envelope.get("task_id", str(uuid.uuid4())[:8])
-
-            self.logger.info(f" 任务入队: {task_id} from={from_id}")
-
-            # TODO Phase 2: AIMTask lifecycle tracking
-
-
-
-        msg = Message(
-
-            msg_id=msg_id, from_id=from_id, to_id=self.agent_id,
-
-            grp_id="" if is_dm else (getattr(self, '_default_group', None) or "grp_trio"), msg_type="dm" if is_dm else "grp",
-
-            content=content, raw_envelope=envelope,
-
-        )
-
-        self.queue.enqueue(msg)
-
-        self._dispatch_event.set()
-
-        # 624: 新消息提醒 — message.received
-        await self.notification.received(
-            msg_id=msg_id, from_id=from_id,
-            content_preview=content, is_dm=is_dm,
-            grp_id=msg.grp_id,
-        )
-        # 624: 检测 @ 提及 — message.mentioned
-        if not is_dm and NotificationHandler.detect_mention(content, self._mention_names):
-            msg.is_mentioned = True  # 标记给 grp_policy 使用
-            await self.notification.mentioned(
-                msg_id=msg_id, from_id=from_id,
-                content_preview=content, grp_id=msg.grp_id,
-            )
-
-        self.scheduler.on_message_enqueued()
-
-    # ── R-002: 去重集持久化 ──────────────────────────────────────
-
-    def _init_dedup_persist(self):
-        """初始化去重持久化文件路径（需在 agent_id 确定后调用）"""
-        if not self.agent_id:
-            return
-        data_dir = Path.home() / ".aim" / "agents" / self.agent_id
-        data_dir.mkdir(parents=True, exist_ok=True)
-        self._dedup_persist_path = data_dir / "dedup_ids.jsonl"
-        self._restore_dedup_ids()
-
-    def _restore_dedup_ids(self):
-        """R-002: 从 JSONL 文件恢复去重集，防重启丢失"""
-        if not self._dedup_persist_path or not self._dedup_persist_path.exists():
-            return
-        try:
-            with open(self._dedup_persist_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                        s = entry.get("set", "")
-                        mid = entry.get("msg_id", "")
-                        if s == "processed" and mid:
-                            self._processed_ids.add(mid)
-                        elif s == "dispatched" and mid:
-                            self._dispatched_ids.add(mid)
-                    except json.JSONDecodeError:
-                        pass
-            # 应用上限
-            if len(self._processed_ids) > 2000:
-                self._processed_ids = set(list(self._processed_ids)[-500:])
-            if len(self._dispatched_ids) > 2000:
-                self._dispatched_ids = set(list(self._dispatched_ids)[-500:])
-            self.logger.info(
-                f"R-002 dedup restore: processed={len(self._processed_ids)}"
-                f" dispatched={len(self._dispatched_ids)}"
-            )
-        except Exception as e:
-            self.logger.warning(f"R-002 dedup restore failed: {e}")
-
-    def _persist_dedup_id(self, set_name: str, msg_id: str):
-        """追加一行去重 ID 到持久化文件（同步写入，单行 JSON 足够快）"""
-        if not self._dedup_persist_path:
-            return
-        try:
-            line = json.dumps(
-                {"set": set_name, "msg_id": msg_id, "ts": time.time()},
-                ensure_ascii=False,
-            ) + "\n"
-            with open(self._dedup_persist_path, "a") as f:
-                f.write(line)
-            # 定期压缩：文件 > 50KB 时触发
-            if self._dedup_persist_path.stat().st_size > 50_000:
-                self._compact_dedup_persist()
-        except Exception:
-            pass  # 持久化失败不影响主流程
-
-    def _compact_dedup_persist(self):
-        """R-002: 压缩去重持久化文件，只保留最近的 ID"""
-        if not self._dedup_persist_path:
-            return
-        try:
-            processed = list(self._processed_ids)[-500:]
-            dispatched = list(self._dispatched_ids)[-500:]
-            now = time.time()
-            lines = []
-            for mid in processed:
-                lines.append(json.dumps(
-                    {"set": "processed", "msg_id": mid, "ts": now},
-                    ensure_ascii=False,
-                ))
-            for mid in dispatched:
-                lines.append(json.dumps(
-                    {"set": "dispatched", "msg_id": mid, "ts": now},
-                    ensure_ascii=False,
-                ))
-            tmp = self._dedup_persist_path.with_suffix(".tmp")
-            tmp.write_text("\n".join(lines) + ("\n" if lines else ""))
-            os.replace(tmp, self._dedup_persist_path)
-            self.logger.debug(
-                f"R-002 dedup compact: processed={len(processed)}"
-                f" dispatched={len(dispatched)}"
-            )
-        except Exception:
-            pass
-
-    def _add_processed_id(self, msg_id: str):
-        """R-002: 添加去重 ID（内存 + 持久化），自动上限裁剪"""
-        self._processed_ids.add(msg_id)
-        self._persist_dedup_id("processed", msg_id)
+        # 限制去重集合大小
         if len(self._processed_ids) > 2000:
             self._processed_ids = set(list(self._processed_ids)[-500:])
-
-    def _add_dispatched_id(self, msg_id: str):
-        """R-002: 添加 dispatch 去重 ID（内存 + 持久化），自动上限裁剪"""
-        self._dispatched_ids.add(msg_id)
-        self._persist_dedup_id("dispatched", msg_id)
         if len(self._dispatched_ids) > 2000:
             self._dispatched_ids = set(list(self._dispatched_ids)[-500:])
+        if len(self._my_msg_ids) > 2000:
+            self._my_msg_ids = set(list(self._my_msg_ids)[-500:])
+        if len(self._seen_msg_keys) > 500:
+            old_keys = sorted(self._seen_msg_keys, key=lambda k: self._seen_msg_keys[k])[:250]
+            for k in old_keys:
+                del self._seen_msg_keys[k]
 
+        # Phase 1: 识别 Task
+        is_task = payload.get("task") is not None or content.startswith("/task ")
+        if is_task:
+            task_id = envelope.get("task_id", str(uuid.uuid4())[:8])
+            self.logger.info(f" 任务入队: {task_id} from={from_id}")
+            # TODO Phase 2: AIMTask lifecycle tracking
+
+        msg = Message(
+            msg_id=msg_id, from_id=from_id, to_id=self.agent_id,
+            grp_id="" if is_dm else (getattr(self, '_default_group', None) or "grp_trio"), msg_type="dm" if is_dm else "grp",
+            content=content, raw_envelope=envelope,
+        )
+        self.queue.enqueue(msg)
+        self._dispatch_event.set()
+        self.scheduler.on_message_enqueued()
 
     def _validate_envelope(self, envelope: dict):
-
         """620: veritas v1.0 信封格式校验
 
-
-
         返回 (severity, reason) 或 None (合规)。
-
         - hard: ver缺失、from缺失、payload非dict → Phase 2 reject
-
         - soft: content在顶层、from_id旧字段 → Phase 1 warn
 
-
-
         三方共识：吉量SDK校验 + 呱呱handler清容错 + 火鸡儿E2E验证
-
         标准文档：~/shared/aim/specs/aim-envelope-spec.md
-
         """
-
         # hard: ver 缺失
-
         if "ver" not in envelope:
-
             return ("hard", "missing 'ver' field")
 
-
-
         # hard: from 缺失
-
         if not envelope.get("from"):
-
             return ("hard", "missing 'from' field")
 
-
-
         # hard: payload 非 dict
-
         payload = envelope.get("payload")
-
         if not isinstance(payload, dict):
-
             return ("hard", "payload is not a dict")
 
-
-
         # soft: content 在 envelope 顶层而非 payload.text (兼容旧格式)
-
         if "content" in envelope and "text" not in payload:
-
             return ("soft", "content at envelope level, expected payload.text")
 
-
-
         # soft: 使用旧字段名 from_id 而非 from
-
         if "from_id" in envelope and "from" not in envelope:
-
             return ("soft", "using legacy 'from_id' instead of 'from'")
-
-
 
         return None
 
+    async def _resolve_and_subscribe_groups(self):
+        """v2.0: 启动时从 NATS KV 查询自己所属的全部群并订阅
 
+        替代硬编码 default_group。
+        后续可通过 aim.groups.notify 实时感知新增群。
+        """
+        cfg = load_global_config()
+        default_grp = cfg.get("default_group", "grp_trio")
+
+        try:
+            nc = self.transport.get_nc()
+            if nc and nc.is_connected:
+                js = nc.jetstream()
+                try:
+                    kv = await js.key_value("aim-kv-groups")
+                    keys = await kv.keys()
+                    count = 0
+                    for key in keys:
+                        entry = await kv.get(key)
+                        data = json.loads(entry.value.decode())
+                        members = data.get("members", [])
+                        if self.agent_id in members:
+                            gid = data["group_id"]
+                            await self.transport.subscribe_grp(gid, self._on_grp)
+                            count += 1
+
+                    if count > 0:
+                        self.logger.info(f"📋 已从 KV 恢复 {count} 个群订阅")
+                        return
+                except Exception as e:
+                    self.logger.warning(f"KV 群查询失败: {e}")
+        except Exception as e:
+            self.logger.warning(f"NATS 群发现失败: {e}")
+
+        # 兜底：KV 不可用时至少订阅默认群
+        self.logger.info(f"📋 KV 无群记录，订阅默认群 {default_grp}")
+        for gid in default_grp.split(","):
+            await self.transport.subscribe_grp(gid.strip(), self._on_grp)
 
     async def _register_with_registry(self):
-
         """向 Registry 注册本 Agent"""
-
         try:
-
             card_data = {
-
                 "name": self.card.name,
-
                 "execution_model": self.card.execution_model,
-
                 "protocol_version": "1.0",
-
             }
-
             result = await asyncio.wait_for(
-
                 self.registry_client.register(self.agent_id, card_data),
-
                 timeout=10.0
-
             )
-
             self.logger.info(f"Registry 注册: {result.get('action')} serial={result.get('serial')}")
-
         except asyncio.TimeoutError:
-
             self.logger.warning("Registry 注册超时（Registry 可能未运行）")
-
         except Exception as e:
-
             self.logger.warning(f"Registry 注册失败（Registry 可能未运行）: {e}")
 
-
-
     # --------------- 619-09: SIGHUP 配置重载 ---------------
-
     def _reload_config(self):
-
         """SIGHUP 触发的优雅重载：重读 config.json + 重新加载资源"""
-
         try:
-
             with open(self.config_path) as f:
-
                 self.config = json.loads(f.read())
-
             self.logger.info(f"🔄 [619-09] 配置已重载 ({self.agent_id})")
-
         except Exception as e:
-
             self.logger.error(f"🔄 [619-09] 配置重载失败: {e}")
 
-
-
     def _shutdown(self):
-
-        """SIGINT 处理：正常退出（watchdog 不重拉）"""
-
-        self.logger.info("收到 SIGINT，正常退出...")
-
+        self.logger.info("收到终止信号，正在退出...")
         self.running = False
-
+        # P2: 5s 安全网，防止 drain hang 导致僵尸
         signal.alarm(10)
-
-
-
-    def _handle_sigterm(self, signum, frame):
-
-        """SIGTERM 处理：异常退出（watchdog 自动重拉）"""
-
-        self.logger.info("收到 SIGTERM，异常退出（watchdog 重拉）")
-
-        self.running = False
-
-        signal.alarm(10)
-
-        os._exit(1)  # 非零退出码 → watchdog 判定异常 → 重拉
-
-
 
     async def close(self):
-
         self.running = False
-
         await asyncio.sleep(0.5)  # 等 _health_probe_loop / _dispatch_loop 退出
-
         await self.queue.close_persist()
-
         await self.transport.disconnect()
-
-        # 624: 关闭通知通道
-        await self.notification.close()
-
         self.lock.release()
 
 
-
-
-
 # -- 异常类 --
-
-# ═══════════════════════════════════════
-# L1 熔断器 (Circuit Breaker)
-# ═══════════════════════════════════════
-# 三态模型: CLOSED → OPEN → HALF_OPEN → CLOSED
-# 指数退避: cooldown = base * 2^n (max=120s)
-# JetStream 持久化: 熔断状态写入 queue.jsonl 旁路
-
-CIRCUIT_CLOSED = "closed"
-CIRCUIT_OPEN = "open"
-CIRCUIT_HALF_OPEN = "half_open"
-
-class CircuitBreaker:
-    """L1 适配器熔断器
-    
-    接入点: _call_adapter() 调用前校验
-    触发条件: 连续 N 次 RetryableError/DegradeError/HumanInterventionError
-    恢复路径: OPEN 冷却后 → HALF_OPEN 探测 → CLOSED
-    """
-    
-    def __init__(
-        self,
-        failure_threshold: int = 5,
-        base_cooldown: int = 10,
-        max_cooldown: int = 120,
-        half_open_max: int = 1,
-        logger=None,
-    ):
-        self.failure_threshold = failure_threshold
-        self.base_cooldown = base_cooldown
-        self.max_cooldown = max_cooldown
-        self.half_open_max = half_open_max
-        self.logger = logger or logging.getLogger("CircuitBreaker")
-        
-        self.state = CIRCUIT_CLOSED
-        self.failure_count = 0
-        self.trip_count = 0
-        self.last_failure_time: float = 0.0
-        self.opened_at: float = 0.0
-        self.half_open_count = 0
-        self.last_success_time: float = 0.0
-        self.total_trips = 0
-        self.total_successes = 0
-    
-    @property
-    def cooldown_sec(self) -> int:
-        """指数退避: base * 2^n, capped at max_cooldown"""
-        return min(self.base_cooldown * (2 ** self.trip_count), self.max_cooldown)
-    
-    @property
-    def remaining_cooldown(self) -> float:
-        """OPEN 态剩余冷却时间（秒）"""
-        if self.state != CIRCUIT_OPEN:
-            return 0.0
-        elapsed = time.time() - self.opened_at
-        return max(0.0, self.cooldown_sec - elapsed)
-    
-    # ── 入口校验：调用前判断是否允许通过 ──
-    
-    def allow_call(self) -> tuple[bool, str]:
-        """
-        Returns:
-            (allowed: bool, reason: str)
-        """
-        if self.state == CIRCUIT_CLOSED:
-            return True, ""
-        
-        if self.state == CIRCUIT_OPEN:
-            remaining = self.remaining_cooldown
-            if remaining > 0:
-                return False, f"breaker OPEN, cooldown {remaining:.0f}s/{self.cooldown_sec}s"
-            # Cooldown elapsed → transition to HALF_OPEN
-            self.state = CIRCUIT_HALF_OPEN
-            self.half_open_count = 0
-            if self.logger:
-                self.logger.info(
-                    f"🔌 熔断器 OPEN→HALF_OPEN (cooldown={self.cooldown_sec}s, trip=#{self.trip_count})"
-                )
-        
-        if self.state == CIRCUIT_HALF_OPEN:
-            if self.half_open_count >= self.half_open_max:
-                return False, f"breaker HALF_OPEN, probes exhausted ({self.half_open_max}/{self.half_open_max})"
-            self.half_open_count += 1
-            if self.logger:
-                self.logger.info(
-                    f"🔌 熔断器 HALF_OPEN 探测 #{self.half_open_count}/{self.half_open_max}"
-                )
-        
-        return True, ""
-    
-    # ── 结果反馈 ──
-    
-    def on_success(self):
-        """适配器调用成功 → 复位"""
-        prev = self.state
-        self.state = CIRCUIT_CLOSED
-        self.failure_count = 0
-        self.half_open_count = 0
-        self.last_success_time = time.time()
-        self.total_successes += 1
-        if prev != CIRCUIT_CLOSED and self.logger:
-            self.logger.info(f"🔌 熔断器 {prev}→CLOSED (success, {self.total_successes} total)")
-    
-    def on_failure(self, error_type: str = ""):
-        """适配器调用失败 → 累加"""
-        self.failure_count += 1
-        self.last_failure_time = time.time()
-        
-        if self.state == CIRCUIT_HALF_OPEN:
-            # 探测失败 → 立即回 OPEN
-            self.state = CIRCUIT_OPEN
-            self.half_open_count = 0
-            self.trip_count += 1
-            self.total_trips += 1
-            if self.logger:
-                self.logger.warning(
-                    f"🔌 熔断器 HALF_OPEN→OPEN (probe failed, cooldown={self.cooldown_sec}s, trip=#{self.trip_count})"
-                )
-            return
-        
-        if self.failure_count >= self.failure_threshold:
-            self.state = CIRCUIT_OPEN
-            self.opened_at = time.time()
-            self.trip_count += 1
-            self.total_trips += 1
-            if self.logger:
-                self.logger.warning(
-                    f"🔌 熔断器 CLOSED→OPEN ({self.failure_count}/{self.failure_threshold} failures, "
-                    f"cooldown={self.cooldown_sec}s, trip=#{self.trip_count}, "
-                    f"last_error={error_type[:40]})"
-                )
-    
-    def force_reset(self):
-        """手动复位（recover 命令触发）"""
-        self.state = CIRCUIT_CLOSED
-        self.failure_count = 0
-        self.trip_count = 0
-        self.half_open_count = 0
-        if self.logger:
-            self.logger.info("🔌 熔断器手动复位 → CLOSED")
-    
-    def status_dict(self) -> dict:
-        """导出状态（用于 health check / JetStream 持久化）"""
-        return {
-            "state": self.state,
-            "failure_count": self.failure_count,
-            "trip_count": self.trip_count,
-            "cooldown_sec": self.cooldown_sec,
-            "remaining_cooldown": self.remaining_cooldown,
-            "total_trips": self.total_trips,
-            "total_successes": self.total_successes,
-            "last_failure_at": self.last_failure_time or None,
-            "last_success_at": self.last_success_time or None,
-        }
-
-
-class CircuitOpenError(Exception):
-    """熔断器 OPEN 时调用适配器 → 快速拒绝"""
-    pass
-
-
 class RetryableError(Exception):
-
     """可重试错误 (exit=1): session 忙、排队中等"""
-
     pass
-
-
-
-
 
 
 
 # P1-2: DEGRADE 滑动窗口（30s 内 2 次 exit=2 才触发）
-
 DEGRADE_WINDOW_S = 30
-
 DEGRADE_WINDOW_COUNT = 2
-
 class DegradeError(Exception):
-
     """降级错误 (exit=2): Runtime 不可用"""
-
     pass
-
-
-
 
 
 class HumanInterventionError(Exception):
-
     """需人工介入 (exit=3): 权限不足、框架崩溃"""
-
     pass
 
 
-
-
-
 # -- CLI --
-
 async def _run_services(args):
-
     """--service 模式：启动 Registry + GroupAdmission 服务"""
-
     from registry import Registry
-
     from group_admission import GroupAdmission
 
-
-
     nats_url = args.nats_url or "nats://127.0.0.1:4222"
-
     creds = args.credentials or ""
-
     registry = Registry(nats_url=nats_url, credentials=creds)
-
     group_admission = GroupAdmission(nats_url=nats_url, credentials=creds)
-
     
-
     # start() 返回后 subscriptions 持续生效，需保持 event loop
-
     await registry.start()
-
     await group_admission.start_service()
-
     
-
     logger = logging.getLogger("aim-client")
-
     logger.info("🛡️  服务模式: Registry + GroupAdmission 已启动")
-
     
-
     try:
-
         while True:
-
             await asyncio.sleep(30)
-
     except asyncio.CancelledError:
-
         pass
-
     finally:
-
         for svc in [registry, group_admission]:
-
             try:
-
                 await svc.stop()
-
             except Exception:
-
                 pass
-
-
-
-
-
-# ═══════════════════════════════════════════════
-
-# 守护进程化 (Phase 2: 自托管)
-
-# ═══════════════════════════════════════════════
-
-
-
-PID_DIR = Path.home() / ".aim" / "run"
-
-PID_DIR.mkdir(parents=True, exist_ok=True)
-
-
-
-
-
-def _pidfile_path(agent_id: str) -> Path:
-
-    return PID_DIR / f"aim-client-{agent_id}.pid"
-
-
-
-
-
-def _write_pidfile(agent_id: str, pid: int) -> None:
-
-    _pidfile_path(agent_id).write_text(str(pid))
-
-
-
-
-
-def _remove_pidfile(agent_id: str) -> None:
-
-    _pidfile_path(agent_id).unlink(missing_ok=True)
-
-
-
-
-
-def _read_pidfile(agent_id: str) -> Optional[int]:
-
-    """读取 pidfile，验证进程是否存活"""
-
-    pf = _pidfile_path(agent_id)
-
-    if not pf.exists():
-
-        return None
-
-    try:
-
-        pid = int(pf.read_text().strip())
-
-        os.kill(pid, 0)
-
-        return pid
-
-    except (ValueError, OSError):
-
-        pf.unlink(missing_ok=True)
-
-        return None
-
-
-
-
-
-def daemonize_with_watchdog(agent_id: str, config_path: str) -> None:
-
-    """自托管守护进程：parent=watchdog, child=daemon.
-
-
-
-    父进程：轻量 watchdog，监控子进程，异常退出自动重拉。
-
-    子进程：实际 AIM client daemon。
-
-
-
-    结构:
-
-        aim-client (启动进程)
-
-          → fork → parent (watchdog loop, PID 写入 pidfile)
-
-                     → child (AIMClient.start(), 异常退出 → parent 重拉)
-
-
-
-    pidfile: ~/.aim/run/aim-client-{agent_id}.pid (记录 watchdog PID)
-
-    lock:    ~/.aim/run/aim-client-{agent_id}.lock (记录 daemon 子进程 PID)
-
-    """
-
-    # 0: 防重复
-
-    existing = _read_pidfile(agent_id)
-
-    if existing:
-
-        print(f"[aim-client] {agent_id} watchdog 已在运行 (PID {existing})，跳过", file=sys.stderr)
-
-        sys.exit(0)
-
-
-
-    # 1: fork → parent=watchdog, child=daemon
-
-    os.environ["AIM_DAEMON_CHILD"] = "1"  # 标记：子进程是 daemon，不走 watchdog 逻辑
-
-    pid = os.fork()
-
-    if pid > 0:
-
-        # ===== watchdog (父进程) =====
-
-        child_pid = pid
-
-        _write_pidfile(agent_id, os.getpid())
-
-        print(f"[aim-client] {agent_id} watchdog PID {os.getpid()}, daemon PID {child_pid}", file=sys.stderr)
-
-
-
-        # 脱离终端
-
-        os.setsid()
-
-        devnull = os.open(os.devnull, os.O_RDWR)
-
-        for fd in (sys.stdin.fileno(), sys.stdout.fileno(), sys.stderr.fileno()):
-
-            os.dup2(devnull, fd)
-
-        os.close(devnull)
-
-
-
-        # watchdog 信号处理：收到 SIGTERM → 杀 daemon → 清理 → 退出
-        def _wd_cleanup(signum, frame):
-            try:
-                os.kill(child_pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            _cleanup_pidfile(agent_id)
-            os._exit(0)
-
-        signal.signal(signal.SIGTERM, _wd_cleanup)
-        signal.signal(signal.SIGINT, _wd_cleanup)
-
-        # watchdog 主循环：监控子进程，异常退出自动重拉
-
-        backoff = 1
-
-        max_backoff = 60
-
-
-
-        while True:
-
-            try:
-
-                _, status = os.waitpid(child_pid, 0)
-
-            except (ChildProcessError, OSError):
-
-                break
-
-
-
-            if os.WIFEXITED(status):
-
-                exit_code = os.WEXITSTATUS(status)
-
-            elif os.WIFSIGNALED(status):
-
-                exit_code = -(os.WTERMSIG(status))
-
-            else:
-
-                exit_code = -1
-
-
-
-            if exit_code == 0:
-
-                print(f"[aim-client] {agent_id} daemon 正常退出", file=sys.stderr)
-
-                break
-
-
-
-            # 异常退出 → 重拉（exec 新进程以加载最新代码）
-
-            time.sleep(min(backoff, max_backoff))
-
-            backoff = min(backoff * 2, max_backoff)
-
-
-
-            child_pid = os.fork()
-
-            if child_pid == 0:
-
-                # 子进程：exec 自身以重新加载源码
-
-                script_path = str(Path(__file__).resolve())
-
-                os.execve(sys.executable,
-
-                          [sys.executable, "-u", script_path] + sys.argv[1:],
-
-                          dict(os.environ, AIM_DAEMON_CHILD="1"))
-
-
-
-        _remove_pidfile(agent_id)
-
-        sys.exit(0)
-
-
-
-    # ===== daemon 子进程 =====
-
-    # exec 自身以重新加载源码（避免继承 watchdog 内存中的旧代码）
-
-    script_path = str(Path(__file__).resolve())
-
-    os.chdir("/")
-
-    os.execve(sys.executable,
-
-              [sys.executable, "-u", script_path] + sys.argv[1:],
-
-              dict(os.environ, AIM_DAEMON_CHILD="1"))
-
-
-
 
 
 def main():
-
     parser = argparse.ArgumentParser(description=f"AIM Client -- 统一通信终端 v{_AIM_VERSION}")
-
     parser.add_argument("--agent-id", required=True, help="Agent ID")
-
     parser.add_argument("--config", required=True, help="config.json 路径")
-
     parser.add_argument("--nats-url", default=None, help="NATS 服务器地址")
-
     parser.add_argument("--mode", default="direct", choices=["direct", "service"])
-
     parser.add_argument("--services", action="store_true", default=False,
-
                        help="同时启动 Registry + GroupAdmission 服务")
-
     parser.add_argument("--credentials", default="", help="NATS credentials file")
-
-    parser.add_argument("--foreground", action="store_true", default=False,
-
-                       help="前台运行（调试用，默认 watchdog+daemonize）")
-
-    parser.add_argument("--start", action="store_true", default=False,
-                        help="启动 AIM Client（幂等：已运行则跳过）")
-    parser.add_argument("--stop", action="store_true", default=False,
-                        help="停止 AIM Client（杀 watchdog + daemon）")
-    parser.add_argument("--install", action="store_true", default=False,
-                        help="安装 launchd plist（开机自启）")
-    parser.add_argument("--uninstall", action="store_true", default=False,
-                        help="卸载 launchd plist")
     args = parser.parse_args()
 
-
-    # --- --stop: 停止运行中的 AIM Client ---
-    if args.stop:
-        import subprocess as _sp, re as _re
-        pidfile = os.path.expanduser(f"~/.aim/run/aim-client-{args.agent_id}.pid")
-        lockfile = os.path.expanduser(f"~/.aim/run/aim-client-{args.agent_id}.lock")
-        stopped = False
-
-        # 1) 优先用 launchd bootout（--foreground 模式）
-        label = f"com.aim.agent.{args.agent_id}"
-        rc = os.system(f"launchctl bootout gui/$UID/{label} 2>/dev/null")
-        if rc == 0:
-            print(f"✅ [{args.agent_id}] 已通过 launchd 停止")
-            stopped = True
-
-        # 2) 尝试 watchdog pidfile
-        if not stopped:
-            try:
-                with open(pidfile) as pf:
-                    watchdog_pid = int(pf.read().strip())
-                os.kill(watchdog_pid, 15)
-                print(f"✅ [{args.agent_id}] 已发送停止信号 (PID {watchdog_pid})")
-                stopped = True
-            except FileNotFoundError:
-                pass
-            except ProcessLookupError:
-                for f in (pidfile, lockfile):
-                    try: os.remove(f)
-                    except OSError: pass
-                print(f"⚠️  [{args.agent_id}] 进程已不存在，已清理残留")
-                return
-            except Exception as e:
-                print(f"❌ [{args.agent_id}] 停止失败: {e}", file=sys.stderr)
-                return
-
-        # 3) 最后尝试 pgrep
-        if not stopped:
-            result = _sp.run(["pgrep", "-f", f"aim-client.*--agent-id {args.agent_id}"],
-                             capture_output=True, text=True)
-            if result.stdout.strip():
-                for line in result.stdout.strip().split('\n'):
-                    try:
-                        os.kill(int(line.strip()), 15)
-                        print(f"✅ [{args.agent_id}] 已停止 (PID {line.strip()})")
-                        stopped = True
-                    except ProcessLookupError:
-                        pass
-            if not stopped:
-                print(f"⚠️  [{args.agent_id}] 未找到运行中的进程")
-        return
-
-    # --- --install: 安装 launchd plist（开机自启+崩溃自动重启） ---
-    if args.install:
-        import plistlib, shutil
-        python_bin = shutil.which("python3.13") or sys.executable
-        plist_label = f"com.aim.agent.{args.agent_id}"
-        plist_path = os.path.expanduser(f"~/Library/LaunchAgents/{plist_label}.plist")
-        plist = {
-            "Label": plist_label,
-            "Disabled": False,
-            "ProgramArguments": [
-                python_bin, "-u",
-                os.path.expanduser("~/shared/aim/aim-client/main.py"),
-                "--agent-id", args.agent_id,
-                "--config", os.path.abspath(args.config),
-                "--mode", "direct",
-                "--foreground",
-            ],
-            "RunAtLoad": True,
-            "KeepAlive": {"SuccessfulExit": False},
-            "StandardOutPath": os.path.expanduser(f"~/Library/Logs/aim-client-{args.agent_id}.log"),
-            "StandardErrorPath": os.path.expanduser(f"~/Library/Logs/aim-client-{args.agent_id}.log"),
-            "ThrottleInterval": 10,
-            "EnvironmentVariables": {
-                "PATH": "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin",
-                "HOME": os.path.expanduser("~"),
-            },
-        }
-        os.makedirs(os.path.dirname(plist_path), exist_ok=True)
-        with open(plist_path, "wb") as pf:
-            plistlib.dump(plist, pf)
-        os.system(f"launchctl bootout gui/$UID/{plist_label} 2>/dev/null || true")
-        # 619-01: 先 enable（防止被 launchd throttle 标记为 disabled）
-        os.system(f"launchctl enable gui/$UID/{plist_label} 2>/dev/null || true")
-        rc = os.system(f"launchctl bootstrap gui/$UID {plist_path} 2>/dev/null")
-        if rc != 0:
-            # fallback: legacy load
-            os.system(f"launchctl load {plist_path} 2>/dev/null")
-        print(f"✅ [{args.agent_id}] launchd plist 已安装（KeepAlive + 崩溃自恢复）")
-        print(f"   路径: {plist_path}")
-        return
-
-    # --- --uninstall: 卸载 launchd plist ---
-    if args.uninstall:
-        plist_label = f"com.aim.agent.{args.agent_id}"
-        plist_path = os.path.expanduser(f"~/Library/LaunchAgents/{plist_label}.plist")
-        os.system(f"launchctl bootout gui/$UID/{plist_label} 2>/dev/null || true")
-        try:
-            os.remove(plist_path)
-            print(f"✅ [{args.agent_id}] plist 已卸载")
-        except FileNotFoundError:
-            print(f"⚠️  [{args.agent_id}] plist 不存在，无需卸载")
-        return
-
-    # --- --start 或默认：幂等启动（已运行则跳过） ---
-    if args.start:
-        import subprocess as _sp2
-        # 检查 launchd
-        result = _sp2.run(["launchctl", "list"], capture_output=True, text=True)
-        for ln in result.stdout.split('\n'):
-            if f"com.aim.agent.{args.agent_id}" in ln:
-                pid = ln.split()[0]
-                if pid.isdigit():
-                    print(f"⚠️  [{args.agent_id}] 已在运行 (launchd PID {pid})，无需重复启动")
-                    return
-        # 检查 watchdog 模式
-        lockfile = os.path.expanduser(f"~/.aim/run/aim-client-{args.agent_id}.lock")
-        try:
-            with open(lockfile) as lf:
-                pid = int(lf.read().strip())
-            os.kill(pid, 0)
-            print(f"⚠️  [{args.agent_id}] 已在运行 (PID {pid})，无需重复启动")
-            return
-        except (FileNotFoundError, ProcessLookupError, OSError):
-            pass  # 未运行，继续正常启动
-        # 检查 pgrep
-        r2 = _sp2.run(["pgrep", "-f", f"aim-client.*--agent-id {args.agent_id}"],
-                       capture_output=True, text=True)
-        if r2.stdout.strip():
-            pid = r2.stdout.strip().split('\n')[0]
-            print(f"⚠️  [{args.agent_id}] 已在运行 (pgrep PID {pid})，无需重复启动")
-            return
-
-
     if args.mode == "service" or args.services:
-
         asyncio.run(_run_services(args))
-
         return
-
-
-
-    # Phase 2: 自托管 = watchdog(parent) + daemon(child)
-
-    if not args.foreground and not os.environ.get("AIM_DAEMON_CHILD"):
-
-        daemonize_with_watchdog(args.agent_id, args.config)
-
-        # 到这里的是 daemon 子进程（exec 重新加载了源码）
-
-
-
-    # daemon 子进程：脱离终端
-
-    if os.environ.get("AIM_DAEMON_CHILD"):
-
-        os.chdir("/")
-
-        os.umask(0o027)
-
-        devnull = os.open(os.devnull, os.O_RDWR)
-
-        for fd in (sys.stdin.fileno(), sys.stdout.fileno(), sys.stderr.fileno()):
-
-            os.dup2(devnull, fd)
-
-        os.close(devnull)
-
-
-
-    # 运行 AIM client（daemon 子进程直接运行）
 
     client = AIMClient(args.config)
-
     try:
-
         asyncio.run(client.start())
-
     except KeyboardInterrupt:
-
-        print(f"\n[aim-client] {args.agent_id} 中断", file=sys.stderr)
-
+        print(f"\n[aim-client] {args.agent_id} 中断")
     finally:
-
         try:
-
             asyncio.run(client.close())
-
         except Exception:
-
             pass
 
 
-
-
-
 if __name__ == "__main__":
-
     main()

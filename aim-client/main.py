@@ -534,90 +534,109 @@ class AIMClient:
                             self.logger.debug(f" [{msg.msg_id[:8]}] 免LLM跳过: from={msg.from_id}")
                             self.queue.ack(msg.msg_id)
                             continue
-                        reply = await self._call_adapter(msg)
-                        if reply:
-                            if msg.grp_id:
-                                # 619-18: 群聊回路防护（30s 冷却，防回复风暴）
-                                import time as _t619
-                                now = _t619.time()
-                                last = self._last_grp_reply.get(msg.grp_id, 0)
-                                if now - last < self._grp_cooldown_sec:
-                                    self.logger.debug(f" [{msg.msg_id[:8]}] 群聊回复跳过（冷却 {now-last:.0f}s/{self._grp_cooldown_sec}s）")
-                                elif self._is_confirm_loop(msg, reply):
-                                    self.logger.info(f" [{msg.msg_id[:8]}] 群聊确认循环跳过: in={msg.content[:20]} out={reply[:20]}")
+                        # ── 原地重试：消息不 nack 回队，在手里重试 3 次 ──
+                        delivered = False
+                        for attempt in range(3):
+                            try:
+                                reply = await self._call_adapter(msg)
+                                if reply:
+                                    if msg.grp_id:
+                                        # 619-18: 群聊回路防护（30s 冷却，防回复风暴）
+                                        import time as _t619
+                                        now = _t619.time()
+                                        last = self._last_grp_reply.get(msg.grp_id, 0)
+                                        if now - last < self._grp_cooldown_sec:
+                                            self.logger.debug(f" [{msg.msg_id[:8]}] 群聊回复跳过（冷却 {now-last:.0f}s/{self._grp_cooldown_sec}s）")
+                                        elif self._is_confirm_loop(msg, reply):
+                                            self.logger.info(f" [{msg.msg_id[:8]}] 群聊确认循环跳过: in={msg.content[:20]} out={reply[:20]}")
+                                        else:
+                                            self._last_grp_reply[msg.grp_id] = now
+                                            await self.transport.send_grp(msg.grp_id, reply)
+                                    else:
+                                        await self.transport.send_dm(msg.from_id, reply)
                                 else:
-                                    self._last_grp_reply[msg.grp_id] = now
-                                    await self.transport.send_grp(msg.grp_id, reply)
-                            else:
-                                await self.transport.send_dm(msg.from_id, reply)
-                        else:
-                            # P0-D: 空响应校验 — adapter rc=0 但空回复 = 疑似假成功
-                            self.logger.warning(f" [{msg.msg_id[:8]}] 空响应: adapter rc=0 但无输出, 视为可重试")
-                            raise RetryableError("adapter 空响应")
-                        self.scheduler.on_processing_done()
-                        # U-006: 标记已 dispatch，防止回队重复处理
-                        if msg.msg_id:
-                            self._dispatched_ids.add(msg.msg_id)
-                        self.queue.ack(msg.msg_id)
-                        self._stall_recovery_count = 0  # 620-01: 成功投递才清零
-                        self._retry_tracker.pop(msg.msg_id, None)  # 退避跟踪清除
-                    except DegradeError:
-                        self.scheduler.on_degrade()
-                        self.queue.nack(msg.msg_id, "degrade")
-                        # 619-11: 降级告警
-                        self.logger.warning(f"⚠️  [{self.agent_id}] adapter 降级，停止投递")
-                        await self.transport.emit_health("degrade", msg.msg_id[:8], "adapter DEGRADE")
-                        # FIX(2026-06-19): break 后必须重置事件，否则永久阻塞（火鸡儿发现）
-                        self._dispatch_event.set()
-                        break
-
-                    except RetryableError:
-                        self.scheduler.on_retry()
-                        rt = self._retry_tracker.get(msg.msg_id, 0) + 1
-                        self._retry_tracker[msg.msg_id] = rt
-                        self._save_retry_counts()  # P0-D: 持久化 retry_count
-                        if rt >= 3:
-                            self.logger.warning(f" [{msg.msg_id[:8]}] 退避耗尽 ({rt}次)，入死信")
-                            self.queue.ack(msg.msg_id)  # ack 移除，不 requeue
-                            if msg.msg_id:
-                                self._dispatched_ids.add(msg.msg_id)
-                            self._retry_tracker.pop(msg.msg_id, None)
-                            self.scheduler.reset_to_idle()
-                            self._dispatch_event.set()  # 立即触发下一轮
-                            self._stall_recovery_count = 0  # 成功 discard 后重置计数
-                            # P0-L3: backoff exhausted -> trim stuck session
-                            await self._call_adapter_trim()
-                        else:
-                            delay = [2, 4, 8][rt - 1]
-                            self.logger.info(f" [{msg.msg_id[:8]}] 退避 {rt}/3, delay={delay}s")
-                            self.queue.nack(msg.msg_id, "retry")
-                            self.scheduler.reset_to_idle()  # 退避期间释放 BUSY，恢复调度
-                            await asyncio.sleep(delay)
-                            self._dispatch_event.set()  # 退避完成后立即触发下一轮调度
-
-                    except Exception as e:
-                        if "agent_unreachable" in str(e):
-                            self.scheduler.on_degrade()
-                            self.queue.nack(msg.msg_id, "agent_unreachable")
-                            self.logger.warning(f"🔌 [{self.agent_id}] Agent 不可达（exit=4），暂停投递")
-                            await self.transport.emit_health("agent_unreachable", msg.msg_id[:8], "exit=4")
+                                    # P0-D: 空响应 → 原地重试
+                                    self.logger.warning(f" [{msg.msg_id[:8]}] 空响应 (attempt {attempt+1}/3)")
+                                    if attempt == 2:
+                                        self.queue.ack(msg.msg_id)
+                                        if msg.msg_id:
+                                            self._dispatched_ids.add(msg.msg_id)
+                                        self.scheduler.on_processing_done()
+                                        self._dispatch_event.set()
+                                        self._stall_recovery_count = 0
+                                        self._retry_tracker.pop(msg.msg_id, None)
+                                        self._save_retry_counts()
+                                        delivered = True
+                                        break
+                                    delay = [2, 4, 8][attempt]
+                                    self.logger.info(f" [{msg.msg_id[:8]}] 退避 {attempt+1}/3 (空响应), delay={delay}s")
+                                    await asyncio.sleep(delay)
+                                    continue
+                                # ── 成功 ──
+                                self.scheduler.on_processing_done()
+                                if msg.msg_id:
+                                    self._dispatched_ids.add(msg.msg_id)
+                                self.queue.ack(msg.msg_id)
+                                self._stall_recovery_count = 0
+                                self._retry_tracker.pop(msg.msg_id, None)
+                                self._save_retry_counts()
+                                delivered = True
+                                break
+                            except DegradeError:
+                                self.scheduler.on_degrade()
+                                self.queue.nack(msg.msg_id, "degrade")
+                                self.logger.warning(f"⚠️  [{self.agent_id}] adapter 降级，停止投递")
+                                await self.transport.emit_health("degrade", msg.msg_id[:8], "adapter DEGRADE")
+                                self._dispatch_event.set()
+                                delivered = True
+                                break
+                            except HumanInterventionError:
+                                self.scheduler.on_human_intervention()
+                                self.queue.nack(msg.msg_id, "human_intervention")
+                                self.logger.error(f"💀 [{self.agent_id}] FATAL exit=3, 永久停止 dispatch")
+                                await self.transport.emit_health("fatal", msg.msg_id[:8], "exit=3")
+                                self._dispatch_event.set()
+                                delivered = True
+                                break
+                            except RetryableError:
+                                if attempt == 2:
+                                    self.logger.warning(f" [{msg.msg_id[:8]}] 退避耗尽 (3次)，入死信")
+                                    self.queue.ack(msg.msg_id)
+                                    if msg.msg_id:
+                                        self._dispatched_ids.add(msg.msg_id)
+                                    self._retry_tracker.pop(msg.msg_id, None)
+                                    self.scheduler.on_processing_done()
+                                    self._dispatch_event.set()
+                                    self._stall_recovery_count = 0
+                                    self._save_retry_counts()
+                                    await self._call_adapter_trim()
+                                    delivered = True
+                                    break
+                                delay = [2, 4, 8][attempt]
+                                self.logger.info(f" [{msg.msg_id[:8]}] 退避 {attempt+1}/3, delay={delay}s")
+                                await asyncio.sleep(delay)
+                                # 原地重试，不 nack 回队！下轮 continue 继续
+                                continue
+                            except Exception as e:
+                                if "agent_unreachable" in str(e):
+                                    self.scheduler.on_degrade()
+                                    self.queue.nack(msg.msg_id, "agent_unreachable")
+                                    self.logger.warning(f"🔌 [{self.agent_id}] Agent 不可达（exit=4），暂停投递")
+                                    await self.transport.emit_health("agent_unreachable", msg.msg_id[:8], "exit=4")
+                                    self._dispatch_event.set()
+                                    if self._recover_task and not self._recover_task.done():
+                                        self.logger.debug(f"[{self.agent_id}] recover already in progress, skipping")
+                                    else:
+                                        self._recover_task = asyncio.create_task(self._call_adapter_recover())
+                                    delivered = True
+                                    break
+                                raise
+                        if not delivered:
+                            # 安全网：不应到达，但兜底释放调度器
+                            self.scheduler.on_processing_done()
                             self._dispatch_event.set()
-                            # P2: non-blocking recover
-                            if self._recover_task and not self._recover_task.done():
-                                self.logger.debug(f"[{self.agent_id}] recover already in progress, skipping")
-                            else:
-                                self._recover_task = asyncio.create_task(self._call_adapter_recover())
-                            break
-                        raise
-                    except HumanInterventionError:
-                        self.scheduler.on_human_intervention()
-                        self.queue.nack(msg.msg_id, "human_intervention")
-                        self.logger.error(f"💀 [{self.agent_id}] FATAL exit=3, 永久停止 dispatch")
-                        await self.transport.emit_health("fatal", msg.msg_id[:8], "exit=3")
-                        self._dispatch_event.set()
-                        break
                     except Exception as e:
-                        self.logger.error(f"投递异常 [{msg.msg_id[:8]}]: {e}")
+                        self.logger.error(f"投递循环异常 [{msg.msg_id[:8]}]: {e}")
             except Exception as e:
                 self.logger.error(f"投递循环异常: {e}")
                 await asyncio.sleep(5)

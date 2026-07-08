@@ -171,7 +171,7 @@ cat > "$PLIST_FILE" <<PLEOF
     <string>com.aim.agent.$AGENT_ID</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/python3.13</string>
+        <string>/usr/local/bin/python3</string>
         <string>aim-client/main.py</string>
         <string>--mode</string>
         <string>direct</string>

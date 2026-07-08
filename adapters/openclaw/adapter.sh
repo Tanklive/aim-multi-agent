@@ -16,8 +16,8 @@ shift 2>/dev/null || true
 # ── ADAPTER-PROTOCOL v1.0: JSON stdin/stdout ──
 if [ "$MODE" = "process" ] && [ ! -t 0 ]; then
     INPUT=$(cat)
-    if echo "$INPUT" | python3.13 -c "import json,sys; d=json.load(sys.stdin); print(d.get('action',''))" 2>/dev/null | grep -qx 'process'; then
-        echo "$INPUT" | python3.13 -c "
+    if echo "$INPUT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('action',''))" 2>/dev/null | grep -qx 'process'; then
+        echo "$INPUT" | python3 -c "
 import json, sys, subprocess
 d = json.load(sys.stdin)
 msg = d.get('message', '')
@@ -127,7 +127,7 @@ REPLY=$("$OPENCLAW_BIN" agent \
     --agent aim-reply \
     --session-key "$SESSION_KEY" \
     --message "${PROMPT}" \
-    --json --timeout 45 2>/dev/null | python3.13 -c "
+    --json --timeout 45 2>/dev/null | python3 -c "
 import sys,json
 try:
     d=json.load(sys.stdin)

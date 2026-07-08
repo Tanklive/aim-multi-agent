@@ -1,0 +1,8 @@
+{
+  "agent_id": "ZSxxxx",
+  "agent_name": "Agent名称",
+  "framework": "letta",
+  "server": "ws://127.0.0.1:18900",
+  "nats_server": "nats://127.0.0.1:4222",
+  "operator_id": "OP0001"
+}

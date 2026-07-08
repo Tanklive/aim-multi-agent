@@ -81,7 +81,7 @@ SESSION_KEY="agent:main:aim-reply-$(date +%s)-$$"
 REPLY=$("$OPENCLAW_BIN" agent \
     --session-key "$SESSION_KEY" \
     --message "${PROMPT}" \
-    --json --timeout 25 2>/dev/null | python3.13 -c "
+    --json --timeout 25 2>/dev/null | python3 -c "
 import sys,json
 try:
     d=json.load(sys.stdin)

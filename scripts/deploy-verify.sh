@@ -135,7 +135,7 @@ TARGET=ZS0003
 TEST_MSG="E2E-DEPLOY-VERIFY-$(date +%s)"
 
 echo "  📤 发送测试 DM → $TARGET ..."
-result=$(python3.13 "$SEND_SCRIPT" "$TARGET" "$TEST_MSG" 2>&1)
+result=$(python3 "$SEND_SCRIPT" "$TARGET" "$TEST_MSG" 2>&1)
 msg_id=$(echo "$result" | grep -o 'msg_id: [a-f0-9]\{12\}' | awk '{print $2}')
 
 if [ -n "$msg_id" ]; then

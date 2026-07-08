@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.13
+#!/usr/bin/env python3
 """AIM Client — 统一通信终端
 
 OAS 基础设施核心组件。
@@ -544,7 +544,7 @@ class AIMClient:
                                 if now - last < self._grp_cooldown_sec:
                                     self.logger.debug(f" [{msg.msg_id[:8]}] 群聊回复跳过（冷却 {now-last:.0f}s/{self._grp_cooldown_sec}s）")
                                 elif self._is_confirm_loop(msg, reply):
-                                    self.logger.info(f" [{msg.msg_id[:8]}] 群聊确认循环跳过: in={msg.text[:20]} out={reply[:20]}")
+                                    self.logger.info(f" [{msg.msg_id[:8]}] 群聊确认循环跳过: in={msg.content[:20]} out={reply[:20]}")
                                 else:
                                     self._last_grp_reply[msg.grp_id] = now
                                     await self.transport.send_grp(msg.grp_id, reply)
@@ -1041,9 +1041,15 @@ class AIMClient:
         elif rc == 4:
             # AGENT_UNREACHABLE（exit=4）：agent数据不在磁盘/框架崩溃 → DEGRADE+可恢复
             raise DegradeError(f"[agent_unreachable] {stderr_text}" if stderr_text else "agent unreachable")
+        elif rc in (124, 125, 126, 127, 137, 143):
+            # 124/137/143: 进程被信号杀死（超时/SIGKILL/SIGTERM） — 可重试
+            # 125-127: shell 执行错误（非 adapter 自身问题）— 可重试
+            self.logger.warning(f"exit={rc} (signal/shell error): {stderr_text[:100]}")
+            raise RetryableError(stderr_text or f"adapter exit={rc}")
         else:
-            # 5+ UNKNOWN → 按 FATAL 处理（未知即不安全）
-            raise HumanInterventionError(f"unknown exit={rc}: {stderr_text[:100]}")
+            # 其他 UNKNOWN → 可重试（不 break dispatch loop）
+            self.logger.warning(f"unknown exit={rc}: {stderr_text[:100]}, 按可重试处理")
+            raise RetryableError(stderr_text or f"adapter unknown exit={rc}")
 
     # -- NATS 回调 (SDK 签名: handler(envelope_dict, raw_msg)) --
 

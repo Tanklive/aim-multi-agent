@@ -1,0 +1,67 @@
+{
+  "agent_id": "ZS0003",
+  "agent_name": "小火鸡儿",
+  "protocol_version": "1.0",
+  "version": "1.5.0",
+  "nats_server": "nats://127.0.0.1:4222",
+  "creds_path": "~/.aim/agents/ZS0003/aim.creds",
+  "framework": "letta",
+  "execution_model": "deferred",
+  "adapter_cmd": "~/.aim/agents/ZS0003/adapter.sh",
+  "adapter_timeout": 120,
+  "mention_names": [
+    "ZS0003",
+    "小火鸡儿",
+    "火鸡儿"
+  ],
+  "security": {
+    "allowlist": [
+      "ZS0001",
+      "ZS0002",
+      "ZS0003"
+    ],
+    "allow_grp": [
+      "grp_trio"
+    ]
+  },
+  "heartbeat": {
+    "interval_ms": 30000,
+    "timeout_ms": 120000
+  },
+  "launchd": {
+    "auto_manage": true,
+    "keep_alive": true
+  },
+  "healthd": {
+    "auto_ensure": true,
+    "check_interval_s": 30
+  },
+  "notification": {
+    "channel": [
+      "file",
+      "system_event"
+    ],
+    "watch_interval_s": 5
+  },
+  "log": {
+    "level": "info"
+  },
+  "queue": {
+    "max_age_ms": 3600000,
+    "ack_timeout_ms": 300000,
+    "capacity": 1000,
+    "max_retries": 3
+  },
+  "queue_persist_path": "~/.aim/agents/ZS0003/queue.jsonl",
+  "queue_processor": {
+    "enabled": true,
+    "poll_interval_s": 1
+  },
+  "max_msg_age_sec": 900,
+  "stall_watchdog_sec": 120,
+  "grp_reply_cooldown_sec": 30,
+  "dispatch_conv_pool_size": 3,
+  "python_bin": "/usr/local/bin/python3",
+  "letta_bin": "/Users/yangzs/.npm-global/bin/letta",
+  "letta_agent_id": "agent-local-6c75d7a2-0a32-46da-9ea3-a97092ea9cb1"
+}

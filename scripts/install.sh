@@ -56,7 +56,7 @@ banner() {
 
 check_python() {
     log_step "检查 Python 环境..."
-    for cmd in python3.14 python3.13 python3.12 python3.11 python3.10 python3 python; do
+    for cmd in python3.14 python3 python3.12 python3.11 python3.10 python3 python; do
         if command -v "$cmd" &>/dev/null; then
             version=$("$cmd" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+')
             major=$(echo "$version" | cut -d. -f1)

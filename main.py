@@ -155,12 +155,15 @@ def setup_logging(agent_id: str) -> logging.Logger:
     fh = RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=3)
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)-5s] %(message)s", datefmt="%H:%M:%S"))
+    # 只保留 FileHandler；StreamHandler 已移除（shell 用 2>&1 捕获 stderr，
+    # 同时保留 StreamHandler 会导致每行日志在文件中出现两次）
     logger.addHandler(fh)
-
-    sh = logging.StreamHandler(sys.stderr)
-    sh.setLevel(logging.INFO)
-    sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)-5s] %(message)s", datefmt="%H:%M:%S"))
-    logger.addHandler(sh)
+    # Debug 输出走 stdout（不双写，shell 不重定向时不丢调试信息）
+    dh = logging.StreamHandler(sys.stdout)
+    dh.setLevel(logging.DEBUG)
+    dh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)-5s] %(message)s", datefmt="%H:%M:%S"))
+    if os.environ.get("AIM_LOG_NO_CONSOLE"):
+        dh.setLevel(logging.CRITICAL)  # 静默
     return logger
 
 
@@ -241,12 +244,20 @@ class Transport:
         self._logger.info(f" 已订阅群聊: aim.grp.{group_id}")
 
     async def send_dm(self, to_id: str, text: str):
-        """发送私聊消息"""
-        await self._sdk.send_dm(to_id, text)
+        """发送私聊消息 + 送达确认"""
+        envelope = await self._sdk.send_dm(to_id, text)
+        if isinstance(envelope, dict) and "id" in envelope:
+            self._my_msg_ids.add(envelope["id"])  # U-007: 追踪发出的消息
+            await self.emit_delivery(to_id, envelope["id"], via="dm")
+        return envelope
 
     async def send_grp(self, group_id: str, text: str):
-        """发送群聊消息"""
-        await self._sdk.send_grp(group_id, text)
+        """发送群聊消息 + 送达确认"""
+        result = await self._sdk.send_grp(group_id, text)
+        if isinstance(result, dict) and "id" in result:
+            self._my_msg_ids.add(result["id"])  # U-007: 追踪发出的消息
+            await self.emit_delivery(group_id, result["id"], via="grp")
+        return result
 
     async def authenticate(self) -> bool:
         return True
@@ -257,6 +268,30 @@ class Transport:
             await self._sdk.emit_obs(status, msg_id, detail)
         except Exception as e:
             self._logger.debug(f"emit_obs 失败: {e}")
+
+    async def emit_health(self, status: str, msg_id: str = "", detail: str = ""):
+        """发布健康监控事件到 aim.health.>（healthd 消费，不耗 token）"""
+        try:
+            import json, time, uuid
+            event = {
+                "agent_id": self.agent_id,
+                "status": status,
+                "msg_id": msg_id,
+                "detail": detail,
+                "ts": time.time(),
+                "nonce": uuid.uuid4().hex[:8],
+            }
+            await self._sdk.nc.publish(f"aim.health.{self.agent_id}", json.dumps(event).encode())
+        except Exception as e:
+            self._logger.debug(f"emit_health 失败: {e}")
+
+    async def emit_delivery(self, to_id: str, envelope_id: str, via: str = "dm"):
+        """推送送达确认事件（observer 可见但不进 dispatch）
+        U-006 fix: detail 人可读不丢 JSON，observer 格式干净
+        """
+        import time
+        mid = envelope_id[:8] if len(envelope_id) >= 8 else envelope_id
+        # await self._sdk.emit_obs("delivered", mid, f"→ {to_id} via {via}")  # 2026-06-21 禁用以省带宽
 
     async def send_registry_health_report(self, health: dict):
         return await self.request("aim.registry.health_report", {
@@ -294,7 +329,7 @@ class Transport:
 
     async def verify_peer(self, peer_id: str) -> bool:
         cfg = load_global_config()
-        peers = cfg.get("trusted_peers", ["ZS0001"])
+        peers = cfg.get("trusted_peers", [])
         return peer_id in peers
 
     async def request(self, subject: str, payload: dict, timeout: float = 5.0) -> dict:
@@ -362,6 +397,7 @@ class AIMClient:
         # 以父进程环境打底（必须！空 dict 会清空 PATH/HOME 等）
         self.adapter_env: dict[str, str] = dict(os.environ)
         self._degrade_history = deque(maxlen=100)  # P1-2: (ts, exit_code) 窗口
+        self._init_loop_state()  # 循环检测追踪
         for config_key in ("letta_bin", "letta_agent_id"):
             val = self.config.get(config_key)
             if val:
@@ -378,12 +414,17 @@ class AIMClient:
         # 619-18: 群聊回路防护冷却（从 config 读取，默认30s）
         self._grp_cooldown_sec = self.config.get("grp_reply_cooldown_sec", 30.0)
         self._last_grp_reply: dict[str, float] = {}
-        self._seen_msg_keys: dict[str, float] = {}  # NATS at-least-once 内容去重 (key→timestamp)
+        self._seen_msg_keys: dict[str, float] = {}  # 内容去重 (from_id:content[:200]→timestamp)
+        self._processed_ids: set = set()  # U-005: msg_id L1 去重（接收时）
+        self._dispatched_ids: set = set()  # U-006: 已 dispatch 去重（发送 adapter 后）
+        self._my_msg_ids: set = set()  # U-007: 本 Agent 发出的消息 ID，用于群聊 reply_to 过滤
         # 619-20: StallWatchdog — 检测 dispatch_loop 假死
         self._last_dispatch_time: float = 0.0
         self._stall_timeout_sec = self.config.get("stall_watchdog_sec", 30.0)
         self._stall_recovery_count: int = 0  # 619-20: 连续自愈计数（>3 次则丢弃卡死消息）
         self._retry_tracker: dict[str, int] = {}  # P0: exit=1 退避, msg_id → retry_count
+        self._retry_persist_path = (Path.home() / ".aim" / "agents" / self.agent_id / "retry.json")  # P0-D: 持久化
+        self._load_retry_counts()  # P0-D: 启动时恢复
         self._last_recover_at: float = 0.0  # P0-L3: recover cooldown (60s)
         self._last_trim_at: float = 0.0  # P0-L3: trim cooldown (30s)
         # 620: 自适应 stalled 阈值 (基于 queue depth)
@@ -427,7 +468,8 @@ class AIMClient:
                 now_wd = _t619_wd.time()
                 # 620: 使用计算后的自适应阈值
                 stall_timeout_check = max(self._stall_timeout_sec, stall_timeout)
-                if self._last_dispatch_time > 0 and now_wd - self._last_dispatch_time > stall_timeout_check:
+                if (self.queue.size() > 0 and
+                    (self._last_dispatch_time == 0 or now_wd - self._last_dispatch_time > stall_timeout_check)):
                     if self.queue.size() > 0:
                         self._stall_recovery_count += 1
                         self.logger.warning(
@@ -452,6 +494,19 @@ class AIMClient:
                     msg = self.queue.dequeue()
                     if not msg:
                         break
+                    # U-006: 出队去重用独立 _dispatched_ids，不与接收时 L1 _processed_ids 冲突
+                    if msg.msg_id and msg.msg_id in self._dispatched_ids:
+                        self.logger.debug(f" [DEDUP DEQUEUE] msg_id={msg.msg_id[:8]} 已 dispatch, ack跳过")
+                        self.queue.ack(msg.msg_id)
+                        continue
+                    # P0-D: 毒消息跳过（retry>=3 持久化，重启后跳过）
+                    if msg.msg_id and self._retry_tracker.get(msg.msg_id, 0) >= 3:
+                        self.logger.warning(f" [{msg.msg_id[:8]}] 毒消息 retry={self._retry_tracker[msg.msg_id]}, skip→死信")
+                        self.queue.ack(msg.msg_id)
+                        if msg.msg_id:
+                            self._dispatched_ids.add(msg.msg_id)
+                        self._dispatch_event.set()
+                        continue
                     self._last_dispatch_time = _t619_wd.time()  # 记录最近投递时间
                     self.scheduler.on_dispatch_started()
                     self.logger.info(f"投递: {msg.msg_id[:8]} from={msg.from_id}")
@@ -460,6 +515,11 @@ class AIMClient:
                     except Exception:
                         pass
                     try:
+                        # ── 免 LLM 消息：系统通知和确认消息不烧 token ──
+                        if self._skip_adapter_for_operational(msg):
+                            self.logger.debug(f" [{msg.msg_id[:8]}] 免LLM跳过: from={msg.from_id}")
+                            self.queue.ack(msg.msg_id)
+                            continue
                         reply = await self._call_adapter(msg)
                         if reply:
                             if msg.grp_id:
@@ -469,12 +529,21 @@ class AIMClient:
                                 last = self._last_grp_reply.get(msg.grp_id, 0)
                                 if now - last < self._grp_cooldown_sec:
                                     self.logger.debug(f" [{msg.msg_id[:8]}] 群聊回复跳过（冷却 {now-last:.0f}s/{self._grp_cooldown_sec}s）")
+                                elif self._is_confirm_loop(msg, reply):
+                                    self.logger.info(f" [{msg.msg_id[:8]}] 群聊确认循环跳过: in={msg.text[:20]} out={reply[:20]}")
                                 else:
                                     self._last_grp_reply[msg.grp_id] = now
                                     await self.transport.send_grp(msg.grp_id, reply)
                             else:
                                 await self.transport.send_dm(msg.from_id, reply)
+                        else:
+                            # P0-D: 空响应校验 — adapter rc=0 但空回复 = 疑似假成功
+                            self.logger.warning(f" [{msg.msg_id[:8]}] 空响应: adapter rc=0 但无输出, 视为可重试")
+                            raise RetryableError("adapter 空响应")
                         self.scheduler.on_processing_done()
+                        # U-006: 标记已 dispatch，防止回队重复处理
+                        if msg.msg_id:
+                            self._dispatched_ids.add(msg.msg_id)
                         self.queue.ack(msg.msg_id)
                         self._stall_recovery_count = 0  # 620-01: 成功投递才清零
                         self._retry_tracker.pop(msg.msg_id, None)  # 退避跟踪清除
@@ -483,7 +552,7 @@ class AIMClient:
                         self.queue.nack(msg.msg_id, "degrade")
                         # 619-11: 降级告警
                         self.logger.warning(f"⚠️  [{self.agent_id}] adapter 降级，停止投递")
-                        await self.transport.emit_obs("degrade", msg.msg_id[:8], f"adapter={self.agent_id}")
+                        await self.transport.emit_health("degrade", msg.msg_id[:8], "adapter DEGRADE")
                         # FIX(2026-06-19): break 后必须重置事件，否则永久阻塞（火鸡儿发现）
                         self._dispatch_event.set()
                         break
@@ -492,9 +561,12 @@ class AIMClient:
                         self.scheduler.on_retry()
                         rt = self._retry_tracker.get(msg.msg_id, 0) + 1
                         self._retry_tracker[msg.msg_id] = rt
+                        self._save_retry_counts()  # P0-D: 持久化 retry_count
                         if rt >= 3:
                             self.logger.warning(f" [{msg.msg_id[:8]}] 退避耗尽 ({rt}次)，入死信")
                             self.queue.ack(msg.msg_id)  # ack 移除，不 requeue
+                            if msg.msg_id:
+                                self._dispatched_ids.add(msg.msg_id)
                             self._retry_tracker.pop(msg.msg_id, None)
                             self.scheduler.reset_to_idle()
                             self._dispatch_event.set()  # 立即触发下一轮
@@ -512,7 +584,7 @@ class AIMClient:
                             self.scheduler.on_degrade()
                             self.queue.nack(msg.msg_id, "agent_unreachable")
                             self.logger.warning(f"🔌 [{self.agent_id}] Agent 不可达（exit=4），暂停投递")
-                            await self.transport.emit_obs("agent_unreachable", msg.msg_id[:8], f"adapter={self.agent_id}")
+                            await self.transport.emit_health("agent_unreachable", msg.msg_id[:8], "exit=4")
                             self._dispatch_event.set()
                             # P2: non-blocking recover
                             if self._recover_task and not self._recover_task.done():
@@ -525,7 +597,7 @@ class AIMClient:
                         self.scheduler.on_human_intervention()
                         self.queue.nack(msg.msg_id, "human_intervention")
                         self.logger.error(f"💀 [{self.agent_id}] FATAL exit=3, 永久停止 dispatch")
-                        await self.transport.emit_obs("fatal", msg.msg_id[:8], "dispatch stopped")
+                        await self.transport.emit_health("fatal", msg.msg_id[:8], "exit=3")
                         self._dispatch_event.set()
                         break
                     except Exception as e:
@@ -577,6 +649,20 @@ class AIMClient:
         self.running = True
         self.logger.info(f" {self.agent_id} AIM Client v{_AIM_VERSION} 启动完成")
 
+        # NOTICE 1.3.0: 运行时版本检查（拒绝低于最低要求的 SDK）
+        _MIN_SDK = "1.3.0"
+        def _ver_tuple(v: str):
+            return tuple(int(x) for x in v.strip().split("."))
+        try:
+            from packaging.version import Version
+            _ver_ok = Version(_AIM_VERSION) >= Version(_MIN_SDK)
+        except ImportError:
+            _ver_ok = _ver_tuple(_AIM_VERSION) >= _ver_tuple(_MIN_SDK)
+        if not _ver_ok:
+            self.logger.error(f"SDK version {_AIM_VERSION} < {_MIN_SDK}，启动中止")
+            self.running = False
+            return
+
         # 初始化持久化队列（恢复未 ack 消息）
         # 按 agent_id 分文件，避免三方 Agent 互踩（v1.3.0 bug 修复 2026-06-19）
         persist_path = self.config.get("queue_persist_path")
@@ -608,14 +694,33 @@ class AIMClient:
                 new_state = report.status.name if hasattr(report, 'status') else str(report.status)
                 if new_state != _last_state and new_state in ("BUSY", "DEGRADE", "OFFLINE"):
                     self.logger.warning(f"⚠️  [{self.agent_id}] adapter {_last_state}→{new_state}")
-                    await self.transport.emit_obs("state_change", "", f"{_last_state}→{new_state}")
+                    await self.transport.emit_health("state_change", "", f"{_last_state}→{new_state}")
+
                 _last_state = new_state
                 if not prev_can and self.scheduler.should_dispatch():
                     self._dispatch_event.set()
-                # Observer 事件推送：心跳
-                await self.transport.emit_obs("heartbeat", "", "alive")
+                # ── 0-ack 告警（项6）：队列堆积但无处理进展 → observer 事件 ──
+                qsize = self.queue.size()
+                prev_qsize = getattr(self, '_prev_queue_size', 0)
+                self._prev_queue_size = qsize
+                # 队列有货 且 数量未减少（无 ack 消化）
+                if qsize > 0 and qsize >= prev_qsize:
+                    zs = getattr(self, '_zero_ack_streak', 0) + 1
+                    self._zero_ack_streak = zs
+                else:
+                    self._zero_ack_streak = 0
+                if self._zero_ack_streak >= 3 and qsize > 0:
+                    self.logger.warning(f"⚠️ 0-ack: queue={qsize} pending, {self._zero_ack_streak} 周期未消化")
+                    now = time.time()
+                    last_emit = getattr(self, '_last_0ack_emit', 0)
+                    if now - last_emit > 300:
+                        self._last_0ack_emit = now
+                        await self.transport.emit_health("0-ack", "", f"queue={qsize} streak={self._zero_ack_streak}")
+
                 # Registry 心跳：更新 last_seen
                 await self.transport.send_registry_heartbeat()
+                # 健康心跳（推送到 healthd，不耗 token）
+                await self.transport.emit_health("heartbeat", "", "alive")
                 # P1: 上报健康快照到 Registry KV
                 h = {
                     'adapter_ok': report.status.name != 'OFFLINE',
@@ -639,6 +744,54 @@ class AIMClient:
             self._degrade_history.popleft()
         count = sum(1 for _, ec in self._degrade_history if ec == 2)
         return count >= DEGRADE_WINDOW_COUNT
+
+    # ── 确认循环检测 ───────────────────────────────
+    CONFIRM_WORDS = {"收到", "1", "✅", "👍", "👂", "收到 ✅", "收到 👍", "ok", "OK", "Ok", "done", "Done", "好", "嗯", "哦", "✓", "✔"}
+    CONFIRM_MAX_LEN = 20
+    # U-006: 信号/测试消息关键词 — 不调 adapter，零 token 消耗
+    SIGNAL_PATTERNS = {"TEST-", "TEST_", "LOG-FIX-", "INVOKE-", "STACKTRACE-", "LOCK-TEST", "DEDUP-", "PING", "通信正常", "通道打通", "回执确认", "通道确认"}
+    # 系统发送者：消息不应经过 LLM
+    SYSTEM_SENDERS_SET = {"alertd", "registry", "aim-watch", "observer"}
+    # 社交结束语：纯礼貌用语，不需 LLM 处理
+    SOCIAL_CLOSE = {"晚安", "再见", "拜拜", "明天见", "辛苦", "好梦", "早点休息", "养足精神"}
+
+    def _skip_adapter_for_operational(self, msg) -> bool:
+        """免 LLM：系统通知/确认消息/测试信号/群聊 ACK 不调 adapter，零 token 消耗"""
+        # 系统发送者
+        if msg.from_id in self.SYSTEM_SENDERS_SET:
+            return True
+        text = (msg.content or "").strip()
+        # 纯确认消息（扩宽到 20 字）
+        if len(text) <= self.CONFIRM_MAX_LEN and (
+            text in self.CONFIRM_WORDS or any(w in text for w in self.CONFIRM_WORDS if len(w) > 1)
+        ):
+            return True
+        # 信号/测试消息（零 token）
+        if any(p in text for p in self.SIGNAL_PATTERNS):
+            return True
+        # 群聊特殊: 以 🐤 或 ✨🐴✨ 开头的短消息 = Agent ACK
+        if msg.grp_id and len(text) <= 60:
+            if text.startswith("🐤") or text.startswith("✨🐴✨") or text.startswith("🐸"):
+                # 检查是否是纯 ACK（不含实质请求）
+                if text in self.CONFIRM_WORDS or any(w in text for w in ("收到", "ok", "OK", "Ok", "1")):
+                    return True
+        # 社交结束语（短 + 含结束词）
+        if len(text) <= 50 and any(w in text for w in self.SOCIAL_CLOSE):
+            return True
+        return False
+
+    def _is_confirm_loop(self, msg, reply: str) -> bool:
+        """检测群聊确认死锁：入站是简短确认 + 出站也是简短确认 → 跳过回复"""
+        in_text = (msg.content or "").strip()
+        out_text = reply.strip()
+        # 入站和出站都是确认
+        in_confirm = len(in_text) <= self.CONFIRM_MAX_LEN and (
+            in_text in self.CONFIRM_WORDS or any(w in in_text for w in self.CONFIRM_WORDS if len(w) > 1)
+        )
+        out_confirm = len(out_text) <= self.CONFIRM_MAX_LEN and (
+            out_text in self.CONFIRM_WORDS or any(w in out_text for w in self.CONFIRM_WORDS if len(w) > 1)
+        )
+        return in_confirm and out_confirm
 
     async def _call_adapter_recover(self) -> bool:
         """Call adapter.sh recover, returns True if backend recovered.
@@ -755,14 +908,61 @@ class AIMClient:
             self.logger.error(
                 f"💀 [L3] {self.agent_id} 自修复连续 {n} 次失败，永久停止自修复"
             )
-            # 通过 observer 发布 stalled 告警，alertd 将升级为 CRITICAL
+            # 通过 health 通道发布 stalled 告警
             asyncio.ensure_future(
-                self.transport.emit_obs(
+                self.transport.emit_health(
                     "stalled",
                     "",
                     f"自修复连续{n}次失败，已停止。最后原因: {reason}"
                 )
             )
+
+    # ── 循环检测（行为模式，非关键词）──
+    _LOOP_WINDOW_SEC = 60
+    _LOOP_REPEAT_THRESHOLD = 3        # 同一 (from_id, 短内容) 窗口内 ≥3 次 → 视为循环
+    _LOOP_CONTENT_MAX_LEN = 20        # 只有短消息参与循环检测
+
+    def _init_loop_state(self):
+        """初始化循环追踪状态（在 __init__ 中调用）"""
+        # {(from_id, content_fingerprint): deque[timestamp]}
+        self._loop_tracker: dict = {}
+
+    def _check_loop(self, from_id: str, content: str, msg_id: str) -> bool:
+        """检测消息是否处于循环中（行为模式：同发送者+同短内容高频重复）
+
+        大哥原则：不看固定词汇，看行为——同一来源反复发同样的短消息。
+        真正的对话（如"收到，确认我的归属项：…"）不会重复，不会被误杀。
+        """
+        import time as _time
+        now = _time.time()
+        text = content.strip()
+
+        # 只追踪短消息（长消息几乎不可能进入循环）
+        if len(text) > self._LOOP_CONTENT_MAX_LEN:
+            return False
+
+        # 指纹：from_id + 内容前 20 字
+        key = (from_id, text[:20])
+        dq = self._loop_tracker.get(key)
+        if dq is None:
+            dq = __import__("collections").deque(maxlen=50)
+            self._loop_tracker[key] = dq
+
+        # 清理过期
+        cutoff = now - self._LOOP_WINDOW_SEC
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+
+        dq.append(now)
+        count = len(dq)
+
+        if count >= self._LOOP_REPEAT_THRESHOLD:
+            self.logger.warning(
+                f" [{msg_id[:8]}] 🔁 循环检测: from={from_id} cnt={count}/{self._LOOP_WINDOW_SEC}s "
+                f"content={text[:30]!r}"
+            )
+            return True
+        return False
 
     async def _call_adapter(self, msg: Message) -> Optional[str]:
         """调用 adapter.sh process，返回回复文本
@@ -776,6 +976,10 @@ class AIMClient:
             DegradeError: exit=2
             HumanInterventionError: exit=3
         """
+        # ── 循环抑制：同来源同内容高频重复 → 静默跳过 ──
+        if self._check_loop(msg.from_id, msg.content, msg.msg_id):
+            return None
+
         safe_content = msg.content.replace("'", "'\\''")
         cmd = f"bash {self.adapter_cmd} process --from '{msg.from_id}' --message '{safe_content}'"
         proc = await asyncio.create_subprocess_shell(
@@ -829,20 +1033,68 @@ class AIMClient:
 
     # -- NATS 回调 (SDK 签名: handler(envelope_dict, raw_msg)) --
 
+    # ── P0-D: retry_count 持久化 ──
+    def _load_retry_counts(self):
+        """启动时从文件恢复 retry_count，避免重启后毒消息无限循环"""
+        try:
+            if self._retry_persist_path.exists():
+                with open(self._retry_persist_path) as f:
+                    data = json.load(f)
+                self._retry_tracker = data.get("retry_counts", {})
+                stale_before = data.get("updated_at", 0)
+                # 超过 24h 的 retry count 过期清理
+                if time.time() - stale_before > 86400:
+                    self._retry_tracker = {}
+                    self.logger.info("retry_counts expired (>24h), cleared")
+                else:
+                    poison = [k[:8] for k, v in self._retry_tracker.items() if v >= 3]
+                    if poison:
+                        self.logger.warning(f"加载 {len(self._retry_tracker)} 条 retry_count, 毒消息: {poison}")
+                    else:
+                        self.logger.info(f"加载 {len(self._retry_tracker)} 条 retry_count")
+        except Exception as e:
+            self.logger.debug(f"加载 retry_counts 失败: {e}")
+            self._retry_tracker = {}
+
+    def _save_retry_counts(self):
+        """持久化 retry_count 到文件"""
+        try:
+            self._retry_persist_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._retry_persist_path, 'w') as f:
+                json.dump({"retry_counts": self._retry_tracker, "updated_at": time.time()}, f)
+        except Exception as e:
+            self.logger.warning(f"保存 retry_counts 失败: {e}")
+
+    @staticmethod
+    def _preview(envelope: dict, maxlen: int = 50) -> str:
+        """提取消息内容截断预览"""
+        text = envelope.get("payload", {}).get("text", "")
+        if not text:
+            return ""
+        return text[:maxlen] + ("…" if len(text) > maxlen else "")
+
     async def _on_dm(self, envelope: dict, raw_msg):
         from_id = envelope.get("from", envelope.get("from_id", ""))
-        self.logger.info(f" DM收到: from={from_id} id={str(envelope.get('id','?'))[:8]}")
+        mid = str(envelope.get('id','?'))[:8]
+        preview = self._preview(envelope, maxlen=50)
+        obs_text = self._preview(envelope, maxlen=500)
+        self.logger.info(f" DM收到: from={from_id} id={mid}")
         if from_id == self.agent_id:
             return
-        # Observer 事件推送：收到消息
-        await self.transport.emit_obs("received", str(envelope.get('id','?'))[:8], f"from={from_id}")
+        detail = f"from={from_id}" + (f" text={obs_text}" if obs_text else "")
+        # await self.transport.emit_obs("received", mid, detail)  # 2026-06-21 禁用以省带宽
         await self._handle_message(envelope, is_dm=True)
 
     async def _on_grp(self, envelope: dict, raw_msg):
         from_id = envelope.get("from", envelope.get("from_id", ""))
+        mid = str(envelope.get('id','?'))[:8]
+        preview = self._preview(envelope, maxlen=50)
+        obs_text = self._preview(envelope, maxlen=500)
         self.logger.info(f" GRP收到: from={from_id}")
         if from_id == self.agent_id:
             return
+        detail = f"from={from_id}" + (f" text={obs_text}" if obs_text else "")
+        # await self.transport.emit_obs("received", mid, detail)  # 2026-06-21 禁用以省带宽
         await self._handle_message(envelope, is_dm=False)
 
     async def _handle_message(self, envelope: dict, *, is_dm: bool):
@@ -854,16 +1106,29 @@ class AIMClient:
             detail = f"{sev} envelope from={envelope.get('from','?')} id={(envelope.get('id','?') or '?')[:8]}: {reason}"
             if sev == "hard" and self._reject_hard_errors:
                 self.logger.warning(f"🚫 [envelope] REJECT {detail}")
-                asyncio.ensure_future(self.transport.emit_obs("envelope_reject", "", detail))
                 return
             else:
                 self.logger.warning(f"⚠️ [envelope] WARN {detail} (violations={self._envelope_violations})")
-                asyncio.ensure_future(self.transport.emit_obs("envelope_warn", "", detail))
 
         payload = envelope.get("payload", {})
         content = payload.get("text", "")
         # 620: 移除 envelope.get("content") 容错回退，不合规格式已在上面告警
         if not content:
+            return
+
+        # ── 送达确认替代 ACK：短 ACK 不进 dispatch ──
+        # 传输层 NATS publish ack 已保证送达，应用层 ACK 是冗余
+        import re
+        stripped = content.strip()
+        # 去除 emoji/符号后提取纯文本
+        _text_only = re.sub(r'[^\w\s\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]', '', stripped).strip()
+        # 压缩空白后判断
+        _compact = re.sub(r'\s+', '', _text_only)
+        _ACK_PATTERNS = {"收到", "ok", "OK", "Ok", "done", "Done", "ack", "ACK", "Ack"}
+        _ACK_REPEATS = {"收到收到", "okok", "donedone", "ackack"}
+        if _text_only in _ACK_PATTERNS or (len(_compact) <= 10 and _compact in _ACK_REPEATS):
+            eid = (envelope.get("id", "?"))[:8]
+            self.logger.info(f" [{eid}] ACK skip: '{stripped[:20]}' (送达已由传输层确认)")
             return
 
         from_id = envelope.get("from", "")
@@ -872,23 +1137,47 @@ class AIMClient:
             return
         msg_id = envelope.get("id", str(uuid.uuid4()))
 
+        # ── U-007: 群聊 reply_to 过滤 ──
+        # 群聊消息若明确回复他人消息，而我方未发过该消息 → 跳过 dispatch（只 observe）
+        if not is_dm:
+            reply_to = (envelope.get("meta") or {}).get("reply_to", "")
+            if reply_to and reply_to not in self._my_msg_ids:
+                self.logger.debug(f" [GRP-FILTER] reply_to={reply_to[:8]} 非我方消息, 跳过 dispatch")
+                return
+
         # 安全过滤 — 认证链
         if not await self.security.authenticate(from_id, token=payload.get("token", ""), msg_id=msg_id, envelope=envelope):
             return
 
-        # 去重：NATS at-least-once 可能导致同一条消息重复投递（不同 msg_id 相同内容）
-        dedup_key = f"{from_id}:{content[:200]}"
+        # ── U-005 双层去重 ──
+        # L1: msg_id 级去重（精确，覆盖同一消息的重复投递）
+        msg_id = envelope.get("id", "")
+        if msg_id and msg_id in self._processed_ids:
+            self.logger.debug(f" [DEDUP L1] msg_id={msg_id[:8]} 已处理, 跳过")
+            return
         now_ts = time.time()
+        # L2: 内容去重（StallWatchdog 重投会换 msg_id，内容查重兜底）
+        dedup_key = f"{from_id}:{content[:200]}"
         if dedup_key in self._seen_msg_keys:
-            if now_ts - self._seen_msg_keys[dedup_key] < 5.0:
+            age = now_ts - self._seen_msg_keys[dedup_key]
+            if age < 120.0:  # U-005: 5s→120s，覆盖 StallWatchdog 30s 重试周期
+                self.logger.info(f" [DEDUP L2] from={from_id} content_dup age={age:.0f}s, 跳过")
                 return
+        # 记录
+        if msg_id:
+            self._processed_ids.add(msg_id)
         self._seen_msg_keys[dedup_key] = now_ts
         # 限制去重集合大小
+        if len(self._processed_ids) > 2000:
+            self._processed_ids = set(list(self._processed_ids)[-500:])
+        if len(self._dispatched_ids) > 2000:
+            self._dispatched_ids = set(list(self._dispatched_ids)[-500:])
+        if len(self._my_msg_ids) > 2000:
+            self._my_msg_ids = set(list(self._my_msg_ids)[-500:])
         if len(self._seen_msg_keys) > 500:
             old_keys = sorted(self._seen_msg_keys, key=lambda k: self._seen_msg_keys[k])[:250]
             for k in old_keys:
                 del self._seen_msg_keys[k]
-        msg_id = envelope.get("id", str(uuid.uuid4()))
 
         # Phase 1: 识别 Task
         is_task = payload.get("task") is not None or content.startswith("/task ")

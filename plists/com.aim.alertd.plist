@@ -17,7 +17,7 @@
 	<string>com.aim.alertd</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/local/bin/python3.13</string>
+		<string>/usr/local/bin/python3</string>
 		<string>/Users/yangzs/.aim/bin/alertd.py</string>
 		<string>--persist-events</string>
 	</array>

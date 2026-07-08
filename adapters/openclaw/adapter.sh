@@ -13,58 +13,13 @@ OPENCLAW_BIN="${OPENCLAW_BIN:-$HOME/.npm-global/bin/openclaw}"
 MODE="${1:-process}"
 shift 2>/dev/null || true
 
-# ── ADAPTER-PROTOCOL v1.0: JSON stdin/stdout ──
-if [ "$MODE" = "process" ] && [ ! -t 0 ]; then
-    INPUT=$(cat)
-    if echo "$INPUT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('action',''))" 2>/dev/null | grep -qx 'process'; then
-        echo "$INPUT" | python3 -c "
-import json, sys, subprocess
-d = json.load(sys.stdin)
-msg = d.get('message', '')
-from_id = d.get('from', 'unknown')
-session_id = d.get('session_id', '')
-timeout_ms = d.get('timeout_ms', 30000)
-
-prompt = f'你是呱呱🐸，来自 {from_id} 的消息。直接回复(20-80字)以🐸开头：{msg}'
-cmd = ['$OPENCLAW_BIN', 'agent', '--agent', 'aim-reply', '--session-key', 'agent:aim-reply:json-\$\$', '--message', prompt, '--json', '--timeout', str(int(min(45, timeout_ms/1000))) if timeout_ms else '45']
-try:
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=min(45, timeout_ms/1000))
-    reply_raw = result.stdout.strip()
-    if reply_raw:
-        try:
-            j = json.loads(reply_raw)
-            reply = j.get('result',{}).get('payloads',[{}])[0].get('text','')
-        except: reply = reply_raw[:500]
-    else:
-        reply = result.stderr.strip()[:500]
-    if reply:
-        print(json.dumps({'status':'ok','reply':reply,'session_id':session_id}, ensure_ascii=False))
-        sys.exit(0)
-    else:
-        print(json.dumps({'status':'ok','reply':f'🐸 收到(from={from_id}, adapter busy)','session_id':session_id}, ensure_ascii=False))
-        sys.exit(0)
-except subprocess.TimeoutExpired:
-    print(json.dumps({'status':'error','error':'timeout','error_code':'temp_fail'}, ensure_ascii=False))
-    sys.exit(1)
-except Exception as e:
-    print(json.dumps({'status':'ok','reply':f'🐸 收到(from={from_id}, adapter busy)','session_id':session_id}, ensure_ascii=False))
-    sys.exit(0)
-" 2>/dev/null
-        exit $?
-    fi
-fi
-
 # ── health ──
 if [ "$MODE" = "health" ]; then
-    # 直连 HTTP /health 端点，不走 openclaw CLI（避免 Gateway 单线程排队）
-    if curl -sf --max-time 5 http://127.0.0.1:18789/health >/dev/null 2>&1; then
-        echo '{"status":"healthy","active_sessions":1}'; exit 0
+    PID=$(ps aux | grep -v grep | grep "openclaw.*gateway" | awk '{print $2}' | head -1)
+    if [ -z "$PID" ] || ! kill -0 "$PID" 2>/dev/null; then
+        echo '{"status":"unhealthy"}' >&2; exit 2
     fi
-    # 兜底：curl 不可用时试 openclaw CLI
-    if "$OPENCLAW_BIN" gateway status 2>/dev/null | grep -q "Service:"; then
-        echo '{"status":"healthy","active_sessions":1}'; exit 0
-    fi
-    echo '{"status":"unhealthy"}' >&2; exit 2
+    echo '{"status":"healthy","active_sessions":1}'; exit 0
 fi
 
 # ── info ──
@@ -120,26 +75,37 @@ else
     PROMPT="${BASE}。直接回复(20-80字)以🐸开头：${MESSAGE}"
 fi
 
-# 独立 aim-reply agent + 独立 session，不阻塞 webchat 主会话
-SESSION_KEY="agent:aim-reply:reply-$(date +%s)-$$"
+# 独立 session key 隔离，不阻塞主会话（等同 hermes chat -q 新进程）
+SESSION_KEY="agent:main:aim-reply-$(date +%s)-$$"
 
+# 错误日志路径
+ERR_LOG="${AIM_HOME}/aim-adapter-errors.log"
+
+# 调用 OpenClaw，stderr 重定向到日志文件方便排障
 REPLY=$("$OPENCLAW_BIN" agent \
-    --agent aim-reply \
     --session-key "$SESSION_KEY" \
     --message "${PROMPT}" \
-    --json --timeout 45 2>/dev/null | python3 -c "
+    --json --timeout 25 2>>"$ERR_LOG" | python3 -c "
 import sys,json
 try:
     d=json.load(sys.stdin)
     t=d.get('result',{}).get('payloads',[{}])[0].get('text','')
     print(t)
-except: pass
+except Exception as e:
+    print(f'JSON_PARSE_ERROR: {type(e).__name__}: {e}', file=sys.stderr)
+except KeyboardInterrupt:
+    pass
 " 2>/dev/null)
+
+# 检测 OpenClaw 返回的错误消息（LLM 超时等），让调度器退避重试
+if echo "$REPLY" | grep -qE '^(LLM request failed\.|Request timed out|LLM request timed out)' 2>/dev/null; then
+    echo "$REPLY" >&2; exit 1  # 退避重试
+fi
 
 if [ -n "$REPLY" ]; then
     echo "$REPLY"; exit 0
 else
-    # fallback: 返回确认文本避免重试风暴，stderr打告警供监控
-    echo "🐸 收到(from=${FROM_ID}，adapter busy)"
-    echo "OpenClaw 无回复 (degraded)" >&2; exit 0
+    # 输出最近错误供 main.py 日志使用
+    LAST_ERR=$(tail -3 "$ERR_LOG" 2>/dev/null | tr '\n' ' | ')
+    echo "OpenClaw 无回复 (last_err=${LAST_ERR})" >&2; exit 1
 fi

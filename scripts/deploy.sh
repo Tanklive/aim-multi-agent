@@ -82,7 +82,7 @@ info "Step 3: adapter.sh 部署..."
 
 adapter_path() {
     case "$1" in
-        ZS0001) echo "adapters/ZS0001/adapter.sh" ;;
+        ZS0001) echo "adapters/openclaw/adapter.sh" ;;
         ZS0002) echo "adapters/hermes/adapter.sh" ;;
         ZS0003) echo "adapters/letta/adapter.sh" ;;
     esac

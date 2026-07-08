@@ -1211,6 +1211,19 @@ class AIMClient:
             grp_id="" if is_dm else (getattr(self, '_default_group', None) or "grp_trio"), msg_type="dm" if is_dm else "grp",
             content=content, raw_envelope=envelope,
         )
+
+        # P0-007 @mention 过滤：群聊消息只有被 @ 才入队
+        if not is_dm and not is_task:
+            agent_name = self.config.get("agent_name", self.agent_id)
+            mentioned = (
+                f'@{agent_name}' in content or
+                f'@{self.agent_id}' in content
+            )
+            if not mentioned:
+                self._processed_ids.add(msg_id)  # 标记已处理，不重入
+                self.logger.debug(f" [{msg_id[:8]}] 群聊未@我, 跳过 from={from_id}")
+                return
+
         self.queue.enqueue(msg)
         self._dispatch_event.set()
         self.scheduler.on_message_enqueued()

@@ -97,6 +97,11 @@ except KeyboardInterrupt:
     pass
 " 2>/dev/null)
 
+# 检测 OpenClaw 返回的错误消息（LLM 超时等），让调度器退避重试
+if echo "$REPLY" | grep -qE '^(LLM request failed\.|Request timed out|LLM request timed out)' 2>/dev/null; then
+    echo "$REPLY" >&2; exit 1  # 退避重试
+fi
+
 if [ -n "$REPLY" ]; then
     echo "$REPLY"; exit 0
 else

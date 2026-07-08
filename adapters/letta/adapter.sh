@@ -1,5 +1,6 @@
 #!/bin/bash
 set -eu
+POOL_SIZE="${DISPATCH_CONV_POOL_SIZE:-2}"  # v1.6.0 fix: 防止 set -eu 下 unbound variable
 # v1.14.2: 池会话接口契约固化 + Letta CLI 恢复 (npm 包冲突修复)
 # v1.14.1: JSON stdin 双协议 + shlex.quote 安全注入 + agent_id 磁盘自动发现
 # v1.14.0: agent_id 磁盘自动发现 (_resolve_agent_id)，不依赖 config.json
@@ -48,7 +49,7 @@ if [ -z "$LETTA_BIN" ] || [ -z "$PYTHON_BIN" ]; then
 
     # 池清理：trim 后保留最近 pool_size + 2 个 ID（v1.14.2: 从 ZS0003 收紧策略同步回模板）
     _keep=$((POOL_SIZE + 2))
-    if [ -f "$DISPATCH_IDS_FILE" ] && [ "$(wc -l < "$DISPATCH_IDS_FILE" | tr -d ' ')" -gt "$_keep" ]; then
+    if [ -f "${DISPATCH_IDS_FILE:-}" ] && [ "$(wc -l < "$DISPATCH_IDS_FILE" | tr -d ' ')" -gt "$_keep" ]; then
         tail -n "$_keep" "$DISPATCH_IDS_FILE" > "${DISPATCH_IDS_FILE}.tmp" && mv "${DISPATCH_IDS_FILE}.tmp" "$DISPATCH_IDS_FILE"
     fi
 fi
@@ -287,7 +288,7 @@ if [ "$MODE" = "trim" ]; then
     TOTAL_AFTER=0
     COUNT=0
 
-    if [ -f "$DISPATCH_IDS_FILE" ]; then
+    if [ -f "${DISPATCH_IDS_FILE:-}" ]; then
         while IFS= read -r conv_id; do
             [ -z "$conv_id" ] && continue
             ENCODED_NAME=$(echo -n "conversation:${conv_id}" | base64)

@@ -30,3 +30,4 @@ config/config-schema-v3.json
 config/nats.conf.template
 agents/
 archive/
+configs/ZS0001.json

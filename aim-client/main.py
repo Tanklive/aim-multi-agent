@@ -431,7 +431,7 @@ class AIMClient:
         self._grp_cooldown_sec = self.config.get("grp_reply_cooldown_sec", 30.0)
         self._last_grp_reply: dict[str, float] = {}
         # P0 热消息窗口：最近活跃的群，未@消息也接收（对齐 cooldown，默认30s）
-        self._grp_hot_window_sec = self.config.get("grp_hot_window_sec", max(30.0, self._grp_cooldown_sec))
+        self._grp_hot_window_sec = self.config.get("grp_hot_window_sec", 180.0)
         self._last_grp_interaction: dict[str, float] = {}  # grp_id → 最后活跃时间
         self._seen_msg_keys: dict[str, float] = {}  # 内容去重 (from_id:content[:200]→timestamp)
         self._processed_ids: set = set()  # U-005: msg_id L1 去重（接收时）
@@ -556,6 +556,9 @@ class AIMClient:
                                             self.logger.info(f" [{msg.msg_id[:8]}] 群聊确认循环跳过: in={msg.content[:20]} out={reply[:20]}")
                                         else:
                                             self._last_grp_reply[msg.grp_id] = now
+                                            # P0: 群回复必须 @发送者（确保对方收到）
+                                            if f'@{msg.from_id}' not in reply:
+                                                reply = f'@{msg.from_id} {reply}'
                                             await self.transport.send_grp(msg.grp_id, reply)
                                     else:
                                         await self.transport.send_dm(msg.from_id, reply)

@@ -271,6 +271,8 @@ class Transport:
         if isinstance(result, dict) and "id" in result:
             self._my_msg_ids.add(result["id"])  # U-007: 追踪发出的消息
             await self.emit_delivery(group_id, result["id"], via="grp")
+        # 热窗口：发言后刷新活跃时间，让接力回复能进来
+        self._last_grp_interaction[group_id] = time.time()
         return result
 
     async def authenticate(self) -> bool:
@@ -428,6 +430,9 @@ class AIMClient:
         # 619-18: 群聊回路防护冷却（从 config 读取，默认30s）
         self._grp_cooldown_sec = self.config.get("grp_reply_cooldown_sec", 30.0)
         self._last_grp_reply: dict[str, float] = {}
+        # P0 热消息窗口：最近活跃的群，未@消息也接收（对齐 cooldown，默认30s）
+        self._grp_hot_window_sec = self.config.get("grp_hot_window_sec", max(30.0, self._grp_cooldown_sec))
+        self._last_grp_interaction: dict[str, float] = {}  # grp_id → 最后活跃时间
         self._seen_msg_keys: dict[str, float] = {}  # 内容去重 (from_id:content[:200]→timestamp)
         self._processed_ids: set = set()  # U-005: msg_id L1 去重（接收时）
         self._dispatched_ids: set = set()  # U-006: 已 dispatch 去重（发送 adapter 后）
@@ -1233,7 +1238,7 @@ class AIMClient:
             content=content, raw_envelope=envelope,
         )
 
-        # P0-007 @mention 过滤：群聊消息只有被 @ 才入队
+        # P0-007 @mention 过滤：群聊消息被 @ 或处于热消息窗口才入队
         if not is_dm and not is_task:
             agent_name = self.config.get("agent_name", self.agent_id)
             mentioned = (
@@ -1241,13 +1246,21 @@ class AIMClient:
                 f'@{self.agent_id}' in content
             )
             if not mentioned:
-                self._processed_ids.add(msg_id)  # 标记已处理，不重入
-                self.logger.debug(f" [{msg_id[:8]}] 群聊未@我, 跳过 from={from_id}")
-                return
+                # 热消息窗口：最近在群里活跃过 → 接力回复也接收
+                last_active = self._last_grp_interaction.get(msg.grp_id, 0)
+                in_hot_window = (now_ts - last_active) < self._grp_hot_window_sec
+                if not in_hot_window:
+                    self._processed_ids.add(msg_id)  # 标记已处理，不重入
+                    self.logger.debug(f" [{msg_id[:8]}] 群聊未@我, 跳过 from={from_id}")
+                    return
+                self.logger.debug(f" [{msg_id[:8]}] 群聊未@但热窗口内 (active={now_ts-last_active:.0f}s/{self._grp_hot_window_sec}s), from={from_id}")
 
         self.queue.enqueue(msg)
         self._dispatch_event.set()
         self.scheduler.on_message_enqueued()
+        # 热窗口：群消息入队后刷新活跃时间（让接力回复能进来）
+        if not is_dm and msg.grp_id:
+            self._last_grp_interaction[msg.grp_id] = now_ts
 
     def _validate_envelope(self, envelope: dict):
         """620: veritas v1.0 信封格式校验

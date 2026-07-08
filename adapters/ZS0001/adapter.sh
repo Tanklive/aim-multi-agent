@@ -78,20 +78,29 @@ fi
 # 独立 session key 隔离，不阻塞主会话（等同 hermes chat -q 新进程）
 SESSION_KEY="agent:main:aim-reply-$(date +%s)-$$"
 
+# 错误日志路径
+ERR_LOG="${AIM_HOME}/aim-adapter-errors.log"
+
+# 调用 OpenClaw，stderr 重定向到日志文件方便排障
 REPLY=$("$OPENCLAW_BIN" agent \
     --session-key "$SESSION_KEY" \
     --message "${PROMPT}" \
-    --json --timeout 25 2>/dev/null | python3 -c "
+    --json --timeout 25 2>>"$ERR_LOG" | python3 -c "
 import sys,json
 try:
     d=json.load(sys.stdin)
     t=d.get('result',{}).get('payloads',[{}])[0].get('text','')
     print(t)
-except: pass
+except Exception as e:
+    print(f'JSON_PARSE_ERROR: {type(e).__name__}: {e}', file=sys.stderr)
+except KeyboardInterrupt:
+    pass
 " 2>/dev/null)
 
 if [ -n "$REPLY" ]; then
     echo "$REPLY"; exit 0
 else
-    echo "OpenClaw 无回复" >&2; exit 1
+    # 输出最近错误供 main.py 日志使用
+    LAST_ERR=$(tail -3 "$ERR_LOG" 2>/dev/null | tr '\n' ' | ')
+    echo "OpenClaw 无回复 (last_err=${LAST_ERR})" >&2; exit 1
 fi

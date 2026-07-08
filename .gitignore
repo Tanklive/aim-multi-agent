@@ -18,3 +18,15 @@ jiliang_inbox.md
 .new_message_alert
 .PROJECT-LOG.md
 AUTO_MERGE
+data/
+logs/
+huoji_inbox.md
+deploy_sdk.sh
+events/
+config/aim.json
+config/agent-config.template.json
+config/aim-config.template.json
+config/config-schema-v3.json
+config/nats.conf.template
+agents/
+archive/

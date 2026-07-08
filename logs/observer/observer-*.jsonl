@@ -1,2 +1,0 @@
-{"t": 1780923412.217242, "dt": "2026-06-08 20:56:52", "msg": {"cmd": "lifecycle", "type": "agent_lifecycle", "event": "agent_online", "agent_id": "ZS0001", "old_status": "online", "new_status": "online", "reason": "auth_success", "timestamp": 1780923412.213106}}
-{"t": 1780923412.218074, "dt": "2026-06-08 20:56:52", "msg": {"cmd": "presence", "agent_id": "ZS0001", "name": "呱呱", "emoji": "🐸", "status": "online"}}

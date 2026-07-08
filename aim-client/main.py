@@ -591,7 +591,9 @@ class AIMClient:
                             delay = [2, 4, 8][rt - 1]
                             self.logger.info(f" [{msg.msg_id[:8]}] 退避 {rt}/3, delay={delay}s")
                             self.queue.nack(msg.msg_id, "retry")
+                            self.scheduler.reset_to_idle()  # 退避期间释放 BUSY，恢复调度
                             await asyncio.sleep(delay)
+                            self._dispatch_event.set()  # 退避完成后立即触发下一轮调度
 
                     except Exception as e:
                         if "agent_unreachable" in str(e):

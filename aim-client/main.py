@@ -273,7 +273,13 @@ class Transport:
             self._my_msg_ids.add(result["id"])  # U-007: 追踪发出的消息
             await self.emit_delivery(group_id, result["id"], via="grp")
         # 热窗口：发言后刷新活跃时间，让接力回复能进来
-        self._last_grp_interaction[group_id] = time.time()
+        # v3: 限制最大续期次数，防无限闲聊循环
+        remaining = self._grp_hot_remaining.get(group_id, 2)
+        if remaining > 0:
+            self._grp_hot_remaining[group_id] = remaining - 1
+            self._last_grp_interaction[group_id] = time.time()
+        else:
+            self.logger.debug(f' 热窗口耗尽 ({group_id}), 不再续期')
         return result
 
     async def authenticate(self) -> bool:
@@ -434,6 +440,7 @@ class AIMClient:
         # P0 热消息窗口：最近活跃的群，未@消息也接收（对齐 cooldown，默认30s）
         self._grp_hot_window_sec = self.config.get("grp_hot_window_sec", 60.0)  # ZS0003: 180→60, 接力回复够用不用开半天
         self._last_grp_interaction: dict[str, float] = {}  # grp_id → 最后活跃时间
+        self._grp_hot_remaining: dict[str, int] = {}  # v3: 热窗口剩余续期次数，防无限循环
         self._seen_msg_keys: dict[str, float] = {}  # 内容去重 (from_id:content[:200]→timestamp)
         self._processed_ids: set = set()  # U-005: msg_id L1 去重（接收时）
         self._dispatched_ids: set = set()  # U-006: 已 dispatch 去重（发送 adapter 后）
@@ -1296,6 +1303,9 @@ class AIMClient:
                 if not in_hot_window:
                     self._processed_ids.add(msg_id)  # 标记已处理，不重入
                     self.logger.debug(f" [{msg_id[:8]}] 群聊未@我, 跳过 from={from_id}")
+                    # v3: 窗口关闭时重置续期计数，下次新对话从 2 开始
+                    if msg.grp_id in self._grp_hot_remaining:
+                        self._grp_hot_remaining[msg.grp_id] = 2
                     return
                 self.logger.debug(f" [{msg_id[:8]}] 群聊未@但热窗口内 (active={now_ts-last_active:.0f}s/{self._grp_hot_window_sec}s), from={from_id}")
 
@@ -1306,7 +1316,13 @@ class AIMClient:
         # 注：self-send 刷新在 dispatch 循环 send_grp 后（L578），不走这里
         if not is_dm and msg.grp_id:
             if not self._skip_adapter_for_operational(msg):
-                self._last_grp_interaction[msg.grp_id] = now_ts
+                # v3: 热窗口最大续期 2 次，防无限闲聊循环
+                remaining = self._grp_hot_remaining.get(msg.grp_id, 2)
+                if remaining > 0:
+                    self._grp_hot_remaining[msg.grp_id] = remaining - 1
+                    self._last_grp_interaction[msg.grp_id] = now_ts
+                else:
+                    self.logger.debug(f' [{msg_id[:8]}] 热窗口耗尽({msg.grp_id}), 不续期')
 
     def _validate_envelope(self, envelope: dict):
         """620: veritas v1.0 信封格式校验

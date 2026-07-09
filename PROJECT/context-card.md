@@ -1,4 +1,4 @@
-# AIM 项目骨架 v1.4.0
+# AIM 项目骨架 v1.5.1
 ## 目标
 多 Agent 异构通信基础设施，三 Agent（OpenClaw/Hermes/Letta）通过 NATS 消息总线 DM/群聊。Phase 0-1 完成 ✅，清理阶段闭环，进入稳定运行。
 
@@ -30,6 +30,8 @@
 ## 关键约定
 - AIM Client ≠ Runtime，只通信不思记忆
 - NATS 唯一总线，禁用 agent_bus
-- Python 3.13 统一，禁 3.14
+- Python 3.14.6 统一，plist 硬编码 python3.14
+- @提及：UUID 唯一标识 + display_name 显示，agent_id 兜底
+- 版本管理：改 main.py/SDK 前群通知+等确认，adapter 参数放 config.json
 - 接口 process/health/info/cancel/trim | exit:0/1/2/3/4
 - 代码更新必重启生效

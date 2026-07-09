@@ -209,6 +209,7 @@ class Transport:
     def __init__(self, agent_id: str, nats_url: str = "nats://127.0.0.1:4222"):
         from aim_nats_sdk import AIMNATSClient
         self.agent_id = agent_id
+        self._last_grp_interaction: dict[str, float] = {}  # 热窗口：群聊最后活跃时间
         self._logger = logging.getLogger("aim-client.transport")
         self._my_msg_ids: set = set()  # U-007: 追踪发出的消息
         creds_path = Path.home() / ".aim" / "agents" / agent_id / "aim.creds"
@@ -535,7 +536,9 @@ class AIMClient:
                         pass
                     try:
                         # ── 免 LLM 消息：系统通知和确认消息不烧 token ──
-                        if self._skip_adapter_for_operational(msg):
+                        # 708修复：群聊消息已通过 HOT 过滤，不走免 LLM（防误杀实质性消息）
+                        skip_llm = not msg.grp_id and self._skip_adapter_for_operational(msg)
+                        if skip_llm:
                             self.logger.debug(f" [{msg.msg_id[:8]}] 免LLM跳过: from={msg.from_id}")
                             self.queue.ack(msg.msg_id)
                             continue
@@ -559,9 +562,19 @@ class AIMClient:
                                             # P0: 群回复必须 @发送者（确保对方收到）
                                             if f'@{msg.from_id}' not in reply:
                                                 reply = f'@{msg.from_id} {reply}'
-                                            await self.transport.send_grp(msg.grp_id, reply)
+                                            try:
+                                                await self.transport.send_grp(msg.grp_id, reply)
+                                            except ValueError as e:
+                                                self.logger.warning(f" [{msg.msg_id[:8]}] 群发校验拦截: {e}")
+                                                safe = str(reply)[:200].replace('{', '(').replace('}', ')')
+                                                await self.transport.send_grp(msg.grp_id, safe)
                                     else:
-                                        await self.transport.send_dm(msg.from_id, reply)
+                                        try:
+                                            await self.transport.send_dm(msg.from_id, reply)
+                                        except ValueError as e:
+                                            self.logger.warning(f" [{msg.msg_id[:8]}] DM校验拦截: {e}")
+                                            safe = str(reply)[:200].replace('{', '(').replace('}', ')')
+                                            await self.transport.send_dm(msg.from_id, safe)
                                 else:
                                     # P0-D: 空响应 → 原地重试
                                     self.logger.warning(f" [{msg.msg_id[:8]}] 空响应 (attempt {attempt+1}/3)")

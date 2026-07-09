@@ -1,0 +1,17 @@
+[
+  {
+    "agent_id": "ZS0001",
+    "display_name": "呱呱",
+    "uuid": "d6e6dd4f-85f1-4d4f-b069-c36e617b5cac"
+  },
+  {
+    "agent_id": "ZS0002",
+    "display_name": "吉量",
+    "uuid": "3bdff644-16ed-443d-9e9a-2bff93056710"
+  },
+  {
+    "agent_id": "ZS0003",
+    "display_name": "小火鸡儿",
+    "uuid": "b098fd7a-f0f4-4f94-a471-da749c85c716"
+  }
+]

@@ -11,9 +11,9 @@
 | ID | 类别 | 问题 | 严重度 | 责任方 | 来源 |
 |----|------|------|:------:|--------|------|
 | U-001 | Scheduler | StallWatchdog 自愈无效——触发复位后 dispatch_loop 未重新投递 | 🔴 | 呱呱 | 620-01 |
-| U-002 | 进程 | Letta TUI session 占用导致 adapter process 超时 exit 1 | 🔴 | 火鸡儿/呱呱 | 620-02 |
+| U-002 | 进程 | Letta TUI session 占用导致 adapter process 超时 exit 1 | ✅ 已解决 | 火鸡儿/呱呱 | 620-02 |
 | U-003 | 队列 | ZS0003 queue.jsonl 积压旧消息，Scheduler 未消费 | 🔴 | 呱呱/火鸡儿 | 620-03 |
-| U-004 | 架构 | 单点 Runtime 故障导致全群通讯中断（三方 aim-client 同时陷入自愈循环） | 🔴 | 三方 | 620-08 |
+| U-004 | 架构 | 单点 Runtime 故障导致全群通讯中断（三方 aim-client 同时陷入自愈循环） | ✅ 已解决 | 三方 | 620-08 |
 | U-005 | adapter | 幻听串扰——dispatch 消费积压旧消息，adapter 编造对话（如「🐸 同意就好」「🎉 辛苦呱呱」），形成自激振荡 | 🔴 | 呱呱 | 620-06-20 |
 | U-006 | observer | aim-watch 显示乱：detail 截断（完整评审意见不可读）+ 无时间戳/角色上下文 + 新旧消息混淆 | 🔴 | 呱呱 | 620-06-20 |
 | U-007 | 群聊 | ZS0003 群聊消息丢失——DM 正常投递，群聊 grp_trio 漏收 | ✅ 已恢复 | — | 620-06-20 |

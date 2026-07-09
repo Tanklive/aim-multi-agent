@@ -1314,8 +1314,6 @@ class AIMClient:
                     reason = '耗尽' if hot_exhausted else '窗口关闭'
                     self._processed_ids.add(msg_id)  # 标记已处理，不重入
                     self.logger.debug(f" [{msg_id[:8]}] 群聊未@跳过 ({reason}, gap={now_ts-last_active:.0f}s) from={from_id}")
-                    # v3: 窗口关闭时删除 key，下次新对话重新从 2 开始
-                    self._grp_hot_remaining.pop(msg.grp_id, None)
                     return
                 self.logger.debug(f" [{msg_id[:8]}] 群聊未@但热窗口内 (active={now_ts-last_active:.0f}s/{self._grp_hot_window_sec}s), from={from_id}")
 

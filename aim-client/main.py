@@ -432,7 +432,7 @@ class AIMClient:
         self._grp_cooldown_sec = self.config.get("grp_reply_cooldown_sec", 30.0)
         self._last_grp_reply: dict[str, float] = {}
         # P0 热消息窗口：最近活跃的群，未@消息也接收（对齐 cooldown，默认30s）
-        self._grp_hot_window_sec = self.config.get("grp_hot_window_sec", 180.0)
+        self._grp_hot_window_sec = self.config.get("grp_hot_window_sec", 60.0)  # ZS0003: 180→60, 接力回复够用不用开半天
         self._last_grp_interaction: dict[str, float] = {}  # grp_id → 最后活跃时间
         self._seen_msg_keys: dict[str, float] = {}  # 内容去重 (from_id:content[:200]→timestamp)
         self._processed_ids: set = set()  # U-005: msg_id L1 去重（接收时）
@@ -576,6 +576,8 @@ class AIMClient:
                                                 self.logger.debug(f' [{msg.msg_id[:8]}] @skip: hot window (gap={gap:.0f}s/{self._grp_hot_window_sec}s)')
                                             try:
                                                 await self.transport.send_grp(msg.grp_id, reply)
+                                                # ZS0003: self-send 必刷新热窗口（我发言 = 我在参与）
+                                                self._last_grp_interaction[msg.grp_id] = time.time()
                                             except ValueError as e:
                                                 self.logger.warning(f" [{msg.msg_id[:8]}] 群发校验拦截: {e}")
                                                 safe = str(reply)[:200].replace('{', '(').replace('}', ')')
@@ -1286,8 +1288,8 @@ class AIMClient:
         self.queue.enqueue(msg)
         self._dispatch_event.set()
         self.scheduler.on_message_enqueued()
-        # 618-02: 语义热窗口 — 仅实质性消息续期（ACK/确认/信号不续命）
-        # 火鸡儿建议：热窗口不能退化成一读 inbox 就续命，要有语义
+        # 618-02 v2: 语义热窗口 — 仅实质性消息续期
+        # 注：self-send 刷新在 dispatch 循环 send_grp 后（L578），不走这里
         if not is_dm and msg.grp_id:
             if not self._skip_adapter_for_operational(msg):
                 self._last_grp_interaction[msg.grp_id] = now_ts

@@ -445,6 +445,7 @@ class AIMClient:
         self._retry_tracker: dict[str, int] = {}  # P0: exit=1 退避, msg_id → retry_count
         self._retry_persist_path = (Path.home() / ".aim" / "agents" / self.agent_id / "retry.json")  # P0-D: 持久化
         self._load_retry_counts()  # P0-D: 启动时恢复
+        self._in_flight: set = set()  # P0-L4: 正处理的 msg_id，防 StallWatchdog 并发重复
         self._last_recover_at: float = 0.0  # P0-L3: recover cooldown (60s)
         self._last_trim_at: float = 0.0  # P0-L3: trim cooldown (30s)
         # 620: 自适应 stalled 阈值 (基于 queue depth)
@@ -514,15 +515,24 @@ class AIMClient:
                     msg = self.queue.dequeue()
                     if not msg:
                         break
+                    # P0-L4: 防 StallWatchdog 并发 — 已在处理的消息跳过
+                    if msg.msg_id and msg.msg_id in self._in_flight:
+                        self.logger.warning(f" [{msg.msg_id[:8]}] 已在处理中, 跳过并发调度")
+                        self.queue.ack(msg.msg_id)
+                        continue
+                    if msg.msg_id:
+                        self._in_flight.add(msg.msg_id)
                     # U-006: 出队去重用独立 _dispatched_ids，不与接收时 L1 _processed_ids 冲突
                     if msg.msg_id and msg.msg_id in self._dispatched_ids:
                         self.logger.debug(f" [DEDUP DEQUEUE] msg_id={msg.msg_id[:8]} 已 dispatch, ack跳过")
+                        self._in_flight.discard(msg.msg_id)
                         self.queue.ack(msg.msg_id)
                         continue
                     # P0-D: 毒消息跳过（retry>=3 持久化，重启后跳过）
                     if msg.msg_id and self._retry_tracker.get(msg.msg_id, 0) >= 3:
                         self.logger.warning(f" [{msg.msg_id[:8]}] 毒消息 retry={self._retry_tracker[msg.msg_id]}, skip→死信")
                         self.queue.ack(msg.msg_id)
+                        self._in_flight.discard(msg.msg_id)
                         if msg.msg_id:
                             self._dispatched_ids.add(msg.msg_id)
                         self._dispatch_event.set()
@@ -541,6 +551,7 @@ class AIMClient:
                         if skip_llm:
                             self.logger.debug(f" [{msg.msg_id[:8]}] 免LLM跳过: from={msg.from_id}")
                             self.queue.ack(msg.msg_id)
+                            self._in_flight.discard(msg.msg_id)
                             continue
                         # ── 原地重试：消息不 nack 回队，在手里重试 3 次 ──
                         delivered = False
@@ -594,6 +605,7 @@ class AIMClient:
                                     self.logger.warning(f" [{msg.msg_id[:8]}] 空响应 (attempt {attempt+1}/3)")
                                     if attempt == 2:
                                         self.queue.ack(msg.msg_id)
+                                        self._in_flight.discard(msg.msg_id)
                                         if msg.msg_id:
                                             self._dispatched_ids.add(msg.msg_id)
                                         self.scheduler.on_processing_done()
@@ -612,6 +624,7 @@ class AIMClient:
                                 if msg.msg_id:
                                     self._dispatched_ids.add(msg.msg_id)
                                 self.queue.ack(msg.msg_id)
+                                self._in_flight.discard(msg.msg_id)
                                 self._stall_recovery_count = 0
                                 self._retry_tracker.pop(msg.msg_id, None)
                                 self._save_retry_counts()
@@ -637,6 +650,7 @@ class AIMClient:
                                 if attempt == 2:
                                     self.logger.warning(f" [{msg.msg_id[:8]}] 退避耗尽 (3次)，入死信")
                                     self.queue.ack(msg.msg_id)
+                                    self._in_flight.discard(msg.msg_id)
                                     if msg.msg_id:
                                         self._dispatched_ids.add(msg.msg_id)
                                     self._retry_tracker.pop(msg.msg_id, None)

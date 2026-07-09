@@ -1303,9 +1303,12 @@ class AIMClient:
                 # 热消息窗口：最近在群里活跃过 → 接力回复也接收
                 last_active = self._last_grp_interaction.get(msg.grp_id, 0)
                 in_hot_window = (now_ts - last_active) < self._grp_hot_window_sec
-                if not in_hot_window:
+                # v3.2: remaining=0 立即关窗，不等60s自然关闭
+                hot_exhausted = self._grp_hot_remaining.get(msg.grp_id, 2) <= 0
+                if not in_hot_window or hot_exhausted:
+                    reason = '耗尽' if hot_exhausted else '窗口关闭'
                     self._processed_ids.add(msg_id)  # 标记已处理，不重入
-                    self.logger.debug(f" [{msg_id[:8]}] 群聊未@我, 跳过 from={from_id}")
+                    self.logger.debug(f" [{msg_id[:8]}] 群聊未@跳过 ({reason}, gap={now_ts-last_active:.0f}s) from={from_id}")
                     # v3: 窗口关闭时删除 key，下次新对话重新从 2 开始
                     self._grp_hot_remaining.pop(msg.grp_id, None)
                     return

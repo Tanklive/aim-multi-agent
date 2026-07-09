@@ -559,9 +559,15 @@ class AIMClient:
                                             self.logger.info(f" [{msg.msg_id[:8]}] 群聊确认循环跳过: in={msg.content[:20]} out={reply[:20]}")
                                         else:
                                             self._last_grp_reply[msg.grp_id] = now
-                                            # P0: 群回复必须 @发送者（确保对方收到）
-                                            if f'@{msg.from_id}' not in reply:
-                                                reply = f'@{msg.from_id} {reply}'
+                                            # 618-01: 热窗口内不强制 @（自然流动），窗口外才 @发送者
+                                            # 防止 AI 输出小写 ID 导致误判 → casefold 比较
+                                            last_active = self._last_grp_interaction.get(msg.grp_id, 0)
+                                            outside_hot = (now - last_active) >= self._grp_hot_window_sec
+                                            if outside_hot:
+                                                reply_lower = reply.casefold()
+                                                from_lower = f'@{msg.from_id}'.casefold()
+                                                if from_lower not in reply_lower:
+                                                    reply = f'@{msg.from_id} {reply}'
                                             try:
                                                 await self.transport.send_grp(msg.grp_id, reply)
                                             except ValueError as e:

@@ -562,12 +562,18 @@ class AIMClient:
                                             # 618-01: 热窗口内不强制 @（自然流动），窗口外才 @发送者
                                             # 防止 AI 输出小写 ID 导致误判 → casefold 比较
                                             last_active = self._last_grp_interaction.get(msg.grp_id, 0)
-                                            outside_hot = (now - last_active) >= self._grp_hot_window_sec
+                                            gap = now - last_active
+                                            outside_hot = gap >= self._grp_hot_window_sec
                                             if outside_hot:
                                                 reply_lower = reply.casefold()
                                                 from_lower = f'@{msg.from_id}'.casefold()
                                                 if from_lower not in reply_lower:
+                                                    self.logger.info(f' [{msg.msg_id[:8]}] @prepend: +{msg.from_id} (gap={gap:.0f}s,hot={self._grp_hot_window_sec}s)')
                                                     reply = f'@{msg.from_id} {reply}'
+                                                else:
+                                                    self.logger.debug(f' [{msg.msg_id[:8]}] @skip: already has {msg.from_id} (casefold ok)')
+                                            else:
+                                                self.logger.debug(f' [{msg.msg_id[:8]}] @skip: hot window (gap={gap:.0f}s/{self._grp_hot_window_sec}s)')
                                             try:
                                                 await self.transport.send_grp(msg.grp_id, reply)
                                             except ValueError as e:

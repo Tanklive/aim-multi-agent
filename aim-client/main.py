@@ -283,7 +283,7 @@ class Transport:
             self._grp_hot_remaining[group_id] = remaining - 1
             self._last_grp_interaction[group_id] = time.time()
         else:
-            self.logger.debug(f' 热窗口耗尽 ({group_id}), 不再续期')
+            self._logger.debug(f' 热窗口耗尽 ({group_id}), 不再续期')
         return result
 
     async def authenticate(self) -> bool:

@@ -210,6 +210,7 @@ class Transport:
         from aim_nats_sdk import AIMNATSClient
         self.agent_id = agent_id
         self._last_grp_interaction: dict[str, float] = {}  # 热窗口：群聊最后活跃时间
+        self._grp_hot_remaining: dict[str, int] = {}  # v3: 热窗口剩余续期次数
         self._logger = logging.getLogger("aim-client.transport")
         self._my_msg_ids: set = set()  # U-007: 追踪发出的消息
         creds_path = Path.home() / ".aim" / "agents" / agent_id / "aim.creds"

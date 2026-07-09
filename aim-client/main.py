@@ -1302,7 +1302,11 @@ class AIMClient:
             if not mentioned:
                 # 热消息窗口：最近在群里活跃过 → 接力回复也接收
                 last_active = self._last_grp_interaction.get(msg.grp_id, 0)
-                in_hot_window = (now_ts - last_active) < self._grp_hot_window_sec
+                # v3.3: 首次消息（last_active=0=冷启动）→ 窗口打开
+                if last_active == 0:
+                    in_hot_window = True
+                else:
+                    in_hot_window = (now_ts - last_active) < self._grp_hot_window_sec
                 # v3.2: remaining=0 立即关窗，不等60s自然关闭
                 hot_exhausted = self._grp_hot_remaining.get(msg.grp_id, 2) <= 0
                 if not in_hot_window or hot_exhausted:

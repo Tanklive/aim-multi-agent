@@ -1280,9 +1280,11 @@ class AIMClient:
         self.queue.enqueue(msg)
         self._dispatch_event.set()
         self.scheduler.on_message_enqueued()
-        # 热窗口：群消息入队后刷新活跃时间（让接力回复能进来）
+        # 618-02: 语义热窗口 — 仅实质性消息续期（ACK/确认/信号不续命）
+        # 火鸡儿建议：热窗口不能退化成一读 inbox 就续命，要有语义
         if not is_dm and msg.grp_id:
-            self._last_grp_interaction[msg.grp_id] = now_ts
+            if not self._skip_adapter_for_operational(msg):
+                self._last_grp_interaction[msg.grp_id] = now_ts
 
     def _validate_envelope(self, envelope: dict):
         """620: veritas v1.0 信封格式校验

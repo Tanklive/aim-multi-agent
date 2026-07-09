@@ -274,7 +274,10 @@ class Transport:
             await self.emit_delivery(group_id, result["id"], via="grp")
         # 热窗口：发言后刷新活跃时间，让接力回复能进来
         # v3: 限制最大续期次数，防无限闲聊循环
-        remaining = self._grp_hot_remaining.get(group_id, 2)
+        remaining = self._grp_hot_remaining.get(group_id)
+        if remaining is None:
+            self._grp_hot_remaining[group_id] = 2
+            remaining = 2
         if remaining > 0:
             self._grp_hot_remaining[group_id] = remaining - 1
             self._last_grp_interaction[group_id] = time.time()
@@ -1303,9 +1306,8 @@ class AIMClient:
                 if not in_hot_window:
                     self._processed_ids.add(msg_id)  # 标记已处理，不重入
                     self.logger.debug(f" [{msg_id[:8]}] 群聊未@我, 跳过 from={from_id}")
-                    # v3: 窗口关闭时重置续期计数，下次新对话从 2 开始
-                    if msg.grp_id in self._grp_hot_remaining:
-                        self._grp_hot_remaining[msg.grp_id] = 2
+                    # v3: 窗口关闭时删除 key，下次新对话重新从 2 开始
+                    self._grp_hot_remaining.pop(msg.grp_id, None)
                     return
                 self.logger.debug(f" [{msg_id[:8]}] 群聊未@但热窗口内 (active={now_ts-last_active:.0f}s/{self._grp_hot_window_sec}s), from={from_id}")
 
@@ -1317,7 +1319,11 @@ class AIMClient:
         if not is_dm and msg.grp_id:
             if not self._skip_adapter_for_operational(msg):
                 # v3: 热窗口最大续期 2 次，防无限闲聊循环
-                remaining = self._grp_hot_remaining.get(msg.grp_id, 2)
+                # key 不存在 → 初始化为 2；已存在 → 只减不加
+                remaining = self._grp_hot_remaining.get(msg.grp_id)
+                if remaining is None:
+                    self._grp_hot_remaining[msg.grp_id] = 2
+                    remaining = 2
                 if remaining > 0:
                     self._grp_hot_remaining[msg.grp_id] = remaining - 1
                     self._last_grp_interaction[msg.grp_id] = now_ts

@@ -445,6 +445,8 @@ class AIMClient:
         self._grp_hot_window_sec = self.config.get("grp_hot_window_sec", 60.0)  # ZS0003: 180→60, 接力回复够用不用开半天
         self._last_grp_interaction: dict[str, float] = {}  # grp_id → 最后活跃时间
         self._grp_hot_remaining: dict[str, int] = {}  # v3: 热窗口剩余续期次数，防无限循环
+        self._grp_hot_exhausted_at: dict[str, float] = {}  # v3.5: 窗口耗尽时间，grace period 300s
+        self._grp_hot_grace_used: dict[str, bool] = {}  # v3.5: 耗尽后 grace 消息已用
         self._seen_msg_keys: dict[str, float] = {}  # 内容去重 (from_id:content[:200]→timestamp)
         self._processed_ids: set = set()  # U-005: msg_id L1 去重（接收时）
         self._dispatched_ids: set = set()  # U-006: 已 dispatch 去重（发送 adapter 后）
@@ -1296,11 +1298,26 @@ class AIMClient:
         # P0-007 @mention 过滤：群聊消息被 @ 或处于热消息窗口才入队
         if not is_dm and not is_task:
             agent_name = self.config.get("agent_name", self.agent_id)
-            mentioned = (
+            mentioned_me = (
                 f'@{agent_name}' in content or
                 f'@{self.agent_id}' in content
             )
-            if not mentioned:
+            # v3.5: 检测任意 @mention（群聊活跃信号）→ 重置热窗口
+            _all_agent_refs = set(self.config.get("mention_names", []))
+            _all_agent_refs.update(['ZS0001', 'ZS0002', 'ZS0003'])
+            has_any_mention = mentioned_me or any(
+                f'@{aid}' in content
+                for aid in _all_agent_refs
+            )
+            if not mentioned_me:
+                # v3.5: @others → 群聊活跃，刷新热窗口（不消耗计数器）
+                if has_any_mention:
+                    self._grp_hot_remaining[msg.grp_id] = 2
+                    self._grp_hot_grace_used.pop(msg.grp_id, None)
+                    self._grp_hot_exhausted_at.pop(msg.grp_id, None)
+                    self._last_grp_interaction[msg.grp_id] = now_ts
+                    self.logger.debug(f" [{msg_id[:8]}] @others→热窗口重置 (grp={msg.grp_id})")
+
                 # 热消息窗口：最近在群里活跃过 → 接力回复也接收
                 last_active = self._last_grp_interaction.get(msg.grp_id, 0)
                 # v3.3: 首次消息（last_active=0=冷启动）→ 窗口打开
@@ -1311,10 +1328,24 @@ class AIMClient:
                 # v3.2: remaining=0 立即关窗，不等60s自然关闭
                 hot_exhausted = self._grp_hot_remaining.get(msg.grp_id, 2) <= 0
                 if not in_hot_window or hot_exhausted:
-                    reason = '耗尽' if hot_exhausted else '窗口关闭'
-                    self._processed_ids.add(msg_id)  # 标记已处理，不重入
-                    self.logger.debug(f" [{msg_id[:8]}] 群聊未@跳过 ({reason}, gap={now_ts-last_active:.0f}s) from={from_id}")
-                    return
+                    # v3.5: 耗尽后 300s 内首条实质性消息给一次 grace
+                    if hot_exhausted:
+                        exhausted_at = self._grp_hot_exhausted_at.setdefault(msg.grp_id, now_ts)
+                        grace_used = self._grp_hot_grace_used.get(msg.grp_id, False)
+                        if not grace_used and (now_ts - exhausted_at) < 300 and not self._skip_adapter_for_operational(msg):
+                            self._grp_hot_grace_used[msg.grp_id] = True
+                            self._grp_hot_remaining[msg.grp_id] = 1
+                            self._last_grp_interaction[msg.grp_id] = now_ts
+                            self.logger.info(f" [{msg_id[:8]}] 热窗口耗尽→grace放行 (from={from_id}, age={now_ts-exhausted_at:.0f}s/300s)")
+                        else:
+                            skip_reason = '耗尽(grace已用)' if grace_used else ('耗尽(无实质性)' if self._skip_adapter_for_operational(msg) else '耗尽(grace超时)')
+                            self._processed_ids.add(msg_id)  # 标记已处理，不重入
+                            self.logger.debug(f" [{msg_id[:8]}] 群聊未@跳过 ({skip_reason}, gap={now_ts-last_active:.0f}s) from={from_id}")
+                            return
+                    else:
+                        self._processed_ids.add(msg_id)  # 标记已处理，不重入
+                        self.logger.debug(f" [{msg_id[:8]}] 群聊未@跳过 (窗口关闭, gap={now_ts-last_active:.0f}s) from={from_id}")
+                        return
                 self.logger.debug(f" [{msg_id[:8]}] 群聊未@但热窗口内 (active={now_ts-last_active:.0f}s/{self._grp_hot_window_sec}s), from={from_id}")
 
         self.queue.enqueue(msg)
@@ -1324,17 +1355,25 @@ class AIMClient:
         # 注：self-send 刷新在 dispatch 循环 send_grp 后（L578），不走这里
         if not is_dm and msg.grp_id:
             if not self._skip_adapter_for_operational(msg):
-                # v3: 热窗口最大续期 2 次，防无限闲聊循环
-                # key 不存在 → 初始化为 2；已存在 → 只减不加
-                remaining = self._grp_hot_remaining.get(msg.grp_id)
-                if remaining is None:
+                # v3.5: @me → 重置热窗口（有人在跟我说话，窗口重新开始）
+                if mentioned_me:
                     self._grp_hot_remaining[msg.grp_id] = 2
-                    remaining = 2
-                if remaining > 0:
-                    self._grp_hot_remaining[msg.grp_id] = remaining - 1
+                    self._grp_hot_grace_used.pop(msg.grp_id, None)
+                    self._grp_hot_exhausted_at.pop(msg.grp_id, None)
                     self._last_grp_interaction[msg.grp_id] = now_ts
+                    self.logger.debug(f' [{msg_id[:8]}] 热窗口重置(@me, grp={msg.grp_id})')
                 else:
-                    self.logger.debug(f' [{msg_id[:8]}] 热窗口耗尽({msg.grp_id}), 不续期')
+                    # v3: 纯热窗口消息 → 消耗剩余次数
+                    remaining = self._grp_hot_remaining.get(msg.grp_id)
+                    if remaining is None:
+                        self._grp_hot_remaining[msg.grp_id] = 2
+                        remaining = 2
+                    if remaining > 0:
+                        self._grp_hot_remaining[msg.grp_id] = remaining - 1
+                        self._last_grp_interaction[msg.grp_id] = now_ts
+                    else:
+                        self._grp_hot_exhausted_at.setdefault(msg.grp_id, now_ts)
+                        self.logger.debug(f' [{msg_id[:8]}] 热窗口耗尽({msg.grp_id}), 不续期')
 
     def _validate_envelope(self, envelope: dict):
         """620: veritas v1.0 信封格式校验

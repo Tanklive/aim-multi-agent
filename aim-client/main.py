@@ -60,6 +60,7 @@ from aim_client.types import (
 from aim_client.queue import MessageQueue
 from aim_client.scheduler import Scheduler
 from aim_client.health_probe import HealthProbe
+from aim_client.circuit_breaker import DispatchBreaker, BreakerState
 from aim_nats_sdk import load_global_config
 
 # 619-06: 读取全局 VERSION 文件，不再写死
@@ -156,7 +157,8 @@ class SingleInstance:
 
 # -- 日志 --
 def setup_logging(agent_id: str) -> logging.Logger:
-    log_dir = Path.home() / ".aim" / "logs"
+    # v1.5.3: 日志收拢到 shared/aim/logs/（🐸🐤🐙 三方可见）
+    log_dir = Path.home() / "shared" / "aim" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / f"aim-client-{agent_id}.log"
     logger = logging.getLogger("aim-client")
@@ -491,8 +493,17 @@ class AIMClient:
         self._envelope_strict_mode = self.config.get("envelope_strict_mode", "warn")
         self._envelope_violations: int = 0  # 累计不合规消息数
         self._reject_hard_errors: bool = self._envelope_strict_mode == "reject"
+        # v1.6: dispatch 层熔断截流 — 连续 N 次 adapter timeout → 截流不投，不消费队列
+        self._dispatch_breaker = DispatchBreaker(
+            failure_threshold=self.config.get("breaker_failure_threshold", 5),
+            cooldown_sec=self.config.get("breaker_cooldown_sec", 60.0),
+            half_open_probe_sec=self.config.get("breaker_half_open_probe_sec", 30.0),
+        )
         self.logger.info(f"Framework: {self.config.get('framework', 'unknown')}")
         self.logger.info(f"Adapter: {self.adapter_cmd}")
+        self.logger.info(f"DispatchBreaker: threshold={self._dispatch_breaker.failure_threshold} "
+                         f"cooldown={self._dispatch_breaker.cooldown_sec}s "
+                         f"half_open_probe={self._dispatch_breaker.half_open_probe_sec}s")
         self.logger.info(f"Queue+Scheduler 已嵌入 (capacity={self.queue.capacity})")
 
     def _calc_stall_timeout(self) -> float:
@@ -544,6 +555,16 @@ class AIMClient:
                         self._last_dispatch_time = now_wd  # 只触发一次
 
                 while self.scheduler.should_dispatch() and self.queue.size() > 0:
+                    # v1.6: dispatch 层熔断截流 — adapter 连续 timeout 时不消费队列
+                    if self._dispatch_breaker.is_open:
+                        self.logger.warning(
+                            f"🛑 DispatchBreaker OPEN: 截流跳过 dequeue, "
+                            f"consecutive_timeouts={self._dispatch_breaker.consecutive_timeouts}, "
+                            f"queue={self.queue.size()}"
+                        )
+                        await asyncio.sleep(5)  # 等 cooldown 或 HALF_OPEN 放行
+                        self._dispatch_event.set()  # 确保下次唤醒
+                        break
                     msg = self.queue.dequeue()
                     if not msg:
                         break
@@ -1080,6 +1101,7 @@ class AIMClient:
         except asyncio.TimeoutError:
             proc.kill()
             self.logger.warning(f" [{msg.msg_id[:8]}] adapter 超时 ({self.scheduler.processing_timeout}s)")
+            self._dispatch_breaker.on_timeout()  # v1.6: 通知断路器
             raise RetryableError("adapter 超时")
 
         rc = proc.returncode or 0
@@ -1091,10 +1113,12 @@ class AIMClient:
 
         if rc == 0:
             # 正常回复
+            self._dispatch_breaker.on_success()  # v1.6: 重置断路器超时计数
             if stdout_text:
                 self.logger.debug(f" [{msg.msg_id[:8]}] adapter OK, reply={stdout_text[:60]}")
             else:
                 self.logger.debug(f" [{msg.msg_id[:8]}] adapter OK, 空回复")
+                self._dispatch_breaker.on_empty_response()  # 空响应也重置计数，但不重启 HALF_OPEN
             return stdout_text or None
 
         elif rc == 1:

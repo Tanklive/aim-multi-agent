@@ -560,8 +560,8 @@ class AIMClient:
                         self._in_flight.discard(msg.msg_id)
                         self.queue.ack(msg.msg_id)
                         continue
-                    # P0-D: 毒消息跳过（retry>=3 持久化，重启后跳过）
-                    if msg.msg_id and self._retry_tracker.get(msg.msg_id, 0) >= 3:
+                    # P0-D: 毒消息跳过（retry>=1 持久化，重启后跳过）— v1.5.3 max_retries=1
+                    if msg.msg_id and self._retry_tracker.get(msg.msg_id, 0) >= 1:
                         self.logger.warning(f" [{msg.msg_id[:8]}] 毒消息 retry={self._retry_tracker[msg.msg_id]}, skip→死信")
                         self.queue.ack(msg.msg_id)
                         self._in_flight.discard(msg.msg_id)
@@ -585,9 +585,9 @@ class AIMClient:
                             self.queue.ack(msg.msg_id)
                             self._in_flight.discard(msg.msg_id)
                             continue
-                        # ── 原地重试：消息不 nack 回队，在手里重试 3 次 ──
+                        # ── 原地重试：v1.5.3 止血降级，max_retries 3→1（不跟外部依赖较劲） ──
                         delivered = False
-                        for attempt in range(3):
+                        for attempt in range(1):
                             try:
                                 reply = await self._call_adapter(msg)
                                 if reply:
@@ -599,9 +599,9 @@ class AIMClient:
                                         safe = str(reply)[:200].replace('{', '(').replace('}', ')')
                                         await self.transport.send_dm(msg.from_id, safe)
                                 else:
-                                    # P0-D: 空响应 → 原地重试
-                                    self.logger.warning(f" [{msg.msg_id[:8]}] 空响应 (attempt {attempt+1}/3)")
-                                    if attempt == 2:
+                                    # P0-D: 空响应 → 直接跳过（v1.5.3 max_retries=1）
+                                    self.logger.warning(f" [{msg.msg_id[:8]}] 空响应→跳过")
+                                    if attempt == 0:
                                         self.queue.ack(msg.msg_id)
                                         self._in_flight.discard(msg.msg_id)
                                         if msg.msg_id:
@@ -645,8 +645,8 @@ class AIMClient:
                                 delivered = True
                                 break
                             except RetryableError:
-                                if attempt == 2:
-                                    self.logger.warning(f" [{msg.msg_id[:8]}] 退避耗尽 (3次)，入死信")
+                                if attempt == 0:
+                                    self.logger.warning(f" [{msg.msg_id[:8]}] 重试失败 (v1.5.3 skip)，入死信")
                                     self.queue.ack(msg.msg_id)
                                     self._in_flight.discard(msg.msg_id)
                                     if msg.msg_id:
@@ -1140,7 +1140,7 @@ class AIMClient:
                     self._retry_tracker = {}
                     self.logger.info("retry_counts expired (>24h), cleared")
                 else:
-                    poison = [k[:8] for k, v in self._retry_tracker.items() if v >= 3]
+                    poison = [k[:8] for k, v in self._retry_tracker.items() if v >= 1]  # v1.5.3: max_retries=1
                     if poison:
                         self.logger.warning(f"加载 {len(self._retry_tracker)} 条 retry_count, 毒消息: {poison}")
                     else:

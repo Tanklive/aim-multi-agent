@@ -34,9 +34,11 @@ import fcntl
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import time
+from datetime import datetime
 from collections import deque
 import uuid
 from logging.handlers import RotatingFileHandler
@@ -90,9 +92,45 @@ sys.modules['registry'] = registry_module
 registry_spec.loader.exec_module(registry_module)
 Registry = registry_module.Registry
 
+# AIM 功能模块
+_aim_shared = Path.home() / "shared" / "aim" / "aim-client"
+if str(_aim_shared) not in sys.path:
+    sys.path.insert(0, str(_aim_shared))
+from modules.chat_archive import ChatArchive
+
 # -- 单实例互斥 --
 LOCK_DIR = Path.home() / ".aim" / "run"
 LOCK_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ── 群操作意图识别 (Phase 2: ZS0001 adapter) ─────
+
+GROUP_INTENT_PATTERNS: list[tuple[re.Pattern, str]] = [
+    # ── create ──
+    (re.compile(r'^(?:创建|建|拉|新建)(?:个?)(?:群|群聊|群组)\s*(.*?)$'), 'create'),
+    (re.compile(r'^/create_group\s*(.*)$'), 'create'),
+    # ── join ──
+    (re.compile(r'^(?:加入|加)(?:入?)(?:群|群聊|群组)\s+(\S+)$'), 'join'),
+    (re.compile(r'^/join_group\s+(\S+)$'), 'join'),
+    # ── leave ──
+    (re.compile(r'^(?:退出|离开|退)(?:群|群聊|群组)\s+(\S+)$'), 'leave'),
+    (re.compile(r'^/leave_group\s+(\S+)$'), 'leave'),
+    # ── members ──
+    (re.compile(r'^(?:查看|查询)?(?:群成员|成员)\s+(\S+)$'), 'members'),
+    (re.compile(r'^/members\s+(\S+)$'), 'members'),
+    # ── approve ──
+    (re.compile(r'^(?:审批|同意)\s+(\S+)\s+(\S+)$'), 'approve'),
+    (re.compile(r'^/approve\s+(\S+)\s+(\S+)$'), 'approve'),
+    # ── reject ──
+    (re.compile(r'^(?:拒绝)\s+(\S+)\s+(\S+)$'), 'reject'),
+    (re.compile(r'^/reject\s+(\S+)\s+(\S+)$'), 'reject'),
+    # ── my_groups ──
+    (re.compile(r'^(?:我的群|我的群组|查看群组)$'), 'my_groups'),
+    (re.compile(r'^/my_groups$'), 'my_groups'),
+    # ── list_groups ──
+    (re.compile(r'^(?:所有群|群列表|查看所有群)$'), 'list_groups'),
+    (re.compile(r'^/list_groups$'), 'list_groups'),
+]
 
 
 class SingleInstance:
@@ -211,6 +249,7 @@ class Transport:
         self.agent_id = agent_id
         self._last_grp_interaction: dict[str, float] = {}  # 热窗口：群聊最后活跃时间
         self._grp_hot_remaining: dict[str, int] = {}  # v3: 热窗口剩余续期次数
+        self.chat_archive = ChatArchive(agent_id)  # AIM 聊天持久化模块
         self._logger = logging.getLogger("aim-client.transport")
         self._my_msg_ids: set = set()  # U-007: 追踪发出的消息
         creds_path = Path.home() / ".aim" / "agents" / agent_id / "aim.creds"
@@ -265,6 +304,8 @@ class Transport:
         if isinstance(envelope, dict) and "id" in envelope:
             self._my_msg_ids.add(envelope["id"])  # U-007: 追踪发出的消息
             await self.emit_delivery(to_id, envelope["id"], via="dm")
+            self.chat_archive.archive(envelope, direction="sent", to_id=to_id)  # P0: DM 归档
+            self._logger.info(f"📝 archive: sent DM to={to_id}")
         return envelope
 
     async def send_grp(self, group_id: str, text: str):
@@ -273,6 +314,8 @@ class Transport:
         if isinstance(result, dict) and "id" in result:
             self._my_msg_ids.add(result["id"])  # U-007: 追踪发出的消息
             await self.emit_delivery(group_id, result["id"], via="grp")
+            self.chat_archive.archive(result, direction="sent", to_id=group_id)  # P0: 群聊归档
+            self._logger.info(f"📝 archive: sent 群聊 to={group_id}")
         # 热窗口：发言后刷新活跃时间，让接力回复能进来
         # v3: 限制最大续期次数，防无限闲聊循环
         remaining = self._grp_hot_remaining.get(group_id)
@@ -476,6 +519,157 @@ class AIMClient:
         self.logger.info(f"Adapter: {self.adapter_cmd}")
         self.logger.info(f"Queue+Scheduler 已嵌入 (capacity={self.queue.capacity})")
 
+    # ── 群操作意图识别 ──────────────────────
+
+    GRP_CREATE  = "aim.groups.create"
+    GRP_JOIN    = "aim.groups.join"
+    GRP_APPROVE = "aim.groups.approve"
+    GRP_LEAVE   = "aim.groups.leave"
+    GRP_MEMBERS = "aim.groups.members"
+    GRP_LIST    = "aim.groups.list"
+    GRP_MY      = "aim.groups.my"
+
+    @staticmethod
+    def _detect_group_intent(content: str) -> tuple[str, dict] | None:
+        """检测群管理意图，返回 (intent, params) 或 None。"""
+        content = content.strip()
+        for pattern, intent in GROUP_INTENT_PATTERNS:
+            m = pattern.match(content)
+            if m:
+                params: dict = {}
+                if intent == 'create':
+                    params['name'] = m.group(1).strip() if m.group(1) else ''
+                elif intent in ('join', 'leave', 'members'):
+                    params['group_id'] = m.group(1).strip()
+                elif intent in ('approve', 'reject'):
+                    params['group_id'] = m.group(1).strip()
+                    params['agent_id'] = m.group(2).strip()
+                return (intent, params)
+        return None
+
+    @staticmethod
+    def _format_group_response(intent: str, resp: dict, params: dict) -> str:
+        """格式化群操作响应为人类可读消息。"""
+        status = resp.get('status', '')
+
+        if intent == 'create':
+            if status == 'created':
+                return f"✅ 群组已创建\n📛 名称: {resp.get('name', '?')}\n🆔 ID: `{resp.get('group_id', '?')}`"
+            elif status == 'exists':
+                return f"⚠️ 群组 `{resp.get('group_id', '?')}` 已存在"
+            return f"❌ 创建失败: {resp}"
+
+        elif intent == 'join':
+            if status == 'joined':
+                return f"✅ 已加入群组 `{resp.get('group_id', '?')}`"
+            elif status == 'pending':
+                return f"⏳ 加入申请已提交，等待群主 `{resp.get('owner','?')}` 审批"
+            elif status == 'already_member':
+                return f"⚠️ 你已经是群组 `{resp.get('group_id', '?')}` 的成员"
+            elif status == 'not_found':
+                return f"❌ 群组 `{resp.get('group_id', '?')}` 不存在"
+            return f"❌ 加入失败: {resp}"
+
+        elif intent == 'leave':
+            if status == 'left':
+                return f"✅ 已退出群组 `{resp.get('group_id', '?')}`"
+            elif status == 'not_member':
+                return f"⚠️ 你不是群组 `{resp.get('group_id', '?')}` 的成员"
+            return f"❌ 退群失败: {resp}"
+
+        elif intent == 'members':
+            if status == 'ok':
+                gid = resp.get('group_id', '?')
+                members = resp.get('members', [])
+                pending = resp.get('pending', {})
+                owner = resp.get('owner', '?')
+                lines = [f"👥 群成员 `{gid}`:", f"  👑 群主: {owner}"]
+                for m in members:
+                    lines.append(f"  👤 {m}")
+                if pending:
+                    lines.append(f"  ⏳ 待审批: {', '.join(pending.keys())}")
+                return '\n'.join(lines)
+            return f"❌ 查询失败: {resp}"
+
+        elif intent in ('approve', 'reject'):
+            if status == 'approved':
+                return f"✅ {params.get('agent_id', '?')} 已加入群组 `{resp.get('group_id', '?')}`"
+            elif status == 'rejected':
+                return f"🚫 已拒绝 {params.get('agent_id', '?')} 加入 `{resp.get('group_id', '?')}`"
+            elif status == 'unauthorized':
+                return "❌ 无权限：只有群主可以审批"
+            return f"❌ 操作失败: {resp}"
+
+        elif intent == 'my_groups':
+            if status == 'ok':
+                groups = resp.get('groups', {})
+                if not groups:
+                    return "📭 你还没有加入任何群组"
+                lines = ["📋 我的群组:"]
+                for gid, g in groups.items():
+                    default_tag = " [默认]" if g.get('is_default') else ""
+                    lines.append(f"  🔹 `{gid}` — {g.get('name', gid)}{default_tag} ({g.get('member_count',0)}人)")
+                return '\n'.join(lines)
+            return f"❌ 查询失败: {resp}"
+
+        elif intent == 'list_groups':
+            if status == 'ok':
+                groups = resp.get('groups', {})
+                if not groups:
+                    return "📭 暂无群组"
+                lines = ["📋 所有群组:"]
+                for gid, g in groups.items():
+                    lines.append(f"  🔹 `{gid}` — {g.get('name', gid)} ({g.get('members',0)}人)")
+                return '\n'.join(lines)
+            return f"❌ 查询失败: {resp}"
+
+        return f"❓ 未知响应: {resp}"
+
+    async def _group_request(self, subject: str, payload: dict) -> dict:
+        """向 GroupAdmission 服务发送 NATS 请求。"""
+        try:
+            nc = self.transport.get_nc()
+            if nc is None or not nc.is_connected:
+                return {"status": "error", "error": "NATS not connected"}
+            resp = await nc.request(subject, json.dumps(payload).encode(), timeout=5)
+            return json.loads(resp.data)
+        except asyncio.TimeoutError:
+            self.logger.error(f"GroupAdmission 请求超时: {subject}")
+            return {"status": "error", "error": "timeout"}
+        except Exception as e:
+            self.logger.error(f"GroupAdmission 请求失败 {subject}: {e}")
+            return {"status": "error", "error": str(e)}
+
+    async def _handle_group_command(
+        self, intent: str, params: dict, from_id: str, msg_id: str
+    ) -> str | None:
+        """处理群管理命令，返回回复文本。"""
+        # 按 intent 动态构建 payload（避免 dict literal 中无条件求值 params['group_id']）
+        if intent == 'create':
+            subj, payload = self.GRP_CREATE, {'group_id': '', 'owner': from_id, 'name': params.get('name', '')}
+        elif intent == 'join':
+            subj, payload = self.GRP_JOIN, {'group_id': params['group_id'], 'agent_id': from_id}
+        elif intent == 'leave':
+            subj, payload = self.GRP_LEAVE, {'group_id': params['group_id'], 'agent_id': from_id}
+        elif intent == 'members':
+            subj, payload = self.GRP_MEMBERS, {'group_id': params['group_id']}
+        elif intent == 'approve':
+            subj, payload = self.GRP_APPROVE, {'group_id': params['group_id'], 'agent_id': params['agent_id'], 'action': 'approve', 'requester': from_id}
+        elif intent == 'reject':
+            subj, payload = self.GRP_APPROVE, {'group_id': params['group_id'], 'agent_id': params['agent_id'], 'action': 'reject', 'requester': from_id}
+        elif intent == 'my_groups':
+            subj, payload = self.GRP_MY, {'agent_id': from_id}
+        elif intent == 'list_groups':
+            subj, payload = self.GRP_LIST, {}
+        else:
+            return None
+
+        self.logger.info(f"🎯 群操作 [{intent}] from={from_id}: {payload}")
+        resp_data = await self._group_request(subj, payload)
+        reply = self._format_group_response(intent, resp_data, params)
+        self.logger.info(f"📤 群操作回复 [{intent}]: {reply[:80]}...")
+        return reply
+
     def _calc_stall_timeout(self) -> float:
         """620: 自适应 stalled 阈值 — queue 越大超时越短"""
         qsize = self.queue.size()
@@ -559,8 +753,8 @@ class AIMClient:
                         pass
                     try:
                         # ── 免 LLM 消息：系统通知和确认消息不烧 token ──
-                        # 708修复：群聊消息已通过 HOT 过滤，不走免 LLM（防误杀实质性消息）
-                        skip_llm = not msg.grp_id and self._skip_adapter_for_operational(msg)
+                        # 710: 群聊已走 _grp_direct_route，池内仅剩私聊
+                        skip_llm = self._skip_adapter_for_operational(msg)
                         if skip_llm:
                             self.logger.debug(f" [{msg.msg_id[:8]}] 免LLM跳过: from={msg.from_id}")
                             self.queue.ack(msg.msg_id)
@@ -572,47 +766,13 @@ class AIMClient:
                             try:
                                 reply = await self._call_adapter(msg)
                                 if reply:
-                                    if msg.grp_id:
-                                        # 619-18: 群聊回路防护（30s 冷却，防回复风暴）
-                                        import time as _t619
-                                        now = _t619.time()
-                                        last = self._last_grp_reply.get(msg.grp_id, 0)
-                                        if now - last < self._grp_cooldown_sec:
-                                            self.logger.debug(f" [{msg.msg_id[:8]}] 群聊回复跳过（冷却 {now-last:.0f}s/{self._grp_cooldown_sec}s）")
-                                        elif self._is_confirm_loop(msg, reply):
-                                            self.logger.info(f" [{msg.msg_id[:8]}] 群聊确认循环跳过: in={msg.content[:20]} out={reply[:20]}")
-                                        else:
-                                            self._last_grp_reply[msg.grp_id] = now
-                                            # 618-01: 热窗口内不强制 @（自然流动），窗口外才 @发送者
-                                            # 防止 AI 输出小写 ID 导致误判 → casefold 比较
-                                            last_active = self._last_grp_interaction.get(msg.grp_id, 0)
-                                            gap = now - last_active
-                                            outside_hot = gap >= self._grp_hot_window_sec
-                                            if outside_hot:
-                                                reply_lower = reply.casefold()
-                                                from_lower = f'@{msg.from_id}'.casefold()
-                                                if from_lower not in reply_lower:
-                                                    self.logger.info(f' [{msg.msg_id[:8]}] @prepend: +{msg.from_id} (gap={gap:.0f}s,hot={self._grp_hot_window_sec}s)')
-                                                    reply = f'@{msg.from_id} {reply}'
-                                                else:
-                                                    self.logger.debug(f' [{msg.msg_id[:8]}] @skip: already has {msg.from_id} (casefold ok)')
-                                            else:
-                                                self.logger.debug(f' [{msg.msg_id[:8]}] @skip: hot window (gap={gap:.0f}s/{self._grp_hot_window_sec}s)')
-                                            try:
-                                                await self.transport.send_grp(msg.grp_id, reply)
-                                                # ZS0003: self-send 必刷新热窗口（我发言 = 我在参与）
-                                                self._last_grp_interaction[msg.grp_id] = time.time()
-                                            except ValueError as e:
-                                                self.logger.warning(f" [{msg.msg_id[:8]}] 群发校验拦截: {e}")
-                                                safe = str(reply)[:200].replace('{', '(').replace('}', ')')
-                                                await self.transport.send_grp(msg.grp_id, safe)
-                                    else:
-                                        try:
-                                            await self.transport.send_dm(msg.from_id, reply)
-                                        except ValueError as e:
-                                            self.logger.warning(f" [{msg.msg_id[:8]}] DM校验拦截: {e}")
-                                            safe = str(reply)[:200].replace('{', '(').replace('}', ')')
-                                            await self.transport.send_dm(msg.from_id, safe)
+                                    # 710: dispatch 池仅处理私聊，群聊走 _grp_direct_route
+                                    try:
+                                        await self.transport.send_dm(msg.from_id, reply)
+                                    except ValueError as e:
+                                        self.logger.warning(f" [{msg.msg_id[:8]}] DM校验拦截: {e}")
+                                        safe = str(reply)[:200].replace('{', '(').replace('}', ')')
+                                        await self.transport.send_dm(msg.from_id, safe)
                                 else:
                                     # P0-D: 空响应 → 原地重试
                                     self.logger.warning(f" [{msg.msg_id[:8]}] 空响应 (attempt {attempt+1}/3)")
@@ -744,7 +904,7 @@ class AIMClient:
         await self.transport.subscribe_notification(self._on_notification)
 
         self.running = True
-        self.logger.info(f" {self.agent_id} AIM Client v{_AIM_VERSION} 启动完成")
+        self.logger.info(f" {self.agent_id} AIM Client v{_AIM_VERSION} 启动完成 (ChatArchive v{_AIM_VERSION})")
 
         # NOTICE 1.3.0: 运行时版本检查（拒绝低于最低要求的 SDK）
         _MIN_SDK = "1.3.0"
@@ -1186,6 +1346,8 @@ class AIMClient:
             return
         detail = f"from={from_id}" + (f" text={obs_text}" if obs_text else "")
         # await self.transport.emit_obs("received", mid, detail)  # 2026-06-21 禁用以省带宽
+        self.transport.chat_archive.archive(envelope, direction="received", to_id=self.agent_id)  # P0: DM 归档
+        self.logger.info(f"📝 archive: received DM from={from_id}")
         await self._handle_message(envelope, is_dm=True)
 
     async def _on_grp(self, envelope: dict, raw_msg):
@@ -1198,6 +1360,9 @@ class AIMClient:
             return
         detail = f"from={from_id}" + (f" text={obs_text}" if obs_text else "")
         # await self.transport.emit_obs("received", mid, detail)  # 2026-06-21 禁用以省带宽
+        grp_id = envelope.get("meta", {}).get("group", self._default_group)
+        self.transport.chat_archive.archive(envelope, direction="received", to_id=grp_id)  # P0: 群聊归档
+        self.logger.info(f"📝 archive: received 群聊 from={from_id}")
         await self._handle_message(envelope, is_dm=False)
 
     async def _handle_message(self, envelope: dict, *, is_dm: bool):
@@ -1218,6 +1383,29 @@ class AIMClient:
         # 620: 移除 envelope.get("content") 容错回退，不合规格式已在上面告警
         if not content:
             return
+
+        # ── Phase 2: 群操作意图识别（拦截，直接 NATS 调用，不经过 adapter/LLM）──
+        group_intent = self._detect_group_intent(content)
+        if group_intent:
+            intent, params = group_intent
+            from_id = envelope.get("from", "")
+            msg_id = envelope.get("id", str(uuid.uuid4()))
+            self.logger.info(f"🎯 [{msg_id[:8]}] 检测到群操作意图: {intent} {params}")
+            try:
+                reply = await self._handle_group_command(intent, params, from_id, msg_id)
+                if reply:
+                    if is_dm:
+                        await self.transport.send_dm(from_id, reply)
+                        self.logger.info(f"✅ 群操作 DM 回复 {from_id}: {reply[:60]}...")
+                    else:
+                        grp_id = envelope.get("meta", {}).get("group", self._default_group)
+                        await self.transport.send_grp(grp_id, reply)
+                        self.logger.info(f"✅ 群操作群回复 {grp_id}: {reply[:60]}...")
+            except Exception as e:
+                self.logger.error(f"❌ 群操作处理失败 [{intent}]: {e}")
+                if is_dm:
+                    await self.transport.send_dm(from_id, f"❌ 群操作失败: {e}")
+            return  # 拦截成功，不进入后续流程
 
         # ── 送达确认替代 ACK：短 ACK 不进 dispatch ──
         # 传输层 NATS publish ack 已保证送达，应用层 ACK 是冗余
@@ -1348,14 +1536,10 @@ class AIMClient:
                         return
                 self.logger.debug(f" [{msg_id[:8]}] 群聊未@但热窗口内 (active={now_ts-last_active:.0f}s/{self._grp_hot_window_sec}s), from={from_id}")
 
-        self.queue.enqueue(msg)
-        self._dispatch_event.set()
-        self.scheduler.on_message_enqueued()
-        # 618-02 v2: 语义热窗口 — 仅实质性消息续期
-        # 注：self-send 刷新在 dispatch 循环 send_grp 后（L578），不走这里
+        # ── 710-分支：群聊消息不走 dispatch 池，直接调 adapter → NATS publish ──
         if not is_dm and msg.grp_id:
             if not self._skip_adapter_for_operational(msg):
-                # v3.5: @me → 重置热窗口（有人在跟我说话，窗口重新开始）
+                # 618-02 v2: 语义热窗口续期 (保留在直接路由分支中)
                 if mentioned_me:
                     self._grp_hot_remaining[msg.grp_id] = 2
                     self._grp_hot_grace_used.pop(msg.grp_id, None)
@@ -1363,7 +1547,6 @@ class AIMClient:
                     self._last_grp_interaction[msg.grp_id] = now_ts
                     self.logger.debug(f' [{msg_id[:8]}] 热窗口重置(@me, grp={msg.grp_id})')
                 else:
-                    # v3: 纯热窗口消息 → 消耗剩余次数
                     remaining = self._grp_hot_remaining.get(msg.grp_id)
                     if remaining is None:
                         self._grp_hot_remaining[msg.grp_id] = 2
@@ -1374,6 +1557,63 @@ class AIMClient:
                     else:
                         self._grp_hot_exhausted_at.setdefault(msg.grp_id, now_ts)
                         self.logger.debug(f' [{msg_id[:8]}] 热窗口耗尽({msg.grp_id}), 不续期')
+                # 直接调 adapter + send_grp，不进池
+                asyncio.create_task(self._grp_direct_route(msg))
+            return
+
+        self.queue.enqueue(msg)
+        self._dispatch_event.set()
+        self.scheduler.on_message_enqueued()
+
+    async def _grp_direct_route(self, msg: Message):
+        """710: 群聊直连路由 — 不经过 dispatch 池，直接调 adapter → NATS publish。
+
+        与 dispatch 池的私聊管道分离，避免群聊消息占用池资源。
+        群聊对延迟/顺序不敏感，不需要池子的队列保证和重试机制。
+        """
+        eid = msg.msg_id[:8]
+        try:
+            reply = await self._call_adapter(msg)
+            if reply:
+                grp_id = msg.grp_id
+                # 群聊回路防护（30s 冷却，防回复风暴）
+                import time as _t
+                now = _t.time()
+                last = self._last_grp_reply.get(grp_id, 0)
+                if now - last < self._grp_cooldown_sec:
+                    self.logger.debug(f' [{eid}] 群聊回复跳过（冷却 {now-last:.0f}s/{self._grp_cooldown_sec}s）')
+                    return
+                if self._is_confirm_loop(msg, reply):
+                    self.logger.info(f' [{eid}] 群聊确认循环跳过: in={msg.content[:20]} out={reply[:20]}')
+                    return
+                self._last_grp_reply[grp_id] = now
+                # 热窗口外 @发送者
+                last_active = self._last_grp_interaction.get(grp_id, 0)
+                gap = now - last_active
+                outside_hot = gap >= self._grp_hot_window_sec
+                if outside_hot:
+                    reply_lower = reply.casefold()
+                    from_lower = f'@{msg.from_id}'.casefold()
+                    if from_lower not in reply_lower:
+                        self.logger.info(f' [{eid}] @prepend: +{msg.from_id} (gap={gap:.0f}s,hot={self._grp_hot_window_sec}s)')
+                        reply = f'@{msg.from_id} {reply}'
+                else:
+                    self.logger.debug(f' [{eid}] @skip: hot window (gap={gap:.0f}s/{self._grp_hot_window_sec}s)')
+                try:
+                    await self.transport.send_grp(grp_id, reply)
+                    self._last_grp_interaction[grp_id] = time.time()
+                except ValueError as e:
+                    self.logger.warning(f' [{eid}] 群发校验拦截: {e}')
+                    safe = str(reply)[:200].replace('{', '(').replace('}', ')')
+                    await self.transport.send_grp(grp_id, safe)
+        except RetryableError:
+            self.logger.warning(f' [{eid}] 群聊直连可重试: adapter exit=1 (静默)')
+        except DegradeError:
+            self.logger.warning(f' [{eid}] 群聊直连降级: adapter exit=2 (静默)')
+        except HumanInterventionError:
+            self.logger.error(f' [{eid}] 群聊直连致命: adapter exit=3 (静默)')
+        except Exception as e:
+            self.logger.error(f' [{eid}] 群聊直连异常: {e}')
 
     def _validate_envelope(self, envelope: dict):
         """620: veritas v1.0 信封格式校验

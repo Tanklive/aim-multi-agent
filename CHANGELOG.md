@@ -1,5 +1,42 @@
 # Changelog
 
+## v1.5.2 (2026-07-17) — ChatArchive 模块化 + Cursor 分页
+
+### New Module: ChatArchive (`aim-client/modules/chat_archive.py`)
+- 聊天记录持久化：JSONL 追加写入，单 Agent 绑定，进程级去重
+- Cursor-based 分页：`get_messages(peer_id, before=msg_id, limit=20)` 对标微信上拉加载更多
+- 时间范围筛选：`get_messages(peer_id, since="ISO时间")`
+- 前缀匹配容错：cursor 支持短 ID 前缀匹配
+- Malformed 输入防御：非 dict envelope/payload 不崩溃，graceful return
+- 内置查询接口：`search()` / `get_messages()` / `get_stats()` / `export_readable()`
+- 数据目录统一：`~/.aim/data/archive/{agent_id}/chat_history.jsonl`
+
+### Changed
+- `aim-client/main.py`：archive() 调用改为 `self.chat_archive.archive()`，删除旧 `_archive_msg` + importlib hack
+- `~/.openclaw/aim/archive.py`：从 290 行归档逻辑 → 100 行 CLI 薄封装，底层调 ChatArchive
+- Transport 集成：4 处归档调用点（send_dm/send_grp/_on_dm/_on_grp）统一走 ChatArchive
+
+### Added CLI
+```bash
+archive.py page ZS0001 grp_trio -n 20                 # 分页首屏
+archive.py page ZS0001 grp_trio -b <msg_id> -n 20     # Cursor 翻页
+archive.py page ZS0001 grp_trio -s "2026-07-17T06:00"  # 时间范围
+archive.py session ZS0001 ZS0002 -n 50                # 全量对话（简单模式）
+archive.py search ZS0001 "关键词"                      # 搜索
+archive.py stats ZS0001                                # 统计
+archive.py export ZS0001 [peer_id]                     # 导出可读格式
+```
+
+### Bug Fixes
+- P-002: Malformed envelope (`payload` 非 dict) 导致 archive() 崩溃 → 加类型检查
+- P-003: 旧数据迁移 (cat old→new) 引入重复 → 按 (msg_id, direction) 去重
+- 归档日志统一 `📝 archive:` 前缀，便于 grep
+
+### Data Migration
+- 旧路径 `~/.openclaw/aim/data/archive/` → 新路径 `~/.aim/data/archive/`
+- 三方 Agent 数据合并 + 去重：ZS0001=140, ZS0002=114, ZS0003=85 unique
+
+
 ## v1.5.1 (2026-07-03) — P-fix 三连
 
 ### P0: content validator pattern #2 放行 v1.0 协议 JSON

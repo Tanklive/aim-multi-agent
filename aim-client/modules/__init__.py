@@ -6,8 +6,10 @@ AIM Client Modules
 
 模块列表：
     ChatArchive  — 聊天记录持久化（JSONL + 分页查询）
+    GroupManager — 群管理（创建/加入/退出/审批/查询），统一 NATS 通信 + 意图识别
 """
 
-__all__ = ["ChatArchive"]
+__all__ = ["ChatArchive", "GroupManager"]
 
 from .chat_archive import ChatArchive
+from .group_manager import GroupManager

@@ -1,5 +1,32 @@
 # Changelog
 
+## v1.5.3 (2026-07-17) — GroupManager 模块化 + 群安全加固
+
+### P0: 群安全漏洞修复
+- **KeyError 根除**：所有 `params['group_id']` 硬索引 → `params.get('group_id', '')`
+- **空名拒绝**：`create_group(name="")` 不再创建 UUID 碎片群
+- **频率限制**：每分钟 ≤3 个群创建（滑动窗口）
+- **输入验证**：群名 ≤50 字符 + 合法字符过滤 + 群 ID 格式 `grp_<uuid>` 校验
+- **垃圾群清理**：删除 NATS KV 中 59 个 UUID 碎片群
+
+### New Module: GroupManager (`aim-client/modules/group_manager.py`)
+- 所有 Agent 统一接口：`from modules.group_manager import GroupManager`
+- 8 个标准 API：`create_group/join_group/leave_group/get_members/get_my_groups/list_groups/approve_member/reject_member`
+- 意图识别（自然语言 → API）：`detect_intent("创建群 xxx")`
+- 统一命令处理：`handle_command(intent, params, from_id)` → 人类可读回复
+- 响应格式化：`format_response()` 全部使用 `.get()` 防 KeyError
+- 统计自检：`stats()` 返回频率限制用量
+
+### Changed: main.py
+- **移除**：`GROUP_INTENT_PATTERNS`、`GRP_CREATE/...` 常量、`_detect_group_intent`、`_handle_group_command`、`_format_group_response`、`_group_request`
+- **替换为**：`self.group_mgr.detect_intent()` + `self.group_mgr.handle_command()`
+- 代码从 ~150 行群逻辑 → 15 行调用
+
+### New: README-GroupManager.md
+- 完整 API 文档、意图识别规则、安全机制说明
+
+---
+
 ## v1.5.2 (2026-07-17) — ChatArchive 模块化 + Cursor 分页
 
 ### New Module: ChatArchive (`aim-client/modules/chat_archive.py`)

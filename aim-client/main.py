@@ -97,40 +97,12 @@ _aim_shared = Path.home() / "shared" / "aim" / "aim-client"
 if str(_aim_shared) not in sys.path:
     sys.path.insert(0, str(_aim_shared))
 from modules.chat_archive import ChatArchive
+from modules.group_manager import GroupManager
 
 # -- 单实例互斥 --
 LOCK_DIR = Path.home() / ".aim" / "run"
 LOCK_DIR.mkdir(parents=True, exist_ok=True)
 
-
-# ── 群操作意图识别 (Phase 2: ZS0001 adapter) ─────
-
-GROUP_INTENT_PATTERNS: list[tuple[re.Pattern, str]] = [
-    # ── create ──
-    (re.compile(r'^(?:创建|建|拉|新建)(?:个?)(?:群|群聊|群组)\s*(.*?)$'), 'create'),
-    (re.compile(r'^/create_group\s*(.*)$'), 'create'),
-    # ── join ──
-    (re.compile(r'^(?:加入|加)(?:入?)(?:群|群聊|群组)\s+(\S+)$'), 'join'),
-    (re.compile(r'^/join_group\s+(\S+)$'), 'join'),
-    # ── leave ──
-    (re.compile(r'^(?:退出|离开|退)(?:群|群聊|群组)\s+(\S+)$'), 'leave'),
-    (re.compile(r'^/leave_group\s+(\S+)$'), 'leave'),
-    # ── members ──
-    (re.compile(r'^(?:查看|查询)?(?:群成员|成员)\s+(\S+)$'), 'members'),
-    (re.compile(r'^/members\s+(\S+)$'), 'members'),
-    # ── approve ──
-    (re.compile(r'^(?:审批|同意)\s+(\S+)\s+(\S+)$'), 'approve'),
-    (re.compile(r'^/approve\s+(\S+)\s+(\S+)$'), 'approve'),
-    # ── reject ──
-    (re.compile(r'^(?:拒绝)\s+(\S+)\s+(\S+)$'), 'reject'),
-    (re.compile(r'^/reject\s+(\S+)\s+(\S+)$'), 'reject'),
-    # ── my_groups ──
-    (re.compile(r'^(?:我的群|我的群组|查看群组)$'), 'my_groups'),
-    (re.compile(r'^/my_groups$'), 'my_groups'),
-    # ── list_groups ──
-    (re.compile(r'^(?:所有群|群列表|查看所有群)$'), 'list_groups'),
-    (re.compile(r'^/list_groups$'), 'list_groups'),
-]
 
 
 class SingleInstance:
@@ -442,6 +414,10 @@ class AIMClient:
         nats_url = self.config.get("nats_server", "nats://127.0.0.1:4222")
         self.transport = Transport(self.agent_id, nats_url)
 
+        # GroupManager — 群操作标准模块 (从 Transport 迁移出来)
+        # 初始化时 nc 尚未连接，延迟到 run() 中绑定
+        self.group_mgr: Optional[GroupManager] = None
+
         # Security v1
         self.security = SecurityManager(self.config)
         creds_path = Path.home() / ".aim" / "agents" / self.agent_id / "aim.creds"
@@ -518,157 +494,6 @@ class AIMClient:
         self.logger.info(f"Framework: {self.config.get('framework', 'unknown')}")
         self.logger.info(f"Adapter: {self.adapter_cmd}")
         self.logger.info(f"Queue+Scheduler 已嵌入 (capacity={self.queue.capacity})")
-
-    # ── 群操作意图识别 ──────────────────────
-
-    GRP_CREATE  = "aim.groups.create"
-    GRP_JOIN    = "aim.groups.join"
-    GRP_APPROVE = "aim.groups.approve"
-    GRP_LEAVE   = "aim.groups.leave"
-    GRP_MEMBERS = "aim.groups.members"
-    GRP_LIST    = "aim.groups.list"
-    GRP_MY      = "aim.groups.my"
-
-    @staticmethod
-    def _detect_group_intent(content: str) -> tuple[str, dict] | None:
-        """检测群管理意图，返回 (intent, params) 或 None。"""
-        content = content.strip()
-        for pattern, intent in GROUP_INTENT_PATTERNS:
-            m = pattern.match(content)
-            if m:
-                params: dict = {}
-                if intent == 'create':
-                    params['name'] = m.group(1).strip() if m.group(1) else ''
-                elif intent in ('join', 'leave', 'members'):
-                    params['group_id'] = m.group(1).strip()
-                elif intent in ('approve', 'reject'):
-                    params['group_id'] = m.group(1).strip()
-                    params['agent_id'] = m.group(2).strip()
-                return (intent, params)
-        return None
-
-    @staticmethod
-    def _format_group_response(intent: str, resp: dict, params: dict) -> str:
-        """格式化群操作响应为人类可读消息。"""
-        status = resp.get('status', '')
-
-        if intent == 'create':
-            if status == 'created':
-                return f"✅ 群组已创建\n📛 名称: {resp.get('name', '?')}\n🆔 ID: `{resp.get('group_id', '?')}`"
-            elif status == 'exists':
-                return f"⚠️ 群组 `{resp.get('group_id', '?')}` 已存在"
-            return f"❌ 创建失败: {resp}"
-
-        elif intent == 'join':
-            if status == 'joined':
-                return f"✅ 已加入群组 `{resp.get('group_id', '?')}`"
-            elif status == 'pending':
-                return f"⏳ 加入申请已提交，等待群主 `{resp.get('owner','?')}` 审批"
-            elif status == 'already_member':
-                return f"⚠️ 你已经是群组 `{resp.get('group_id', '?')}` 的成员"
-            elif status == 'not_found':
-                return f"❌ 群组 `{resp.get('group_id', '?')}` 不存在"
-            return f"❌ 加入失败: {resp}"
-
-        elif intent == 'leave':
-            if status == 'left':
-                return f"✅ 已退出群组 `{resp.get('group_id', '?')}`"
-            elif status == 'not_member':
-                return f"⚠️ 你不是群组 `{resp.get('group_id', '?')}` 的成员"
-            return f"❌ 退群失败: {resp}"
-
-        elif intent == 'members':
-            if status == 'ok':
-                gid = resp.get('group_id', '?')
-                members = resp.get('members', [])
-                pending = resp.get('pending', {})
-                owner = resp.get('owner', '?')
-                lines = [f"👥 群成员 `{gid}`:", f"  👑 群主: {owner}"]
-                for m in members:
-                    lines.append(f"  👤 {m}")
-                if pending:
-                    lines.append(f"  ⏳ 待审批: {', '.join(pending.keys())}")
-                return '\n'.join(lines)
-            return f"❌ 查询失败: {resp}"
-
-        elif intent in ('approve', 'reject'):
-            if status == 'approved':
-                return f"✅ {params.get('agent_id', '?')} 已加入群组 `{resp.get('group_id', '?')}`"
-            elif status == 'rejected':
-                return f"🚫 已拒绝 {params.get('agent_id', '?')} 加入 `{resp.get('group_id', '?')}`"
-            elif status == 'unauthorized':
-                return "❌ 无权限：只有群主可以审批"
-            return f"❌ 操作失败: {resp}"
-
-        elif intent == 'my_groups':
-            if status == 'ok':
-                groups = resp.get('groups', {})
-                if not groups:
-                    return "📭 你还没有加入任何群组"
-                lines = ["📋 我的群组:"]
-                for gid, g in groups.items():
-                    default_tag = " [默认]" if g.get('is_default') else ""
-                    lines.append(f"  🔹 `{gid}` — {g.get('name', gid)}{default_tag} ({g.get('member_count',0)}人)")
-                return '\n'.join(lines)
-            return f"❌ 查询失败: {resp}"
-
-        elif intent == 'list_groups':
-            if status == 'ok':
-                groups = resp.get('groups', {})
-                if not groups:
-                    return "📭 暂无群组"
-                lines = ["📋 所有群组:"]
-                for gid, g in groups.items():
-                    lines.append(f"  🔹 `{gid}` — {g.get('name', gid)} ({g.get('members',0)}人)")
-                return '\n'.join(lines)
-            return f"❌ 查询失败: {resp}"
-
-        return f"❓ 未知响应: {resp}"
-
-    async def _group_request(self, subject: str, payload: dict) -> dict:
-        """向 GroupAdmission 服务发送 NATS 请求。"""
-        try:
-            nc = self.transport.get_nc()
-            if nc is None or not nc.is_connected:
-                return {"status": "error", "error": "NATS not connected"}
-            resp = await nc.request(subject, json.dumps(payload).encode(), timeout=5)
-            return json.loads(resp.data)
-        except asyncio.TimeoutError:
-            self.logger.error(f"GroupAdmission 请求超时: {subject}")
-            return {"status": "error", "error": "timeout"}
-        except Exception as e:
-            self.logger.error(f"GroupAdmission 请求失败 {subject}: {e}")
-            return {"status": "error", "error": str(e)}
-
-    async def _handle_group_command(
-        self, intent: str, params: dict, from_id: str, msg_id: str
-    ) -> str | None:
-        """处理群管理命令，返回回复文本。"""
-        # 按 intent 动态构建 payload（避免 dict literal 中无条件求值 params['group_id']）
-        if intent == 'create':
-            subj, payload = self.GRP_CREATE, {'group_id': '', 'owner': from_id, 'name': params.get('name', '')}
-        elif intent == 'join':
-            subj, payload = self.GRP_JOIN, {'group_id': params['group_id'], 'agent_id': from_id}
-        elif intent == 'leave':
-            subj, payload = self.GRP_LEAVE, {'group_id': params['group_id'], 'agent_id': from_id}
-        elif intent == 'members':
-            subj, payload = self.GRP_MEMBERS, {'group_id': params['group_id']}
-        elif intent == 'approve':
-            subj, payload = self.GRP_APPROVE, {'group_id': params['group_id'], 'agent_id': params['agent_id'], 'action': 'approve', 'requester': from_id}
-        elif intent == 'reject':
-            subj, payload = self.GRP_APPROVE, {'group_id': params['group_id'], 'agent_id': params['agent_id'], 'action': 'reject', 'requester': from_id}
-        elif intent == 'my_groups':
-            subj, payload = self.GRP_MY, {'agent_id': from_id}
-        elif intent == 'list_groups':
-            subj, payload = self.GRP_LIST, {}
-        else:
-            return None
-
-        self.logger.info(f"🎯 群操作 [{intent}] from={from_id}: {payload}")
-        resp_data = await self._group_request(subj, payload)
-        reply = self._format_group_response(intent, resp_data, params)
-        self.logger.info(f"📤 群操作回复 [{intent}]: {reply[:80]}...")
-        return reply
 
     def _calc_stall_timeout(self) -> float:
         """620: 自适应 stalled 阈值 — queue 越大超时越短"""
@@ -889,6 +714,11 @@ class AIMClient:
             sys.exit(1)
 
         await self.transport.authenticate()
+
+        # 初始化 GroupManager（绑定 Transport 的 NATS 连接）
+        nc = self.transport.get_nc()
+        self.group_mgr = GroupManager(nc, agent_id=self.agent_id)
+        self.logger.info(f" GroupManager 已初始化 (agent={self.agent_id})")
 
         # 自动向 Registry 注册
         await self._register_with_registry()
@@ -1384,28 +1214,28 @@ class AIMClient:
         if not content:
             return
 
-        # ── Phase 2: 群操作意图识别（拦截，直接 NATS 调用，不经过 adapter/LLM）──
-        group_intent = self._detect_group_intent(content)
-        if group_intent:
-            intent, params = group_intent
-            from_id = envelope.get("from", "")
-            msg_id = envelope.get("id", str(uuid.uuid4()))
-            self.logger.info(f"🎯 [{msg_id[:8]}] 检测到群操作意图: {intent} {params}")
-            try:
-                reply = await self._handle_group_command(intent, params, from_id, msg_id)
-                if reply:
+        # ── Phase 2: 群操作意图识别（拦截，通过 GroupManager 标准模块，不经过 adapter/LLM）──
+        if self.group_mgr:
+            group_intent = self.group_mgr.detect_intent(content)
+            if group_intent:
+                intent, params = group_intent
+                from_id = envelope.get("from", "")
+                msg_id = envelope.get("id", str(uuid.uuid4()))
+                self.logger.info(f"🎯 [{msg_id[:8]}] 检测到群操作意图: {intent} {params}")
+                try:
+                    reply = await self.group_mgr.handle_command(intent, params, from_id)
+                    if reply:
+                        if is_dm:
+                            await self.transport.send_dm(from_id, reply)
+                        else:
+                            grp_id = envelope.get("meta", {}).get("group", self._default_group)
+                            await self.transport.send_grp(grp_id, reply)
+                        self.logger.info(f"✅ 群操作回复 [{intent}]: {reply[:60]}...")
+                except Exception as e:
+                    self.logger.error(f"❌ 群操作处理失败 [{intent}]: {e}")
                     if is_dm:
-                        await self.transport.send_dm(from_id, reply)
-                        self.logger.info(f"✅ 群操作 DM 回复 {from_id}: {reply[:60]}...")
-                    else:
-                        grp_id = envelope.get("meta", {}).get("group", self._default_group)
-                        await self.transport.send_grp(grp_id, reply)
-                        self.logger.info(f"✅ 群操作群回复 {grp_id}: {reply[:60]}...")
-            except Exception as e:
-                self.logger.error(f"❌ 群操作处理失败 [{intent}]: {e}")
-                if is_dm:
-                    await self.transport.send_dm(from_id, f"❌ 群操作失败: {e}")
-            return  # 拦截成功，不进入后续流程
+                        await self.transport.send_dm(from_id, f"❌ 群操作失败: {e}")
+                return  # 拦截成功，不进入后续流程
 
         # ── 送达确认替代 ACK：短 ACK 不进 dispatch ──
         # 传输层 NATS publish ack 已保证送达，应用层 ACK 是冗余

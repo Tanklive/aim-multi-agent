@@ -24,6 +24,10 @@ Phase 2 范围:
   审批:     → aim.groups.approve {"group_id":"my_grp","agent_id":"ZS0002","action":"approve"}
   查成员:   → aim.groups.members {"group_id":"my_grp"}
   我的群:   → aim.groups.my       {"agent_id":"ZS0001"}
+
+  群公告:   → aim.groups.announce {"action":"set","group_id":"...","operator":"群主ID","content":"公告内容"}
+              aim.groups.announce {"action":"get","group_id":"..."}
+  权限: 仅群主可设置公告，所有成员可查看。新成员入群自动推送。
 """
 
 from __future__ import annotations
@@ -67,26 +71,26 @@ class GroupInfo:
 class GroupAdmission:
     """群聊准入管理器 — NATS 微服务 + 客户端"""
 
-    SUBJ_CREATE  = "aim.groups.create"
-    SUBJ_JOIN    = "aim.groups.join"
-    SUBJ_APPROVE = "aim.groups.approve"
-    SUBJ_LEAVE   = "aim.groups.leave"
-    SUBJ_MEMBERS = "aim.groups.members"
-    SUBJ_LIST    = "aim.groups.list"
-    SUBJ_MY      = "aim.groups.my"
+    SUBJ_CREATE   = "aim.groups.create"
+    SUBJ_JOIN     = "aim.groups.join"
+    SUBJ_APPROVE  = "aim.groups.approve"
+    SUBJ_LEAVE    = "aim.groups.leave"
+    SUBJ_MEMBERS  = "aim.groups.members"
+    SUBJ_LIST     = "aim.groups.list"
+    SUBJ_MY       = "aim.groups.my"
+    SUBJ_ANNOUNCE = "aim.groups.announce"
 
     # ── 群 ID / 命名工具 ──
 
     @staticmethod
     def generate_group_id() -> str:
-        """生成全局唯一群 ID: grp_<timestamp_ms>_<random4>
+        """生成全局唯一群 ID: grp_<uuid4>
 
-        格式: grp_1712345678_a3f2
-        保证分布式安全: 同毫秒内不同 Agent 创建的群不会冲突。
+        格式: grp_a1b2c3d4-e5f6-7890-abcd-ef1234567890
+        使用 UUID4 (RFC 4122)，保证跨系统全局唯一，且不暴露创建时间。
         """
-        ts = int(time.time() * 1000)
-        rand = secrets.token_hex(4)[:4]
-        return f"grp_{ts}_{rand}"
+        import uuid
+        return f"grp_{uuid.uuid4()}"
 
     @staticmethod
     def default_group_name() -> str:
@@ -144,6 +148,7 @@ class GroupAdmission:
         await self.nc.subscribe(self.SUBJ_MEMBERS, cb=self._handle_members)
         await self.nc.subscribe(self.SUBJ_LIST, cb=self._handle_list)
         await self.nc.subscribe(self.SUBJ_MY, cb=self._handle_my)
+        await self.nc.subscribe(self.SUBJ_ANNOUNCE, cb=self._handle_announce)
 
         self._running = True
         logger.info(f"群聊准入启动 — {len(self._groups)} group(s)")
@@ -294,6 +299,7 @@ class GroupAdmission:
             grp.members.append(agent_id)
             await self._save_to_kv(group_id, grp)
             self._notify_group_update(agent_id, group_id, "added", grp.name)
+            await self._push_announcement_on_join(agent_id, group_id)
             logger.info(f"{agent_id} 加入默认群 {group_id}")
             self._respond(msg, {"status": "joined", "group_id": group_id})
         else:
@@ -327,6 +333,7 @@ class GroupAdmission:
             grp.members.append(agent_id)
             grp.pending_joins.pop(agent_id, None)
             self._notify_group_update(agent_id, group_id, "added", grp.name)
+            await self._push_announcement_on_join(agent_id, group_id)
             logger.info(f"✅ {agent_id} 加入 {group_id}")
             self._respond(msg, {"status": "approved", "group_id": group_id, "agent_id": agent_id})
         elif action == "reject":
@@ -424,6 +431,109 @@ class GroupAdmission:
                 }
         self._respond(msg, {"status": "ok", "agent_id": agent_id, "groups": my_groups})
 
+    # ── 群公告 (v2.0 2026-07-15) ──
+
+    async def _get_announce_kv_key(self, group_id: str) -> str:
+        return f"{group_id}-announce"
+
+    async def _push_announcement_on_join(self, agent_id: str, group_id: str):
+        """新成员入群时自动推送已有公告"""
+        try:
+            key = await self._get_announce_kv_key(group_id)
+            entry = await self.kv.get(key)
+            ann = json.loads(entry.value.decode())
+            await self._push_announcement_to(agent_id, group_id, ann["content"], ann["set_by"], ann["set_at"])
+        except Exception:
+            pass  # 无公告则静默
+
+    async def _push_announcement_to(self, agent_id: str, group_id: str, content: str, set_by: str, set_at: float):
+        """推送群公告给指定 Agent"""
+        payload = {
+            "event": "group.announce",
+            "group_id": group_id,
+            "content": content,
+            "set_by": set_by,
+            "set_at": set_at,
+            "timestamp": time.time(),
+        }
+        # 同时发通知 + 直接发 DM 公告内容
+        subject_notify = f"aim.notification.{agent_id}"
+        subject_dm = f"aim.dm.{agent_id}"
+        data = json.dumps(payload, ensure_ascii=False).encode()
+        asyncio.ensure_future(self.nc.publish(subject_notify, data))
+        # DM 公告（让 Agent 一定会看到）
+        dm = {
+            "ver": "1.0",
+            "id": str(secrets.token_hex(6)),
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "from": "system",
+            "type": "dm",
+            "payload": {
+                "text": f"📢 [群公告] {group_id}\n{content}\n\n— {set_by} 发布于 {time.strftime('%Y-%m-%d %H:%M', time.localtime(set_at))}"
+            }
+        }
+        asyncio.ensure_future(
+            self.nc.publish(subject_dm, json.dumps(dm, ensure_ascii=False).encode())
+        )
+        logger.info(f"📢 群公告推送 → {agent_id}: {group_id}")
+
+    async def _handle_announce(self, msg):
+        """群公告：set（群主设置）/ get（成员查看）
+
+        请求:
+          {action: "set", group_id: "...", operator: "...", content: "..."}
+          {action: "get", group_id: "..."}
+        响应:
+          {status: "ok", group_id: "...", announcement: {content, set_by, set_at}}
+        """
+        try:
+            req = json.loads(msg.data.decode())
+            action = req.get("action", "get")
+            group_id = req["group_id"]
+        except Exception:
+            self._respond(msg, {"status": "error", "error": "invalid"})
+            return
+
+        grp = self._groups.get(group_id)
+        if not grp:
+            self._respond(msg, {"status": "not_found", "group_id": group_id})
+            return
+
+        if action == "set":
+            operator = req.get("operator", "")
+            content = req.get("content", "")
+            if operator != grp.owner:
+                self._respond(msg, {"status": "unauthorized", "error": "仅群主可设置公告"})
+                return
+            if not content.strip():
+                self._respond(msg, {"status": "error", "error": "公告内容不能为空"})
+                return
+
+            ann = {
+                "content": content.strip(),
+                "set_by": operator,
+                "set_at": time.time(),
+            }
+            key = await self._get_announce_kv_key(group_id)
+            await self.kv.put(key, json.dumps(ann, ensure_ascii=False).encode())
+            # 推送给所有群成员
+            for member_id in grp.members:
+                await self._push_announcement_to(member_id, group_id, content, operator, ann["set_at"])
+            logger.info(f"📢 群公告已设置 {group_id}: {content[:50]}...")
+            self._respond(msg, {"status": "set", "group_id": group_id, "announcement": ann})
+
+        elif action == "get":
+            key = await self._get_announce_kv_key(group_id)
+            try:
+                entry = await self.kv.get(key)
+                ann = json.loads(entry.value.decode())
+                self._respond(msg, {"status": "ok", "group_id": group_id, "announcement": ann})
+            except Exception:
+                self._respond(msg, {"status": "ok", "group_id": group_id, "announcement": None})
+
+        else:
+            self._respond(msg, {"status": "error", "error": f"未知 action: {action}"})
+
     # ── 客户端方法 ───────────────────────────────────────
 
     async def create_group(self, group_id: str = "", owner: str = "", name: str = "") -> dict:
@@ -464,9 +574,10 @@ def main():
 
     parser = argparse.ArgumentParser(description="AIM Group Admission v1.0")
     parser.add_argument("--nats-url", default="nats://127.0.0.1:4222")
+    parser.add_argument("--credentials", default="", help="NATS credentials file path")
     args = parser.parse_args()
 
-    ga = GroupAdmission(nats_url=args.nats_url)
+    ga = GroupAdmission(nats_url=args.nats_url, credentials=args.credentials)
 
     async def run():
         await ga.start_service()

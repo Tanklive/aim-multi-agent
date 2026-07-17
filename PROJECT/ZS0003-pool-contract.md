@@ -39,7 +39,7 @@
 | 变量 | 来源优先级 | 默认值 | 说明 |
 |------|-----------|--------|------|
 | `DISPATCH_CONV_POOL_SIZE` | 环境变量 > config.json | `2` | 池大小，控制 dispatch_conv_ids 保留数量 |
-| `ADAPTER_TIMEOUT` / `PROBE_TIMEOUT` | adapter.sh 内 | `90s` (ZS0003) / `35s` (模板) | 单次 `letta` 调用超时 |
+| `ADAPTER_TIMEOUT` / `PROBE_TIMEOUT` | adapter.sh 内 | `120s` (ZS0003) / `120s` (模板) | 单次 `letta` 调用超时 |
 
 ---
 
@@ -85,7 +85,7 @@
 
 ```
 不变约束:  adapter PROBE_TIMEOUT < main.py adapter_timeout
-当前值:    ZS0003 PROBE_TIMEOUT=90s, main.py adapter_timeout=120s → 满足
+当前值:    ZS0003 PROBE_TIMEOUT=120s, main.py adapter_timeout=120s → 满足
 注意事项:
   - 调整 main.py adapter_timeout 时必须同步检查 PROBE_TIMEOUT
   - 若 PROBE_TIMEOUT >= adapter_timeout，冷启动时 main.py 先超时 → adapter 被 SIGKILL
@@ -111,7 +111,7 @@
 
 当呱呱修改以下内容时，必须检查对 ZS0003 的影响：
 
-1. **adapter_timeout** — 必须大于 ZS0003 的 PROBE_TIMEOUT (90s)
+1. **adapter_timeout** — 必须大于 ZS0003 的 PROBE_TIMEOUT (120s)
 2. **protocol_version 切换** — ZS0003 adapter 支持 v1.0 JSON stdin，不可单方面切回 CLI args
 3. **adapter 调用路径** — 必须指向正确的 adapter.sh (`agents/ZS0003/adapter.sh`)
 4. **empty output 处理** — main.py 应识别连续 empty output 模式并告警，不要静默吞掉
@@ -145,7 +145,7 @@ echo "=== 3. dispatch_conv_ids.txt ==="
 wc -l /Users/yangzs/shared/aim/agents/ZS0003/dispatch_conv_ids.txt 2>/dev/null || echo "FAIL"
 
 echo "=== 4. adapter 手动测试 ==="
-timeout 90 /Users/yangzs/shared/aim/agents/ZS0003/adapter.sh process \
+timeout 120 /Users/yangzs/shared/aim/agents/ZS0003/adapter.sh process \
   --message "test: reply pong" --from "ZS0000" --task-id "selfcheck" 2>/dev/null | head -1 || echo "FAIL"
 
 echo "=== ALL DONE ==="

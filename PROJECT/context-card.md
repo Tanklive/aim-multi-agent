@@ -1,4 +1,4 @@
-# AIM 项目骨架 v1.5.1
+# AIM 项目骨架 v1.5.2
 ## 目标
 多 Agent 异构通信基础设施，三 Agent（OpenClaw/Hermes/Letta）通过 NATS 消息总线 DM/群聊。Phase 0-1 完成 ✅，清理阶段闭环，进入稳定运行。
 
@@ -35,3 +35,4 @@
 - 版本管理：改 main.py/SDK 前群通知+等确认，adapter 参数放 config.json
 - 接口 process/health/info/cancel/trim | exit:0/1/2/3/4
 - 代码更新必重启生效
+- **零事故基线**：从 7/3 起算连续无事故天数。Dispatch 中断/死信/失联超 3min → 基线重置 + 🚨群内红牌通报

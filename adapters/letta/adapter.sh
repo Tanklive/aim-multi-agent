@@ -350,8 +350,8 @@ _verify_agent_id || exit 4
 # @see [[reference/aim/gotchas.md]]                   相关陷阱
 # ══════════════════════════════════════════════════════════════
 
-PROBE_TIMEOUT=35
-# P0: 35s 一次给够（冷启动实测 17s + LLM 推理 5-15s），取消重试避免浪费时间
+PROBE_TIMEOUT=120
+# v1.14.3: 120s 止血（冷启动 17s + LLM 推理 15s + 缓冲余量），exit=124 内部重试不浪费
 DISPATCH_IDS_FILE="$SCRIPT_DIR/dispatch_conv_ids.txt"
 POOL_SIZE="${DISPATCH_CONV_POOL_SIZE:-2}"
 # L2 即时上下文（L1 项目骨架走 MemFS）

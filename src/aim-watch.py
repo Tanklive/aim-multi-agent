@@ -201,6 +201,7 @@ class WatchDisplay:
         self._seen_events: set = set()  # (agent_id, nonce)
         # 频道追踪：msg_id → "dm"|"grp"，配合 channel_filter 过滤 observer 事件
         self._msg_channel: dict = {}
+        self._seen_msg_ids: set = set()  # 消息去重：防止 observer+grp 双通道重复显示
 
         # 打开保存文件
         if save_path:
@@ -301,6 +302,15 @@ class WatchDisplay:
         status = event.get("status", "")
         agent_id = event.get("agent_id", "???")
         msg_id = event.get("msg_id", "")
+        # 去重：同一条消息可能从 observer + direct 双通道到达
+        if msg_id and hasattr(self, '_shown_msg_ids') and msg_id in self._shown_msg_ids:
+            return
+        if not hasattr(self, '_shown_msg_ids'):
+            self._shown_msg_ids = set()
+        if msg_id:
+            self._shown_msg_ids.add(msg_id)
+            if len(self._shown_msg_ids) > 10000:
+                self._shown_msg_ids = set(list(self._shown_msg_ids)[-5000:])
         detail = event.get("detail", "")
         ts = event.get("ts", 0)
         meta = event.get("meta", {})
@@ -425,6 +435,7 @@ class EventSource:
         self.display = display
         self.since = since  # --since 过滤：Unix 时间戳下限
         self._nc = None
+        self._seen_msg_ids: set = set()  # 消息去重
 
     async def connect(self, server: str, token: str):
         """连接 NATS（Observer  + 消息订阅双通道）"""
@@ -487,8 +498,16 @@ class EventSource:
             await self._nc.subscribe("aim.dm.>", cb=_on_dm)
 
         if ch is None or ch == "grp":
+            # raw msg id 去重：同一消息可能从 observer 双通道到达
+            _grp_seen = set()
             async def _on_grp(msg):
                 try:
+                    data_hash = hash(msg.data)
+                    if data_hash in _grp_seen:
+                        return
+                    _grp_seen.add(data_hash)
+                    if len(_grp_seen) > 10000:
+                        _grp_seen.clear()
                     env = json.loads(msg.data.decode())
                     await handler(env)
                 except Exception:
@@ -502,9 +521,17 @@ class EventSource:
           群聊: HH:MM:SS 昵称 头像: @提及 消息内容 头像
           私聊: HH:MM:SS 昵称 头像 → 对方: 消息内容 头像
         """
+        msg_id = envelope.get("id", "")
+        # 去重：同一消息从 observer + direct 双通道到达，只显示一次
+        if msg_id and msg_id in self._seen_msg_ids:
+            return
+        if msg_id:
+            self._seen_msg_ids.add(msg_id)
+            if len(self._seen_msg_ids) > 10000:
+                self._seen_msg_ids = set(list(self._seen_msg_ids)[-5000:])
+
         msg_type = envelope.get("type", "?")
         from_id = envelope.get("from", "?")
-        msg_id = envelope.get("id", "")
         # 频道追踪：让 observer 事件也能按 channel_filter 过滤
         if msg_id and msg_type in ("dm", "grp"):
             self.display._msg_channel[msg_id] = msg_type
@@ -530,6 +557,9 @@ class EventSource:
         import re
         at_pattern = r'@(?:呱呱|吉量|小火鸡儿|ZS000[1-3])'
         at_mentions = re.findall(at_pattern, text_preview)
+        # 从原文中移除已提取的 @提及，避免前缀和原文重复显示
+        for mention in at_mentions:
+            text_preview = re.sub(re.escape(mention) + r'\s*', '', text_preview, count=1)
 
         # 构建前缀
         if msg_type == "grp":

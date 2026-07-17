@@ -115,7 +115,7 @@ import json, sys
 print(json.dumps({
     'model': 'deepseek-v4-pro',
     'messages': [{'role': 'user', 'content': sys.argv[1]}],
-    'max_tokens': 200
+    'max_tokens': 800
 }))
 " "$FULL_PROMPT" 2>/dev/null)
 

@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_PERSIST_DIR = Path.home() / "shared" / "aim" / "data"
 DEFAULT_PERSIST_FILE = "queue.jsonl"
 COMPACT_THRESHOLD = 50_000  # 50KB，超过就压缩
+COMPACT_MIN_LINES = 20  # 行数超此阈值也触发压缩（无论文件大小）
+COMPACT_DEAD_RATIO = 0.4  # ack/nack 比例超此阈值且行数>10时触发压缩
 
 
 class QueuePersist:
@@ -219,12 +221,55 @@ class QueuePersist:
     # ── 压缩 ──────────────────────────────────────────────
 
     async def _maybe_compact(self):
-        """如果文件超过阈值，触发压缩"""
+        """如果文件超过阈值或 dead ratio 过高，触发压缩
+
+        三触发条件（满足任一即压缩）：
+          1. 文件 > COMPACT_THRESHOLD (50KB)
+          2. 行数 > COMPACT_MIN_LINES (20)
+          3. ack/nack 比例 > COMPACT_DEAD_RATIO (40%) 且行数 > 10
+        """
         try:
             size = self.filepath.stat().st_size
         except FileNotFoundError:
             return
+
+        should_compact = False
         if size > self.compact_threshold:
+            should_compact = True
+        else:
+            # 快速行数检查 + dead ratio 检查
+            line_count = 0
+            ack_nack_count = 0
+            try:
+                with open(self.filepath, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        line_count += 1
+                        if line_count > COMPACT_MIN_LINES:
+                            break  # 已经够触发，不用继续读
+            except FileNotFoundError:
+                return
+
+            if line_count >= COMPACT_MIN_LINES:
+                should_compact = True
+            elif line_count > 10:
+                # 精确统计 dead ratio（行数不多，全读不贵）
+                try:
+                    with open(self.filepath, 'r') as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            if '"ack"' in line or '"nack"' in line:
+                                ack_nack_count += 1
+                    if ack_nack_count / max(line_count, 1) > COMPACT_DEAD_RATIO:
+                        should_compact = True
+                except FileNotFoundError:
+                    pass
+
+        if should_compact:
             await self.compact()
 
     async def compact(self):

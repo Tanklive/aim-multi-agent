@@ -237,6 +237,22 @@ class Transport:
     def client(self):
         return self._sdk
 
+    @staticmethod
+    def _sanitize_output(text: str) -> str:
+        """619-22: 过滤 LLM 内部思考标签 — 防 compaction 输出泄露到 NATS
+
+        场景: OpenClaw context compaction 时 &lt;/thinking&gt; 标签被截断,
+        LLM 后续输出残留的 <thinking> 块会被 adapter 透传到 NATS 群聊。
+        """
+        import re
+        # 移除完整的 <thinking>...</thinking> 块
+        text = re.sub(r'<thinking[^>]*>.*?</thinking>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        # 移除未闭合的 <thinking> 块（compaction 残留）
+        text = re.sub(r'<thinking[^>]*>.*', '', text, flags=re.DOTALL | re.IGNORECASE)
+        # 移除孤立的 </thinking> 闭合标签（其他框架的残留）
+        text = re.sub(r'</thinking>', '', text, flags=re.IGNORECASE)
+        return text.strip()
+
     async def connect(self) -> bool:
         try:
             await self._sdk.connect()
@@ -274,6 +290,8 @@ class Transport:
 
     async def send_dm(self, to_id: str, text: str):
         """发送私聊消息 + 送达确认"""
+        # 619-22: 过滤 XML 思考标签 — compaction 导致 LLM 内部输出泄露到 NATS
+        text = self._sanitize_output(text)
         envelope = await self._sdk.send_dm(to_id, text)
         if isinstance(envelope, dict) and "id" in envelope:
             self._my_msg_ids.add(envelope["id"])  # U-007: 追踪发出的消息
@@ -284,6 +302,8 @@ class Transport:
 
     async def send_grp(self, group_id: str, text: str):
         """发送群聊消息 + 送达确认"""
+        # 619-22: 过滤 XML 思考标签 — compaction 导致 LLM 内部输出泄露到 NATS
+        text = self._sanitize_output(text)
         result = await self._sdk.send_grp(group_id, text)
         if isinstance(result, dict) and "id" in result:
             self._my_msg_ids.add(result["id"])  # U-007: 追踪发出的消息
@@ -451,6 +471,28 @@ class AIMClient:
             if val:
                 self.adapter_env[config_key.upper()] = str(val)
 
+        # ── AIM 服务发现注入：config.json services.api → 通用 AIM_API_* 环境变量 ──
+        # 架构：config.json 的 services.api 段定义 Agent 的 API Server 地址和认证方式，
+        # 此处将其翻译为 adapter.sh 需要的 AIM_API_URL / AIM_API_CREDENTIAL 环境变量。
+        # adapter.sh 收到后走 API Server 路径（curl → Hermes Gateway），绕过 CLI。
+        # 所有 Agent（ZS0001/ZS0002/ZS0003）的 config.json 都可配置此段，无配置则跳过。
+        # 扩展口：services.tts / services.vision 同模式追加。
+        # （624 吉量提出，3779397 误删，2026-07-22 恢复）
+        services = self.config.get("services", {})
+        api_svc = services.get("api", {})
+        if isinstance(api_svc, dict) and api_svc.get("url"):
+            self.adapter_env["AIM_API_URL"] = str(api_svc["url"])
+            auth = api_svc.get("auth", {})
+            if isinstance(auth, dict):
+                cred_ref = auth.get("credential", "")
+                if isinstance(cred_ref, str):
+                    if cred_ref.startswith("${") and cred_ref.endswith("}"):
+                        # 变量引用 → 从当前环境解析（如 ${API_SERVER_KEY}）
+                        env_var = cred_ref[2:-1]
+                        self.adapter_env["AIM_API_CREDENTIAL"] = os.getenv(env_var, "") or self.adapter_env.get(env_var, "")
+                    else:
+                        self.adapter_env["AIM_API_CREDENTIAL"] = cred_ref
+
         self.health_probe = HealthProbe(
             health_cmd=f"bash {self.adapter_cmd} health",
             timeout=self.config.get("health_probe_timeout", 25.0),
@@ -605,6 +647,8 @@ class AIMClient:
                             self.logger.debug(f" [{msg.msg_id[:8]}] 免LLM跳过: from={msg.from_id}")
                             self.queue.ack(msg.msg_id)
                             self._in_flight.discard(msg.msg_id)
+                            self.scheduler.on_processing_done()  # P0-FIX: dispatch冻结 — skip_llm后未释放BUSY→IDLE
+                            self._dispatch_event.set()
                             continue
                         # ── 原地重试：v1.5.3 止血降级，max_retries 3→1（不跟外部依赖较劲） ──
                         delivered = False
@@ -787,7 +831,14 @@ class AIMClient:
         self._dispatch_event.set()
 
         # 主循环保持
+        heartbeat_path = Path.home() / ".aim" / "agents" / self.agent_id / "heartbeat"
         while self.running:
+            # 619-22: 文件心跳 — 供外部 watchdog 检测僵尸进程
+            try:
+                hb_data = json.dumps({"ts": time.time(), "pid": os.getpid(), "queue": self.queue.size()})
+                heartbeat_path.write_text(hb_data)
+            except Exception:
+                pass
             await asyncio.sleep(5)
 
     async def _health_probe_loop(self):

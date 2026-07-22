@@ -2,6 +2,8 @@
 
 > 小火鸡儿 🐤 | 2026-06-16 | 供呱呱写 Scheduler 核心逻辑参考
 
+> 📎 相关文档：[Process Health Degrade States](../reference/process-health-degrade-states.md) — 自守护层五态状态机（HEALTHY/WARNED/PROTECTED/DEAD），2026-07-22
+
 ---
 
 ## 一、数据来源

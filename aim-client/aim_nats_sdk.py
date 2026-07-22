@@ -20,7 +20,7 @@ Usage:
 # AIM SDK 版本（SemVer 2.0.0）
 # 核心模块变更时所有模块同步升级
 # ============================================================
-VERSION = "1.4.0"
+VERSION = "1.5.3"
 """SDK 版本号——代码发布标识"""
 
 # 协议版本——Agent 握手时兼容性检查用
@@ -1129,7 +1129,7 @@ class AIMNATSClient:
         """
         kwargs = {
             "servers": [self.server],
-            "max_reconnect_attempts": -1,
+            "max_reconnect_attempts": 5,
             "reconnect_time_wait": 2,
             "ping_interval": 30,
             "max_outstanding_pings": 5,
@@ -1138,6 +1138,7 @@ class AIMNATSClient:
             "error_cb": self._on_nats_error,
             "disconnected_cb": self._on_nats_disconnected,
             "reconnected_cb": self._on_nats_reconnected,
+            "connect_timeout": 10,
         }
         if self.credentials:
             # 自动识别：.creds/.nkey 文件→NKEY/JWT, 否则→Token
@@ -2172,12 +2173,13 @@ class AIMObserverClient:
         """连接 NATS（只订阅，不注册）"""
         kwargs = {
             "servers": [self.server],
-            "max_reconnect_attempts": -1,
+            "max_reconnect_attempts": 5,
             "reconnect_time_wait": 2,
             "ping_interval": 30,
             "max_outstanding_pings": 5,
             "drain_timeout": 5,
             "name": f"OBS-{self.observer_id}",
+            "connect_timeout": 10,
         }
         if self.credentials:
             if os.path.isfile(self.credentials):

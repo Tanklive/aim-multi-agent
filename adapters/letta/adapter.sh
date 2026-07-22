@@ -1,13 +1,15 @@
 #!/bin/bash
+# AIM Letta adapter (ZS0003) — 项目版本: 1.5.3 | adapter 版本: v1.14.3
 set -eu
 POOL_SIZE="${DISPATCH_CONV_POOL_SIZE:-2}"  # v1.6.0 fix: 防止 set -eu 下 unbound variable
+# v1.14.3: PROBE_TIMEOUT=120s + exit=124 内部重试，冷启动耐受
 # v1.14.2: 池会话接口契约固化 + Letta CLI 恢复 (npm 包冲突修复)
 # v1.14.1: JSON stdin 双协议 + shlex.quote 安全注入 + agent_id 磁盘自动发现
 # v1.14.0: agent_id 磁盘自动发现 (_resolve_agent_id)，不依赖 config.json
 # v1.13.2: +context-live L2 即时上下文注入
 # v1.13.1: --from 强制必填，移除 "unknown" 默认值回退
 # v1.12.0: 移除 pipefail，管道全部改为临时文件/python3
-# AIM Letta adapter — AIM Client v1.2 标准接口
+# AIM Client v1.2 标准接口
 # 接口契约: shared/aim/PROJECT/ZS0003-pool-contract.md
 #
 # 6 个标准模式:

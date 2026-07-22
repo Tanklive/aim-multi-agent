@@ -20,7 +20,7 @@ Usage:
 # AIM SDK 版本（SemVer 2.0.0）
 # 核心模块变更时所有模块同步升级
 # ============================================================
-VERSION = "1.4.0"
+VERSION = "1.5.3"
 """SDK 版本号——代码发布标识"""
 
 # 协议版本——Agent 握手时兼容性检查用
@@ -1036,6 +1036,10 @@ class AIMNATSClient:
         # adapter.sh info cache
         self._runtime_info: Optional[Dict[str, Any]] = None
 
+        # HotFeed 热冷消息分级（延迟初始化）
+        self.hot_feed: Optional[Any] = None
+        self._hotfeed_enabled: bool = True  # 可通过环境变量关闭
+
     # -- Agent Card management (P0 Schema v1) --------------------
 
     async def load_agent_card(self, card_path: str = "") -> Dict[str, Any]:
@@ -1172,6 +1176,16 @@ class AIMNATSClient:
 
         # 启动定时 flush
         self._flush_task = asyncio.create_task(self._periodic_flush())
+
+        # ── HotFeed 热冷消息分级（619-22） ──
+        if self._hotfeed_enabled and not os.environ.get("AIM_NO_HOTFEED"):
+            try:
+                from aim_client.hot_feed import attach_to_client
+                self.hot_feed = await attach_to_client(self)
+                log.info(f"[{self.agent_id}] HotFeed attached")
+            except Exception as _e:
+                log.warning(f"[{self.agent_id}] HotFeed init skipped: {_e}")
+
         return self
 
     async def wait_for_connection(self, timeout: float = 10.0):

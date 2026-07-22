@@ -1,5 +1,5 @@
 #!/bin/bash
-# adapter-version: v2.2  (项目 1.4.0 | OpenClaw adapter | ZS0001 呱呱)
+# adapter-version: v2.2  (项目 1.5.3 | OpenClaw adapter | ZS0001 呱呱)
 # 构建: 2026-06-23 +context-card + --session-key 隔离
 # process: 直接调用 OpenClaw CLI，调用方阻塞等回复（≤30s）
 # 退出码: 0=正常, 1=可重试, 2=挂了, 3=需人工介入

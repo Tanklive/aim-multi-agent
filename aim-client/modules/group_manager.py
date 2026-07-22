@@ -39,6 +39,17 @@ NATS_GROUPS_MEMBERS = "aim.groups.members"
 NATS_GROUPS_LIST    = "aim.groups.list"
 NATS_GROUPS_MY      = "aim.groups.my"
 
+# ── 负向规则：确认/状态类消息不触发意图识别（防 LLM 输出递归触发） ──
+
+_CONFIRMATION_PREFIX = re.compile(
+    r'^[✅❌⚠️⏳📋📭👥🔄🔹🔸💡📝🎉🚫]'
+)
+_CONFIRMATION_KEYWORDS: list[str] = [
+    '已创建', '已加入', '已退出', '已拒绝', '已完成',
+    '创建成功', '加入成功', '退出成功',
+    '群已', '群组已', '群聊已',
+]
+
 # ── 自然语言意图识别规则 ──
 
 INTENT_PATTERNS: list[tuple[re.Pattern, str]] = [
@@ -127,6 +138,15 @@ class GroupManager:
             my_groups/list_groups → params {}
         """
         content = content.strip()
+
+        # 负向规则：确认/状态类消息跳过识别
+        if _CONFIRMATION_PREFIX.match(content):
+            return None
+        content_lower = content.lower()
+        for kw in _CONFIRMATION_KEYWORDS:
+            if kw in content_lower:
+                return None
+
         for pattern, intent in INTENT_PATTERNS:
             m = pattern.match(content)
             if m:
@@ -182,26 +202,49 @@ class GroupManager:
 
     # ────── NATS 通信（统一封装） ──────────────────────
 
-    async def _nats_request(self, subject: str, payload: dict, timeout: float = 5.0) -> dict:
-        """向 GroupAdmission 服务发送 NATS request。
+    async def _nats_request(self, subject: str, payload: dict, timeout: float = 5.0,
+                            retries: int = 2) -> dict:
+        """向 GroupAdmission 服务发送 NATS request（底层自动重试+断连等待）。
 
         统一替代 main.py 的 _group_request 和 group_admission.py 的 _client_request。
-        """
-        if self.nc is None:
-            return {"status": "error", "error": "NATS not connected (nc is None)"}
-        try:
-            if not self.nc.is_connected:
-                return {"status": "error", "error": "NATS not connected"}
-        except Exception:
-            return {"status": "error", "error": "NATS connection check failed"}
 
-        try:
-            resp = await self.nc.request(subject, json.dumps(payload).encode(), timeout=timeout)
-            return json.loads(resp.data)
-        except asyncio.TimeoutError:
-            return {"status": "error", "error": "request timeout"}
-        except Exception as e:
-            return {"status": "error", "error": str(e)}
+        Args:
+            retries: 最大重试次数（含首次，默认 2 次 = 1 次重试）
+        """
+        last_error = ""
+        for attempt in range(retries):
+            # 连接检查
+            if self.nc is None:
+                return {"status": "error", "error": "NATS not connected (nc is None)"}
+            try:
+                if not self.nc.is_connected:
+                    if attempt < retries - 1:
+                        await asyncio.sleep(1.0)  # 等待 NATS 重连
+                        continue
+                    return {"status": "error", "error": "NATS not connected"}
+            except Exception:
+                return {"status": "error", "error": "NATS connection check failed"}
+
+            try:
+                resp = await self.nc.request(subject, json.dumps(payload).encode(), timeout=timeout)
+                if not resp or not resp.data:
+                    return {"status": "error", "error": "empty NATS response"}
+                return json.loads(resp.data)
+            except json.JSONDecodeError as e:
+                return {"status": "error", "error": f"malformed response: {str(e)[:100]}"}
+            except asyncio.TimeoutError:
+                last_error = "request timeout"
+                if attempt < retries - 1:
+                    await asyncio.sleep(0.5)
+                    continue
+            except Exception as e:
+                last_error = str(e)
+                if attempt < retries - 1:
+                    await asyncio.sleep(0.5)
+                    continue
+
+        logger.warning(f"GroupManager NATS retries exhausted ({subject}): {last_error}")
+        return {"status": "error", "error": last_error}
 
     # ────── 群操作 API ────────────────────────────────
 
@@ -460,16 +503,30 @@ class GroupManager:
 
     # ────── 统计与自检 ────────────────────────────────
 
+    def health_check(self) -> dict:
+        """连接健康检查（对标 ChatArchive 自检接口）。"""
+        connected = False
+        try:
+            connected = self.nc is not None and self.nc.is_connected
+        except Exception:
+            pass
+        return {
+            "connected": connected,
+            "agent_id": self.agent_id,
+        }
+
     def stats(self) -> dict:
         """返回模块统计信息（对标 ChatArchive.stats()）。"""
         now = time.time()
         recent = sum(1 for t in self._create_timestamps if now - t < self.rate_window)
+        health = self.health_check()
         return {
             "agent_id": self.agent_id,
+            "connected": health["connected"],
             "rate_used": f"{recent}/{self.rate_limit} per {int(self.rate_window)}s",
             "rate_remaining": max(0, self.rate_limit - recent),
         }
 
     def __repr__(self):
         s = self.stats()
-        return f"GroupManager(agent={s['agent_id']}, rate={s['rate_used']})"
+        return f"GroupManager(agent={s['agent_id']}, connected={s['connected']}, rate={s['rate_used']})"

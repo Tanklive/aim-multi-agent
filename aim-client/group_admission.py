@@ -274,6 +274,7 @@ class GroupAdmission:
         self._groups[group_id] = grp
         await self._save_to_kv(group_id, grp)
         logger.info(f"群组创建: {group_id} ({name}) owner={owner}")
+        self._notify_group_update(owner, group_id, "added", grp.name)
         self._respond(msg, {"status": "created", "group_id": group_id, "name": name})
 
     async def _handle_join(self, msg):

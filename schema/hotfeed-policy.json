@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aim:hotfeed-policy:v1",
+  "title": "AIM HotFeed Policy Schema",
+  "description": "热冷消息分级策略 — AIM 平台级配置，存储在 NATS KV aim-hotfeed-policy",
+  "type": "object",
+  "required": ["version", "silence", "archive", "stages"],
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "策略 schema 版本，PolicyLoader 用于兼容降级",
+      "examples": ["1"]
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "策略最后更新时间"
+    },
+    "compat_min_version": {
+      "type": "string",
+      "description": "兼容最低版本，低于此版本拒绝加载"
+    },
+    "silence": {
+      "type": "object",
+      "required": ["hours", "mention_penetrate"],
+      "properties": {
+        "hours": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0, "maximum": 23 },
+          "minItems": 2, "maxItems": 2,
+          "description": "静默时段 [start_hour, end_hour]，如 [23,8] 表示 23:00-08:00",
+          "examples": [[23, 8]]
+        },
+        "mention_penetrate": {
+          "type": "boolean",
+          "description": "静默期 @提及是否强制穿透为 hot",
+          "default": true
+        },
+        "dedup_window_s": {
+          "type": "number",
+          "description": "短时去重窗口（秒），同一发送者在此窗口内重复 @ 触发降级",
+          "default": 60
+        },
+        "max_hot_per_sender": {
+          "type": "integer",
+          "description": "去重窗口内同一发送者最多产生 hot 消息数，超出则降级",
+          "default": 2
+        },
+        "overflow_downgrade_to": {
+          "type": "string",
+          "enum": ["warm", "cold", "archive"],
+          "description": "超出去重上限后降级到的目标 stage",
+          "default": "warm"
+        }
+      }
+    },
+    "archive": {
+      "type": "object",
+      "required": ["retention", "queryable", "auto_mode_map"],
+      "properties": {
+        "retention": {
+          "type": "object",
+          "description": "归档保留时长",
+          "properties": {
+            "summarize": { "type": "string", "description": "摘要保留时长", "examples": ["7d"] },
+            "raw": { "type": "string", "description": "原文保留时长", "examples": ["3d"] }
+          }
+        },
+        "queryable": {
+          "type": "boolean",
+          "description": "archive 是否可回溯查询",
+          "default": true
+        },
+        "auto_mode_map": {
+          "type": "object",
+          "description": "message_type → archive_mode 自动映射表",
+          "properties": {
+            "mention": { "type": "string", "enum": ["summarize", "raw"] },
+            "dm": { "type": "string", "enum": ["summarize", "raw"] },
+            "task": { "type": "string", "enum": ["summarize", "raw"] },
+            "keyword_hit": { "type": "string", "enum": ["summarize", "raw"] },
+            "observer": { "type": "string", "enum": ["summarize", "raw"] },
+            "system": { "type": "string", "enum": ["summarize", "raw"] },
+            "default": { "type": "string", "enum": ["summarize", "raw"] }
+          }
+        }
+      }
+    },
+    "stages": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "object",
+        "required": ["name", "label", "action"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": ["hot", "warm", "cold", "archive"],
+            "description": "stage 标识名"
+          },
+          "label": {
+            "type": "string",
+            "description": "显示标签，如 🔥 热消息"
+          },
+          "triggers": {
+            "type": "object",
+            "description": "触发条件（archive 无此字段）",
+            "properties": {
+              "mention": { "type": "boolean" },
+              "dm": { "type": "boolean" },
+              "keywords": { "type": "array", "items": { "type": "string" } },
+              "reply_to_me": { "type": "boolean" },
+              "any_group_message": { "type": "boolean" },
+              "observer_events": { "type": "boolean" },
+              "system_notice": { "type": "boolean" },
+              "old_messages": { "type": "boolean" },
+              "from_agents": { "type": "array", "items": { "type": "string" } }
+            }
+          },
+          "timeout_s": {
+            "oneOf": [
+              { "type": "number" },
+              { "type": "null" }
+            ],
+            "description": "stage 超时秒数，null = 无超时仅手动降级"
+          },
+          "on_timeout": {
+            "type": "string",
+            "enum": ["escalate", "escalate_to_cold", "drop", "summarize_and_archive", "archive"],
+            "description": "超时后行为"
+          },
+          "action": {
+            "type": "string",
+            "enum": ["report_immediately", "batch_after_task", "heartbeat_summary", "ignore", "auto"],
+            "description": "Agent 框架响应行为"
+          },
+          "archive_mode": {
+            "type": "string",
+            "enum": ["summarize", "raw"],
+            "description": "存档模式（仅 cold stage 需要）"
+          }
+        }
+      }
+    }
+  }
+}

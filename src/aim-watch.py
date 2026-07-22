@@ -563,12 +563,13 @@ class EventSource:
 
         # 构建前缀
         if msg_type == "grp":
-            # 群聊: 时间 昵称 头像: (@提及) 消息
+            # 群聊: 时间 [群ID] 昵称 头像: (@提及) 消息
+            grp_id = to_id if to_id else "?"
             if at_mentions:
                 at_str = " ".join(at_mentions) + " "
             else:
                 at_str = ""
-            prefix = f"{time_str} {display_from} {emoji}: {at_str}"
+            prefix = f"{time_str} [{grp_id}] {display_from} {emoji}: {at_str}"
         else:
             # 私聊: 时间 昵称 头像 → 对方: 消息
             arrow = f" → {display_to} {emoji_to}" if display_to else ""

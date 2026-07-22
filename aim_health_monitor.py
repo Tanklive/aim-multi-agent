@@ -20,11 +20,39 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 AIM_DIR = os.path.expanduser("~/.aim")
+SHARED_AIM_DIR = os.path.expanduser("~/shared/aim")
 AGENTS = {
     "ZS0001": "呱呱",
     "ZS0002": "吉量",
     "ZS0003": "小火鸡儿",
 }
+
+# 积压预警阈值（2026-07-17 🐤）
+QUEUE_WARN = 80       # ⚠️ 黄色预警：开始关注
+QUEUE_CRITICAL = 100  # 🔴 红色告警：自动群聊通知
+ALERT_COOLDOWN_SEC = 300  # 同一 agent 同级别告警冷却 5 分钟
+_last_alert: dict[str, tuple[float, str]] = {}  # agent_id -> (timestamp, level)
+
+GRP_TRIO = "grp_dc738fc1-c85c-4440-b3ad-31192284a6b2"
+
+def send_grp_alert(agent_id: str, name: str, stuck: int, level: str):
+    """向 trio 群聊发送积压告警"""
+    now_ts = time.time()
+    last = _last_alert.get(agent_id)
+    if last and (now_ts - last[0] < ALERT_COOLDOWN_SEC) and last[1] == level:
+        return  # 冷却中，不重复发
+
+    emoji = "🚨" if level == "critical" else "⚠️"
+    msg = f"{emoji} [健康监控] {name}({agent_id}) 积压 {stuck} 条，超过{'临界' if level == 'critical' else '预警'}阈值"
+    send_script = os.path.join(SHARED_AIM_DIR, "aim_send_nats.py")
+    try:
+        subprocess.run(
+            [sys.executable, send_script, GRP_TRIO, msg, "--group", "--from", "ZS0003"],
+            capture_output=True, timeout=10,
+        )
+        _last_alert[agent_id] = (now_ts, level)
+    except Exception:
+        pass  # 发告警失败不阻塞监控主循环
 
 
 def check_launchctl(agent_id: str) -> str:
@@ -79,7 +107,10 @@ def check_queue(agent_id: str) -> dict:
 
 def check_log(agent_id: str) -> dict:
     """检查最近日志活跃度"""
-    log_path = Path(AIM_DIR) / "logs" / f"aim-client-{agent_id}.log"
+    # 优先读 shared/aim/logs/（main.py 实际写入路径），fallback 到 ~/.aim/logs/
+    log_path = Path(SHARED_AIM_DIR) / "logs" / f"aim-client-{agent_id}.log"
+    if not log_path.exists():
+        log_path = Path(AIM_DIR) / "logs" / f"aim-client-{agent_id}.log"
     if not log_path.exists():
         return {"age_sec": None, "last_line": "no log"}
 
@@ -164,6 +195,26 @@ def render(clear: bool = True):
     print("└────────┴──────┴───────┴───────┴──────┴───────┴──────────┴────────────┘")
     print()
 
+    # 积压预警 + 自动群聊告警
+    alert_lines = []
+    for r in rows:
+        stuck = r.get("stuck")
+        if not isinstance(stuck, int) or stuck == 0:
+            continue
+        if stuck >= QUEUE_CRITICAL:
+            label = f"🔴 {r['agent']}({r['name']}) 积压 {stuck} 条 ≥ {QUEUE_CRITICAL}"
+            alert_lines.append(label)
+            send_grp_alert(r["agent"], r["name"], stuck, "critical")
+        elif stuck >= QUEUE_WARN:
+            label = f"🟡 {r['agent']}({r['name']}) 积压 {stuck} 条 ≥ {QUEUE_WARN}"
+            alert_lines.append(label)
+            send_grp_alert(r["agent"], r["name"], stuck, "warn")
+    if alert_lines:
+        print("📊 积压预警：")
+        for line in alert_lines:
+            print(f"  {line}")
+        print()
+
     # 只有真正的 ERROR/FATAL 才在底部显示
     has_errors = [r for r in rows if r.get("has_error")]
     if has_errors:
@@ -172,7 +223,9 @@ def render(clear: bool = True):
             log = check_log(r["agent"])
             # 找最近一条含 ERROR 或 FATAL 的行
             try:
-                log_path = Path(AIM_DIR) / "logs" / f"aim-client-{r['agent']}.log"
+                log_path = Path(SHARED_AIM_DIR) / "logs" / f"aim-client-{r['agent']}.log"
+                if not log_path.exists():
+                    log_path = Path(AIM_DIR) / "logs" / f"aim-client-{r['agent']}.log"
                 with open(log_path) as f:
                     err_lines = [l.strip() for l in f.readlines() if "ERROR" in l or "FATAL" in l]
                 last_err = err_lines[-1][:120] if err_lines else log.get("last_line", "")[:120]
